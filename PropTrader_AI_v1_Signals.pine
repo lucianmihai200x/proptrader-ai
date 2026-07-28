@@ -1,0 +1,45 @@
+//@version=5
+indicator("PropTrader AI v1 Signals", overlay=true)
+
+fastLen=input.int(20,"EMA rapidă")
+slowLen=input.int(50,"EMA lentă")
+rsiLen=input.int(14,"RSI")
+atrLen=input.int(14,"ATR")
+breakoutLen=input.int(10,"Lookback breakout")
+
+emaFast=ta.ema(close,fastLen)
+emaSlow=ta.ema(close,slowLen)
+rsiVal=ta.rsi(close,rsiLen)
+atrVal=ta.atr(atrLen)
+
+bullTrend=emaFast>emaSlow
+bearTrend=emaFast<emaSlow
+bullBreak=close>ta.highest(high,breakoutLen)[1]
+bearBreak=close<ta.lowest(low,breakoutLen)[1]
+
+buySignal=barstate.isconfirmed and bullTrend and rsiVal>52 and rsiVal<72 and bullBreak
+sellSignal=barstate.isconfirmed and bearTrend and rsiVal<48 and rsiVal>28 and bearBreak
+
+entry=close
+buySL=entry-atrVal*1.5
+buyTP1=entry+atrVal*3.0
+buyTP2=entry+atrVal*4.5
+sellSL=entry+atrVal*1.5
+sellTP1=entry-atrVal*3.0
+sellTP2=entry-atrVal*4.5
+
+scoreBuy=math.min(95,65+(rsiVal>55?10:0)+(close>emaFast?10:0)+(bullBreak?10:0))
+scoreSell=math.min(95,65+(rsiVal<45?10:0)+(close<emaFast?10:0)+(bearBreak?10:0))
+
+plot(emaFast,"EMA rapidă")
+plot(emaSlow,"EMA lentă")
+plotshape(buySignal,title="BUY",text="BUY",style=shape.labelup,location=location.belowbar)
+plotshape(sellSignal,title="SELL",text="SELL",style=shape.labeldown,location=location.abovebar)
+
+if buySignal
+    msg='{"symbol":"' + syminfo.ticker + '","timeframe":"' + timeframe.period + '","signal":"BUY","price":' + str.tostring(entry) + ',"sl":' + str.tostring(buySL) + ',"tp1":' + str.tostring(buyTP1) + ',"tp2":' + str.tostring(buyTP2) + ',"score":' + str.tostring(scoreBuy) + ',"rsi":' + str.tostring(rsiVal) + ',"atr":' + str.tostring(atrVal) + ',"rr":2,"reason":"Trend EMA bullish + RSI + breakout structură"}'
+    alert(msg,alert.freq_once_per_bar_close)
+
+if sellSignal
+    msg='{"symbol":"' + syminfo.ticker + '","timeframe":"' + timeframe.period + '","signal":"SELL","price":' + str.tostring(entry) + ',"sl":' + str.tostring(sellSL) + ',"tp1":' + str.tostring(sellTP1) + ',"tp2":' + str.tostring(sellTP2) + ',"score":' + str.tostring(scoreSell) + ',"rsi":' + str.tostring(rsiVal) + ',"atr":' + str.tostring(atrVal) + ',"rr":2,"reason":"Trend EMA bearish + RSI + breakout structură"}'
+    alert(msg,alert.freq_once_per_bar_close)
