@@ -748,23 +748,68 @@ function performanceStats(returns){
   let equity=0,peak=0,maxDD=0;for(const r of returns){equity+=r;peak=Math.max(peak,equity);maxDD=Math.max(maxDD,peak-equity);}
   return {trades:n,wins:wins.length,winRate:n?wins.length/n*100:0,lowerBound:wilsonLower(wins.length,n),avgReturnPct:n?sum/n:0,totalReturnPct:sum,profitFactor:grossLoss?grossWin/grossLoss:(grossWin>0?99:0),maxDrawdownPct:maxDD};
 }
-function buildBacktest(bars,{horizonBars=3,minSamples=25,minProbability=60}={}){
-  const groups=new Map();
-  for(let i=0;i<bars.length-horizonBars;i++){
-    const b=bars[i],end=bars[i+horizonBars],bucket=bucketFor(b.bar_time,b.timeframe),weekday=new Date(b.bar_time).getUTCDay(),move=(num(end.close)-num(b.close))/Math.max(0.000001,num(b.close))*100,key=`${weekday}|${bucket}`;
-    if(!groups.has(key))groups.set(key,[]);groups.get(key).push({time:b.bar_time,move});
+function emaSeries(values, period){
+  const out=new Array(values.length).fill(null); if(!values.length)return out;
+  const k=2/(period+1); let ema=values[0]; out[0]=ema;
+  for(let i=1;i<values.length;i++){ema=values[i]*k+ema*(1-k);out[i]=ema;} return out;
+}
+function rsiSeries(values, period=14){
+  const out=new Array(values.length).fill(null); if(values.length<=period)return out;
+  let gain=0,loss=0; for(let i=1;i<=period;i++){const d=values[i]-values[i-1];gain+=Math.max(0,d);loss+=Math.max(0,-d);} gain/=period;loss/=period;
+  out[period]=loss===0?100:100-(100/(1+gain/loss));
+  for(let i=period+1;i<values.length;i++){const d=values[i]-values[i-1];gain=(gain*(period-1)+Math.max(0,d))/period;loss=(loss*(period-1)+Math.max(0,-d))/period;out[i]=loss===0?100:100-(100/(1+gain/loss));}return out;
+}
+function atrSeries(bars, period=14){
+  const tr=bars.map((b,i)=>i===0?num(b.high)-num(b.low):Math.max(num(b.high)-num(b.low),Math.abs(num(b.high)-num(bars[i-1].close)),Math.abs(num(b.low)-num(bars[i-1].close))));
+  return emaSeries(tr,period);
+}
+function enrichBars(bars){
+  const closes=bars.map(b=>num(b.close)),ema20=emaSeries(closes,20),ema50=emaSeries(closes,50),rsi14=rsiSeries(closes,14),atr14=atrSeries(bars,14);
+  return bars.map((b,i)=>({...b,ema20:ema20[i],ema50:ema50[i],rsi14:rsi14[i],atr14:atr14[i]}));
+}
+function candidateKey(name,weekday,bucket,side){return `${name}|${weekday}|${bucket}|${side}`;}
+function buildObservations(bars,{horizonBars=3,costBps=1.5}={}){
+  const e=enrichBars(bars), out=[];
+  for(let i=55;i<e.length-horizonBars;i++){
+    const b=e[i], prev=e[i-1], end=e[i+horizonBars], close=num(b.close), atr=Math.max(1e-9,num(b.atr14)), bucket=bucketFor(b.bar_time,b.timeframe), weekday=new Date(b.bar_time).getUTCDay();
+    const raw=(num(end.close)-close)/close*100, cost=Number(costBps)/100, range20=e.slice(i-20,i), hh=Math.max(...range20.map(x=>num(x.high))),ll=Math.min(...range20.map(x=>num(x.low)));
+    const candidates=[];
+    candidates.push(['TIME',raw>=0?'BUY':'SELL']);
+    if(b.ema20!=null&&b.ema50!=null){if(close>b.ema20&&b.ema20>b.ema50)candidates.push(['TREND','BUY']);if(close<b.ema20&&b.ema20<b.ema50)candidates.push(['TREND','SELL']);}
+    if(prev.ema20!=null&&b.ema20!=null){if(num(prev.close)<=prev.ema20&&close>b.ema20&&b.ema20>b.ema50&&b.rsi14>=50)candidates.push(['PULLBACK','BUY']);if(num(prev.close)>=prev.ema20&&close<b.ema20&&b.ema20<b.ema50&&b.rsi14<=50)candidates.push(['PULLBACK','SELL']);}
+    if(close>hh-0.05*atr)candidates.push(['BREAKOUT','BUY']); if(close<ll+0.05*atr)candidates.push(['BREAKOUT','SELL']);
+    for(const [strategy,side] of candidates){const signed=(side==='BUY'?raw:-raw)-cost;out.push({time:b.bar_time,weekday,bucket,strategy,side,returnPct:signed,rawMovePct:raw,atrPct:atr/close*100});}
   }
+  return out;
+}
+function walkForwardStats(obs, folds=5){
+  const sorted=[...obs].sort((a,b)=>new Date(a.time)-new Date(b.time)); const foldResults=[];
+  const minTrain=Math.max(20,Math.floor(sorted.length*.5));
+  for(let f=0;f<folds;f++){
+    const testStart=minTrain+Math.floor((sorted.length-minTrain)*f/folds),testEnd=minTrain+Math.floor((sorted.length-minTrain)*(f+1)/folds);
+    const test=sorted.slice(testStart,testEnd); if(test.length<3)continue;
+    foldResults.push(performanceStats(test.map(x=>x.returnPct)));
+  }
+  const all=performanceStats(sorted.slice(minTrain).map(x=>x.returnPct));
+  const positiveFolds=foldResults.filter(x=>x.avgReturnPct>0&&x.profitFactor>1).length;
+  return {all,folds:foldResults,positiveFolds,totalFolds:foldResults.length,stability:foldResults.length?positiveFolds/foldResults.length*100:0};
+}
+function buildBacktest(bars,{horizonBars=3,minSamples=40,minProbability=60,costBps=1.5,walkForwardFolds=5}={}){
+  const observations=buildObservations(bars,{horizonBars,costBps}), groups=new Map();
+  for(const o of observations){const k=candidateKey(o.strategy,o.weekday,o.bucket,o.side);if(!groups.has(k))groups.set(k,[]);groups.get(k).push(o);}
   const results=[];
   for(const [key,obs] of groups){
-    if(obs.length<minSamples)continue;obs.sort((a,b)=>new Date(a.time)-new Date(b.time));const cut=Math.max(1,Math.floor(obs.length*.8)),train=obs.slice(0,cut),test=obs.slice(cut);
-    if(test.length<5)continue;const up=train.filter(x=>x.move>0).length,down=train.filter(x=>x.move<0).length,side=up>=down?"BUY":"SELL",prob=Math.max(up,down)/train.length*100;
-    if(prob<minProbability)continue;const signed=x=>side==="BUY"?x.move:-x.move,trainStats=performanceStats(train.map(signed)),testStats=performanceStats(test.map(signed));
-    const [weekday,bucket]=key.split("|");const robust=testStats.avgReturnPct>0&&testStats.profitFactor>=1.1&&testStats.lowerBound>=45;
-    results.push({weekday:Number(weekday),timeBucket:bucket,side,samples:obs.length,train:trainStats,test:testStats,trainProbability:prob,robust});
+    if(obs.length<minSamples)continue;obs.sort((a,b)=>new Date(a.time)-new Date(b.time));const cut=Math.max(1,Math.floor(obs.length*.8)),train=obs.slice(0,cut),test=obs.slice(cut);if(test.length<8)continue;
+    const trainStats=performanceStats(train.map(x=>x.returnPct)),testStats=performanceStats(test.map(x=>x.returnPct));
+    if(trainStats.winRate<minProbability)continue;
+    const wf=walkForwardStats(obs,walkForwardFolds),[strategy,weekday,bucket,side]=key.split('|');
+    const robust=testStats.avgReturnPct>0&&testStats.profitFactor>=1.15&&testStats.lowerBound>=45&&wf.stability>=60&&wf.all.avgReturnPct>0;
+    const score=Math.max(0,Math.min(100,0.35*testStats.winRate+15*Math.min(3,testStats.profitFactor)+0.25*wf.stability+10*Math.min(1,Math.max(0,testStats.avgReturnPct/(Math.max(0.001,obs.reduce((a,x)=>a+x.atrPct,0)/obs.length))))));
+    results.push({strategy,weekday:Number(weekday),timeBucket:bucket,side,samples:obs.length,train:trainStats,test:testStats,walkForward:wf,trainProbability:trainStats.winRate,robust,score,costBps});
   }
-  results.sort((a,b)=>(Number(b.robust)-Number(a.robust))||(b.test.avgReturnPct-a.test.avgReturnPct)||(b.test.trades-a.test.trades));
+  results.sort((a,b)=>(Number(b.robust)-Number(a.robust))||(b.score-a.score)||(b.test.avgReturnPct-a.test.avgReturnPct));
   const robust=results.filter(x=>x.robust);
-  return {summary:{patternsTested:results.length,robustPatterns:robust.length,best:robust[0]||results[0]||null},results:results.slice(0,300)};
+  return {summary:{patternsTested:results.length,robustPatterns:robust.length,best:robust[0]||results[0]||null,costBps,walkForwardFolds,warning:'Rezultatele istorice nu garantează performanță viitoare. Costurile, slippage-ul și schimbarea regimului pot elimina avantajul.'},results:results.slice(0,500)};
 }
 async function getBarsForBacktest(symbol,timeframe,limit=250000){
   if(!pool)return memoryBars.filter(x=>x.symbol===symbol&&x.timeframe===timeframe).sort((a,b)=>new Date(a.bar_time)-new Date(b.bar_time)).slice(-limit);
@@ -776,7 +821,7 @@ async function saveBacktestRun(run){
 }
 async function latestBacktest(){if(!pool)return global.lastMemoryBacktest||null;return (await pool.query(`SELECT * FROM backtest_runs ORDER BY created_at DESC LIMIT 1`)).rows[0]||null;}
 
-app.get("/health", (req,res)=>res.json({ok:true,version:"13.0.0",database:pool?"postgres":"memory",archiveAfterHours:ARCHIVE_AFTER_HOURS,adminKeyConfigured:Boolean(ADMIN_KEY),newsWebhookConfigured:Boolean(NEWS_WEBHOOK_KEY),fmpConfigured:Boolean(FMP_API_KEY),alphaVantageConfigured:Boolean(ALPHAVANTAGE_API_KEY),finnhubConfigured:Boolean(FINNHUB_API_KEY),autoTrackTrades:AUTO_TRACK_TRADES,lastNewsSync,lastNewsSyncError,patternMinSamples:PATTERN_MIN_SAMPLES,patternMinProbability:PATTERN_MIN_PROBABILITY,patternHorizonBars:PATTERN_HORIZON_BARS,liveMinAdaptiveScore:LIVE_MIN_ADAPTIVE_SCORE,learningMinSamples:LEARNING_MIN_SAMPLES,maxNewsRiskLive:MAX_NEWS_RISK_LIVE,maxConsecutiveLosses:MAX_CONSECUTIVE_LOSSES,time:new Date().toISOString()}));
+app.get("/health", (req,res)=>res.json({ok:true,version:"14.0.0",database:pool?"postgres":"memory",archiveAfterHours:ARCHIVE_AFTER_HOURS,adminKeyConfigured:Boolean(ADMIN_KEY),newsWebhookConfigured:Boolean(NEWS_WEBHOOK_KEY),fmpConfigured:Boolean(FMP_API_KEY),alphaVantageConfigured:Boolean(ALPHAVANTAGE_API_KEY),finnhubConfigured:Boolean(FINNHUB_API_KEY),autoTrackTrades:AUTO_TRACK_TRADES,lastNewsSync,lastNewsSyncError,patternMinSamples:PATTERN_MIN_SAMPLES,patternMinProbability:PATTERN_MIN_PROBABILITY,patternHorizonBars:PATTERN_HORIZON_BARS,liveMinAdaptiveScore:LIVE_MIN_ADAPTIVE_SCORE,learningMinSamples:LEARNING_MIN_SAMPLES,maxNewsRiskLive:MAX_NEWS_RISK_LIVE,maxConsecutiveLosses:MAX_CONSECUTIVE_LOSSES,time:new Date().toISOString()}));
 
 app.get("/api/signals", async(req,res)=>{ try { const mode=req.query.mode==="archive"?"archive":"active"; res.json({ok:true,mode,signals:await listSignals(mode,req.query),analytics:await analytics()}); } catch(e){ console.error(e); res.status(500).json({ok:false,error:e.message}); } });
 app.get("/api/analytics", async(req,res)=>{ try { res.json({ok:true,analytics:await analytics()}); } catch(e){res.status(500).json({ok:false,error:e.message});} });
@@ -839,7 +884,7 @@ app.post("/api/history-import",async(req,res)=>{if(!requireAdmin(req,res))return
 }catch(e){res.status(400).json({ok:false,error:e.message});}});
 
 app.post("/api/backtest",async(req,res)=>{if(!requireAdmin(req,res))return;try{
-  const symbol=clean(req.body.symbol||"US30",30).toUpperCase(),timeframe=clean(req.body.timeframe||"5",20),settings={horizonBars:Math.max(1,Math.min(24,num(req.body.horizonBars,3))),minSamples:Math.max(20,num(req.body.minSamples,40)),minProbability:Math.max(50,Math.min(90,num(req.body.minProbability,60)))};
+  const symbol=clean(req.body.symbol||"US30",30).toUpperCase(),timeframe=clean(req.body.timeframe||"5",20),settings={horizonBars:Math.max(1,Math.min(24,num(req.body.horizonBars,3))),minSamples:Math.max(20,num(req.body.minSamples,40)),minProbability:Math.max(50,Math.min(90,num(req.body.minProbability,60))),costBps:Math.max(0,Math.min(50,num(req.body.costBps,1.5))),walkForwardFolds:Math.max(3,Math.min(10,num(req.body.walkForwardFolds,5)))};
   const bars=await getBarsForBacktest(symbol,timeframe);if(bars.length<settings.minSamples+settings.horizonBars+20)throw new Error(`Istoric insuficient: ${bars.length} lumânări. Importă mai multe date.`);
   const report=buildBacktest(bars,settings),run=await saveBacktestRun({symbol,timeframe,bars:bars.length,start_time:bars[0].bar_time,end_time:bars[bars.length-1].bar_time,settings,summary:report.summary,results:report.results});res.json({ok:true,run});
 }catch(e){res.status(400).json({ok:false,error:e.message});}});
@@ -863,5 +908,5 @@ initDb().then(async()=>{
   await archiveOldSignals();
   setInterval(()=>archiveOldSignals().catch(e=>console.error("Auto-archive:",e)),15*60*1000).unref();
   if(FMP_API_KEY||ALPHAVANTAGE_API_KEY||FINNHUB_API_KEY){syncRealNews().catch(e=>{lastNewsSyncError=e.message;console.error("News sync:",e.message)});setInterval(()=>syncRealNews().catch(e=>{lastNewsSyncError=e.message;console.error("News sync:",e.message)}),NEWS_AUTO_SYNC_MINUTES*60000).unref();}
-  app.listen(PORT,()=>console.log(`PropTrader AI v12.0 rulează pe portul ${PORT}`));
+  app.listen(PORT,()=>console.log(`PropTrader AI v14.0 rulează pe portul ${PORT}`));
 }).catch(e=>{console.error("DB init failed:",e);process.exit(1)});
