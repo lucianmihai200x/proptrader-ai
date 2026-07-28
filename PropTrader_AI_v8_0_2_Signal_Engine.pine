@@ -1,0 +1,180 @@
+//@version=6
+indicator("PropTrader AI v8.0.2 — Stable Selective", overlay=true, max_labels_count=300)
+
+// Sistem euristic selectiv. Nu garantează profit.
+// Conceput pentru puține semnale și payload webhook compact.
+
+// ───────────────────────────── Inputs
+groupSignal = "Semnale"
+minScore = input.int(75, "Scor minim", minval=55, maxval=100, group=groupSignal)
+cooldownBars = input.int(36, "Pauză între semnale (lumânări)", minval=1, group=groupSignal)
+onlyConfirmed = input.bool(true, "Doar după închiderea lumânării", group=groupSignal)
+
+groupRisk = "Entry / SL / TP"
+atrLen = input.int(14, "ATR", minval=2, group=groupRisk)
+slATR = input.float(1.20, "SL în ATR", minval=0.4, step=0.05, group=groupRisk)
+tp1R = input.float(1.5, "TP1 în R", minval=1.0, step=0.25, group=groupRisk)
+tp2R = input.float(2.5, "TP2 în R", minval=1.5, step=0.25, group=groupRisk)
+tp3R = input.float(3.5, "TP3 în R", minval=2.0, step=0.25, group=groupRisk)
+
+groupTrend = "Trend"
+fastLen = input.int(20, "EMA rapidă", minval=2, group=groupTrend)
+slowLen = input.int(50, "EMA lentă", minval=5, group=groupTrend)
+mtfTF = input.timeframe("15", "Confirmare MTF", group=groupTrend)
+adxLen = input.int(14, "ADX", minval=5, group=groupTrend)
+minAdx = input.float(22.0, "ADX minim", minval=10, maxval=50, step=0.5, group=groupTrend)
+
+groupStructure = "Structură"
+pivotLen = input.int(5, "Pivot", minval=2, maxval=20, group=groupStructure)
+requireStructure = input.bool(true, "Necesită BOS/CHOCH", group=groupStructure)
+
+groupSession = "Sesiuni"
+useLondon = input.bool(true, "London", group=groupSession)
+london = input.session("0800-1100", "Interval London", group=groupSession)
+useNewYork = input.bool(true, "New York", group=groupSession)
+newYork = input.session("1430-1700", "Interval New York", group=groupSession)
+onlyKillZones = input.bool(true, "Doar în sesiunile selectate", group=groupSession)
+
+// ───────────────────────────── Core
+emaFast = ta.ema(close, fastLen)
+emaSlow = ta.ema(close, slowLen)
+atr = ta.atr(atrLen)
+rsi = ta.rsi(close, 14)
+vwapVal = ta.vwap(hlc3)
+[diPlus, diMinus, adx] = ta.dmi(adxLen, adxLen)
+
+bullTrend = emaFast > emaSlow and close > emaFast and emaFast > emaFast[3] and emaSlow > emaSlow[3]
+bearTrend = emaFast < emaSlow and close < emaFast and emaFast < emaFast[3] and emaSlow < emaSlow[3]
+
+mtfFast = request.security(syminfo.tickerid, mtfTF, ta.ema(close, fastLen))
+mtfSlow = request.security(syminfo.tickerid, mtfTF, ta.ema(close, slowLen))
+mtfBull = mtfFast > mtfSlow
+mtfBear = mtfFast < mtfSlow
+
+ph = ta.pivothigh(high, pivotLen, pivotLen)
+pl = ta.pivotlow(low, pivotLen, pivotLen)
+
+var float lastPH = na
+var float lastPL = na
+
+if not na(ph)
+    lastPH := ph
+
+if not na(pl)
+    lastPL := pl
+
+// Apelurile crossover/crossunder sunt evaluate pe fiecare lumânare.
+crossAbovePH = ta.crossover(close, lastPH)
+crossBelowPL = ta.crossunder(close, lastPL)
+
+bullBOS = not na(lastPH) and crossAbovePH
+bearBOS = not na(lastPL) and crossBelowPL
+bullCHOCH = bullBOS and bearTrend[1]
+bearCHOCH = bearBOS and bullTrend[1]
+
+aboveVWAP = close > vwapVal
+belowVWAP = close < vwapVal
+
+inLondon = useLondon and not na(time(timeframe.period, london))
+inNY = useNewYork and not na(time(timeframe.period, newYork))
+inKillZone = inLondon or inNY
+sessionName = inLondon ? "London" : inNY ? "New York" : "Outside"
+
+trendStrengthBuy = adx >= minAdx and diPlus > diMinus
+trendStrengthSell = adx >= minAdx and diMinus > diPlus
+
+structureBuy = bullBOS or bullCHOCH
+structureSell = bearBOS or bearCHOCH
+
+// ───────────────────────────── Score
+int buyScore = 0
+buyScore += bullTrend ? 20 : 0
+buyScore += mtfBull ? 20 : 0
+buyScore += aboveVWAP ? 15 : 0
+buyScore += structureBuy ? 20 : 0
+buyScore += trendStrengthBuy ? 15 : 0
+buyScore += inKillZone ? 10 : 0
+
+int sellScore = 0
+sellScore += bearTrend ? 20 : 0
+sellScore += mtfBear ? 20 : 0
+sellScore += belowVWAP ? 15 : 0
+sellScore += structureSell ? 20 : 0
+sellScore += trendStrengthSell ? 15 : 0
+sellScore += inKillZone ? 10 : 0
+
+buyProbability = math.min(92.0, 45.0 + buyScore * 0.45)
+sellProbability = math.min(92.0, 45.0 + sellScore * 0.45)
+
+var int lastSignalBar = na
+cooldownOK = na(lastSignalBar) or bar_index - lastSignalBar >= cooldownBars
+barOK = not onlyConfirmed or barstate.isconfirmed
+sessionOK = not onlyKillZones or inKillZone
+structureBuyOK = not requireStructure or structureBuy
+structureSellOK = not requireStructure or structureSell
+
+buySignal = barOK and cooldownOK and sessionOK and structureBuyOK and buyScore >= minScore and bullTrend and mtfBull and trendStrengthBuy
+sellSignal = barOK and cooldownOK and sessionOK and structureSellOK and sellScore >= minScore and bearTrend and mtfBear and trendStrengthSell
+
+// ───────────────────────────── Prices
+buyEntry = close
+buySL = buyEntry - atr * slATR
+buyRisk = buyEntry - buySL
+buyTP1 = buyEntry + buyRisk * tp1R
+buyTP2 = buyEntry + buyRisk * tp2R
+buyTP3 = buyEntry + buyRisk * tp3R
+
+sellEntry = close
+sellSL = sellEntry + atr * slATR
+sellRisk = sellSL - sellEntry
+sellTP1 = sellEntry - sellRisk * tp1R
+sellTP2 = sellEntry - sellRisk * tp2R
+sellTP3 = sellEntry - sellRisk * tp3R
+
+f_num(float x) =>
+    str.tostring(x, format.mintick)
+
+f_payload(string side, float entry, float sl, float tp1, float tp2, float tp3, int score, float probability) =>
+    string payload = "{\"event\":\"SIGNAL\""
+    payload := payload + ",\"external_id\":\"" + syminfo.ticker + "-" + timeframe.period + "-" + str.tostring(time) + "-" + side + "\""
+    payload := payload + ",\"symbol\":\"" + syminfo.ticker + "\""
+    payload := payload + ",\"timeframe\":\"" + timeframe.period + "\""
+    payload := payload + ",\"signal\":\"" + side + "\""
+    payload := payload + ",\"price\":" + f_num(entry)
+    payload := payload + ",\"sl\":" + f_num(sl)
+    payload := payload + ",\"tp1\":" + f_num(tp1)
+    payload := payload + ",\"tp2\":" + f_num(tp2)
+    payload := payload + ",\"tp3\":" + f_num(tp3)
+    payload := payload + ",\"score\":" + str.tostring(score)
+    payload := payload + ",\"probability\":" + str.tostring(probability, "#.0")
+    payload := payload + ",\"rsi\":" + str.tostring(rsi, "#.0")
+    payload := payload + ",\"atr\":" + f_num(atr)
+    payload := payload + ",\"rr\":" + str.tostring(tp3R, "#.00")
+    payload := payload + ",\"trend\":\"" + (side == "BUY" ? "Bullish" : "Bearish") + "\""
+    string structureText = side == "BUY" ? (bullCHOCH ? "Bullish CHOCH" : "Bullish BOS") : (bearCHOCH ? "Bearish CHOCH" : "Bearish BOS")
+    payload := payload + ",\"structure\":\"" + structureText + "\""
+    payload := payload + ",\"session\":\"" + sessionName + "\""
+    payload := payload + ",\"reason\":\"Stable selective v8.0.2\"}"
+    payload
+
+if buySignal
+    alert(f_payload("BUY", buyEntry, buySL, buyTP1, buyTP2, buyTP3, buyScore, buyProbability), alert.freq_once_per_bar_close)
+    lastSignalBar := bar_index
+    label.new(bar_index, low, "BUY\n" + str.tostring(buyScore), style=label.style_label_up, textcolor=color.white)
+
+if sellSignal
+    alert(f_payload("SELL", sellEntry, sellSL, sellTP1, sellTP2, sellTP3, sellScore, sellProbability), alert.freq_once_per_bar_close)
+    lastSignalBar := bar_index
+    label.new(bar_index, high, "SELL\n" + str.tostring(sellScore), style=label.style_label_down, textcolor=color.white)
+
+plot(emaFast, "EMA rapidă", linewidth=1)
+plot(emaSlow, "EMA lentă", linewidth=2)
+plot(vwapVal, "VWAP", linewidth=1)
+
+plotshape(bullBOS, title="Bull BOS", style=shape.triangleup, location=location.belowbar, size=size.tiny, text="BOS")
+plotshape(bearBOS, title="Bear BOS", style=shape.triangledown, location=location.abovebar, size=size.tiny, text="BOS")
+plotshape(bullCHOCH, title="Bull CHOCH", style=shape.circle, location=location.belowbar, size=size.tiny, text="CH")
+plotshape(bearCHOCH, title="Bear CHOCH", style=shape.circle, location=location.abovebar, size=size.tiny, text="CH")
+
+alertcondition(buySignal, title="PropTrader BUY v8.0.2", message="Selectează Any alert() function call")
+alertcondition(sellSignal, title="PropTrader SELL v8.0.2", message="Selectează Any alert() function call")

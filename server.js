@@ -9,6 +9,11 @@ const ADMIN_KEY = process.env.ADMIN_KEY || "";
 const NEWS_WEBHOOK_KEY = process.env.NEWS_WEBHOOK_KEY || WEBHOOK_KEY;
 const DATABASE_URL = process.env.DATABASE_URL || "";
 const ARCHIVE_AFTER_HOURS = Math.max(1, Number(process.env.ARCHIVE_AFTER_HOURS || 24));
+const PATTERN_MIN_SAMPLES = Math.max(10, Number(process.env.PATTERN_MIN_SAMPLES || 25));
+const PATTERN_MIN_PROBABILITY = Math.max(50, Math.min(95, Number(process.env.PATTERN_MIN_PROBABILITY || 68)));
+const PATTERN_LOOKBACK_DAYS = Math.max(14, Number(process.env.PATTERN_LOOKBACK_DAYS || 180));
+const PATTERN_HORIZON_BARS = Math.max(1, Math.min(12, Number(process.env.PATTERN_HORIZON_BARS || 3)));
+const PATTERN_COOLDOWN_MINUTES = Math.max(5, Number(process.env.PATTERN_COOLDOWN_MINUTES || 60));
 
 const pool = DATABASE_URL
   ? new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } })
@@ -16,6 +21,8 @@ const pool = DATABASE_URL
 
 let memorySignals = [];
 let memoryNews = [];
+let memoryBars = [];
+let memoryPatterns = [];
 
 app.use(express.json({ limit: "800kb" }));
 app.use(express.text({ type: ["text/plain", "application/text"], limit: "800kb" }));
@@ -91,6 +98,51 @@ async function initDb() {
   `);
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS news_external_id_unique ON news_events (external_id) WHERE external_id IS NOT NULL`);
   await pool.query(`CREATE INDEX IF NOT EXISTS news_published_idx ON news_events (published_at DESC)`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS market_bars (
+      id BIGSERIAL PRIMARY KEY,
+      external_id TEXT UNIQUE,
+      bar_time TIMESTAMPTZ NOT NULL,
+      received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      symbol TEXT NOT NULL,
+      timeframe TEXT NOT NULL,
+      open NUMERIC NOT NULL,
+      high NUMERIC NOT NULL,
+      low NUMERIC NOT NULL,
+      close NUMERIC NOT NULL,
+      volume NUMERIC DEFAULT 0
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS market_bars_lookup_idx ON market_bars(symbol,timeframe,bar_time DESC)`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS pattern_signals (
+      id BIGSERIAL PRIMARY KEY,
+      external_id TEXT UNIQUE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      symbol TEXT NOT NULL,
+      timeframe TEXT NOT NULL,
+      side TEXT NOT NULL,
+      entry NUMERIC NOT NULL,
+      sl NUMERIC,
+      tp1 NUMERIC,
+      tp2 NUMERIC,
+      tp3 NUMERIC,
+      samples INTEGER NOT NULL,
+      probability NUMERIC NOT NULL,
+      avg_move_pct NUMERIC NOT NULL,
+      median_move_pct NUMERIC NOT NULL,
+      time_bucket TEXT NOT NULL,
+      weekday INTEGER,
+      horizon_bars INTEGER NOT NULL,
+      trend_confirmed BOOLEAN DEFAULT FALSE,
+      news_risk INTEGER DEFAULT 0,
+      status TEXT DEFAULT 'CANDIDATE',
+      reason TEXT
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS pattern_signals_created_idx ON pattern_signals(created_at DESC)`);
 }
 
 function setupKey(p) {
@@ -184,6 +236,91 @@ async function recentNewsRisk(symbol, at = new Date()) {
   if (!relevant.length) return { risk: 0, bias: "NEUTRAL", summary: "Fără știri relevante în fereastra ±3h." };
   const max = relevant.reduce((a, n) => Number(n.impact) > Number(a.impact) ? n : a, relevant[0]);
   return { risk: Number(max.impact || 0), bias: max.bias || "NEUTRAL", summary: relevant.slice(0, 3).map(n => n.title).join(" • ").slice(0, 1200) };
+}
+
+
+function normalizeBar(p) {
+  const barTime = new Date(p.bar_time || p.time || p.timestamp || Date.now());
+  if (Number.isNaN(barTime.getTime())) throw new Error("Timpul lumânării este invalid");
+  const symbol = clean(p.symbol || p.ticker, 30).toUpperCase();
+  const timeframe = clean(p.timeframe || p.interval, 20);
+  const o = num(p.open, NaN), h = num(p.high, NaN), l = num(p.low, NaN), c = num(p.close, NaN);
+  if (!symbol || !timeframe || ![o,h,l,c].every(Number.isFinite)) throw new Error("BAR necesită symbol, timeframe, open, high, low și close");
+  return { external_id: clean(p.external_id || `BAR-${symbol}-${timeframe}-${barTime.getTime()}`, 160), bar_time: barTime.toISOString(), symbol, timeframe, open:o, high:h, low:l, close:c, volume:num(p.volume) };
+}
+
+async function saveBar(b) {
+  if (!pool) {
+    if (!memoryBars.some(x=>x.external_id===b.external_id)) memoryBars.push({id:Date.now(),...b});
+    memoryBars = memoryBars.filter(x=>new Date(x.bar_time) >= new Date(Date.now()-PATTERN_LOOKBACK_DAYS*86400000)).slice(-30000);
+    return;
+  }
+  await pool.query(`INSERT INTO market_bars(external_id,bar_time,symbol,timeframe,open,high,low,close,volume)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT DO NOTHING`,[b.external_id,b.bar_time,b.symbol,b.timeframe,b.open,b.high,b.low,b.close,b.volume]);
+}
+
+async function recentBars(symbol,timeframe,limit=20000) {
+  const cutoff=new Date(Date.now()-PATTERN_LOOKBACK_DAYS*86400000).toISOString();
+  if(!pool) return memoryBars.filter(x=>x.symbol===symbol&&x.timeframe===timeframe&&new Date(x.bar_time)>=new Date(cutoff)).sort((a,b)=>new Date(a.bar_time)-new Date(b.bar_time)).slice(-limit);
+  return (await pool.query(`SELECT * FROM market_bars WHERE symbol=$1 AND timeframe=$2 AND bar_time >= $3 ORDER BY bar_time ASC LIMIT $4`,[symbol,timeframe,cutoff,limit])).rows;
+}
+
+function median(values){if(!values.length)return 0;const a=[...values].sort((x,y)=>x-y),m=Math.floor(a.length/2);return a.length%2?a[m]:(a[m-1]+a[m])/2;}
+function ema(values,len){if(!values.length)return 0;const k=2/(len+1);let e=values[0];for(let i=1;i<values.length;i++)e=values[i]*k+e*(1-k);return e;}
+function atrFromBars(bars,len=14){if(bars.length<2)return 0;const tr=[];for(let i=1;i<bars.length;i++){const h=num(bars[i].high),l=num(bars[i].low),pc=num(bars[i-1].close);tr.push(Math.max(h-l,Math.abs(h-pc),Math.abs(l-pc)));}return tr.slice(-len).reduce((a,x)=>a+x,0)/Math.max(1,Math.min(len,tr.length));}
+function bucketFor(date,timeframe){const d=new Date(date);const mins=d.getUTCHours()*60+d.getUTCMinutes();const tf=Math.max(1,parseInt(timeframe)||5);const bucket=Math.floor(mins/tf)*tf;return `${String(Math.floor(bucket/60)).padStart(2,'0')}:${String(bucket%60).padStart(2,'0')} UTC`;}
+
+async function analyzeTimePattern(bar) {
+  const bars=await recentBars(bar.symbol,bar.timeframe);
+  if(bars.length < PATTERN_MIN_SAMPLES + PATTERN_HORIZON_BARS + 20) return null;
+  const now=new Date(bar.bar_time), targetBucket=bucketFor(now,bar.timeframe), weekday=now.getUTCDay();
+  const moves=[];
+  for(let i=0;i<bars.length-PATTERN_HORIZON_BARS;i++){
+    const a=bars[i], dt=new Date(a.bar_time);
+    if(bucketFor(dt,bar.timeframe)!==targetBucket) continue;
+    // Prioritize the same weekday, but accept all weekdays until the sample threshold is reached.
+    const end=bars[i+PATTERN_HORIZON_BARS];
+    if(!end)continue;
+    const move=(num(end.close)-num(a.close))/Math.max(0.000001,num(a.close))*100;
+    moves.push({move,sameWeekday:dt.getUTCDay()===weekday});
+  }
+  let selected=moves.filter(x=>x.sameWeekday).map(x=>x.move);
+  if(selected.length<PATTERN_MIN_SAMPLES) selected=moves.map(x=>x.move);
+  if(selected.length<PATTERN_MIN_SAMPLES) return null;
+  const up=selected.filter(x=>x>0).length, down=selected.filter(x=>x<0).length;
+  const upProb=up/selected.length*100, downProb=down/selected.length*100;
+  const side=upProb>=downProb?'BUY':'SELL', probability=Math.max(upProb,downProb);
+  const directional=selected.filter(x=>side==='BUY'?x>0:x<0).map(Math.abs);
+  const avgMove=directional.reduce((a,x)=>a+x,0)/Math.max(1,directional.length), medMove=median(directional);
+  const closes=bars.slice(-60).map(x=>num(x.close));
+  const e20=ema(closes.slice(-40),20), e50=ema(closes,50);
+  const trendConfirmed=side==='BUY'?num(bar.close)>e20&&e20>e50:num(bar.close)<e20&&e20<e50;
+  const atr=atrFromBars(bars.slice(-30));
+  const minMovePct=Math.max(0.03,(atr/Math.max(0.000001,num(bar.close))*100)*0.55);
+  if(probability<PATTERN_MIN_PROBABILITY || avgMove<minMovePct || !trendConfirmed) return null;
+  const news=await recentNewsRisk(bar.symbol,new Date(bar.bar_time));
+  if(news.risk>=80) return null;
+  const entry=num(bar.close), risk=Math.max(atr*1.1,entry*avgMove/100*0.45);
+  const sl=side==='BUY'?entry-risk:entry+risk;
+  const tp1=side==='BUY'?entry+risk*1.5:entry-risk*1.5;
+  const tp2=side==='BUY'?entry+risk*2.5:entry-risk*2.5;
+  const tp3=side==='BUY'?entry+risk*3.5:entry-risk*3.5;
+  const bucketMs=PATTERN_COOLDOWN_MINUTES*60000;
+  const ext=`PATTERN-${bar.symbol}-${bar.timeframe}-${side}-${Math.floor(new Date(bar.bar_time).getTime()/bucketMs)}`;
+  return {external_id:ext,created_at:new Date().toISOString(),symbol:bar.symbol,timeframe:bar.timeframe,side,entry,sl,tp1,tp2,tp3,samples:selected.length,probability:Number(probability.toFixed(2)),avg_move_pct:Number(avgMove.toFixed(4)),median_move_pct:Number(medMove.toFixed(4)),time_bucket:targetBucket,weekday,horizon_bars:PATTERN_HORIZON_BARS,trend_confirmed:trendConfirmed,news_risk:news.risk,status:'CANDIDATE',reason:`Model orar: ${side} a apărut în ${probability.toFixed(1)}% din ${selected.length} cazuri; mișcare medie ${avgMove.toFixed(3)}% în următoarele ${PATTERN_HORIZON_BARS} lumânări. Confirmare EMA20/EMA50 și risc știri ${news.risk}/100.`};
+}
+
+async function savePattern(p) {
+  if(!p)return false;
+  if(!pool){if(memoryPatterns.some(x=>x.external_id===p.external_id))return false;memoryPatterns.unshift({id:Date.now(),...p});memoryPatterns=memoryPatterns.slice(0,500);return true;}
+  const q=await pool.query(`INSERT INTO pattern_signals(external_id,created_at,symbol,timeframe,side,entry,sl,tp1,tp2,tp3,samples,probability,avg_move_pct,median_move_pct,time_bucket,weekday,horizon_bars,trend_confirmed,news_risk,status,reason)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21) ON CONFLICT DO NOTHING RETURNING id`,[p.external_id,p.created_at,p.symbol,p.timeframe,p.side,p.entry,p.sl,p.tp1,p.tp2,p.tp3,p.samples,p.probability,p.avg_move_pct,p.median_move_pct,p.time_bucket,p.weekday,p.horizon_bars,p.trend_confirmed,p.news_risk,p.status,p.reason]);
+  return q.rowCount>0;
+}
+
+async function listPatterns(limit=100){
+  if(!pool)return memoryPatterns.slice(0,limit);
+  return (await pool.query(`SELECT * FROM pattern_signals ORDER BY created_at DESC LIMIT $1`,[limit])).rows;
 }
 
 async function archiveOldSignals() {
@@ -345,7 +482,7 @@ function requireAdmin(req, res) {
   return true;
 }
 
-app.get("/health", (req,res)=>res.json({ok:true,version:"9.0.0",database:pool?"postgres":"memory",archiveAfterHours:ARCHIVE_AFTER_HOURS,adminKeyConfigured:Boolean(ADMIN_KEY),newsWebhookConfigured:Boolean(NEWS_WEBHOOK_KEY),time:new Date().toISOString()}));
+app.get("/health", (req,res)=>res.json({ok:true,version:"9.1.0",database:pool?"postgres":"memory",archiveAfterHours:ARCHIVE_AFTER_HOURS,adminKeyConfigured:Boolean(ADMIN_KEY),newsWebhookConfigured:Boolean(NEWS_WEBHOOK_KEY),patternMinSamples:PATTERN_MIN_SAMPLES,patternMinProbability:PATTERN_MIN_PROBABILITY,patternHorizonBars:PATTERN_HORIZON_BARS,time:new Date().toISOString()}));
 
 app.get("/api/signals", async(req,res)=>{ try { const mode=req.query.mode==="archive"?"archive":"active"; res.json({ok:true,mode,signals:await listSignals(mode,req.query),analytics:await analytics()}); } catch(e){ console.error(e); res.status(500).json({ok:false,error:e.message}); } });
 app.get("/api/analytics", async(req,res)=>{ try { res.json({ok:true,analytics:await analytics()}); } catch(e){res.status(500).json({ok:false,error:e.message});} });
@@ -366,14 +503,21 @@ app.post("/news-webhook", async(req,res)=>{ try{
 }catch(e){res.status(400).json({ok:false,error:e.message});} });
 
 app.post("/api/test-signal",async(req,res)=>{ if(!requireAdmin(req,res))return; try{
-  const s=normalizeSignal({external_id:`TEST-${Date.now()}`,symbol:"US30",timeframe:"5",signal:"BUY",price:45000,sl:44920,tp1:45120,tp2:45200,tp3:45280,score:88,probability:79,rsi:58.4,atr:72,rr:3.5,trend:"Bullish",structure:"Bullish BOS",session:"New York",bos:true,fvg:true,liquidity_sweep:true,vwap_confirm:true,mtf_confirm:true,market_phase:"Expansion",premium_discount:"Discount",reason:"Semnal demonstrativ v9."});
+  const price=num(req.body.price,NaN); if(!Number.isFinite(price)||price<=0)throw new Error("Introdu un preț curent valid pentru test");
+  const atr=Math.max(price*0.0015,num(req.body.atr,0)); const risk=atr*1.1;
+  const side=clean(req.body.side||"BUY",10).toUpperCase()==="SELL"?"SELL":"BUY";
+  const s=normalizeSignal({external_id:`TEST-${Date.now()}`,symbol:clean(req.body.symbol||"US30",30),timeframe:"5",signal:side,price,
+    sl:side==="BUY"?price-risk:price+risk,tp1:side==="BUY"?price+risk*1.5:price-risk*1.5,tp2:side==="BUY"?price+risk*2.5:price-risk*2.5,tp3:side==="BUY"?price+risk*3.5:price-risk*3.5,
+    score:88,probability:79,rsi:58.4,atr,rr:3.5,trend:side==="BUY"?"Bullish":"Bearish",structure:`${side} test`,session:"New York",bos:true,fvg:true,liquidity_sweep:true,vwap_confirm:true,mtf_confirm:true,market_phase:"Expansion",premium_discount:side==="BUY"?"Discount":"Premium",reason:"Semnal demonstrativ v9.1 la preț introdus manual."});
   await saveSignal(s);res.json({ok:true,signal:s});
-}catch(e){res.status(500).json({ok:false,error:e.message});} });
+}catch(e){res.status(400).json({ok:false,error:e.message});} });
 
 app.post("/api/test-news",async(req,res)=>{ if(!requireAdmin(req,res))return; try{const n=normalizeNews({external_id:`NEWS-${Date.now()}`,title:"FOMC interest rate decision and Powell press conference",summary:"High-impact Federal Reserve event may increase volatility in US indices and gold.",source:"PropTrader test",symbols:["US30","NAS100","XAUUSD"],impact:90});await saveNews(n);res.json({ok:true,news:n});}catch(e){res.status(500).json({ok:false,error:e.message});} });
 
 app.post("/api/manual-close",async(req,res)=>{if(!requireAdmin(req,res))return;try{res.json({ok:true,closed:await closeSignal(req.body)});}catch(e){res.status(400).json({ok:false,error:e.message});}});
-app.post("/api/clear",async(req,res)=>{if(!requireAdmin(req,res))return;try{if(pool){await pool.query("DELETE FROM signals");await pool.query("DELETE FROM news_events");}else{memorySignals=[];memoryNews=[];}res.json({ok:true});}catch(e){res.status(500).json({ok:false,error:e.message});}});
+app.post("/api/clear",async(req,res)=>{if(!requireAdmin(req,res))return;try{if(pool){await pool.query("DELETE FROM signals");await pool.query("DELETE FROM news_events");await pool.query("DELETE FROM pattern_signals");await pool.query("DELETE FROM market_bars");}else{memorySignals=[];memoryNews=[];memoryBars=[];memoryPatterns=[];}res.json({ok:true});}catch(e){res.status(500).json({ok:false,error:e.message});}});
+
+app.get("/api/patterns",async(req,res)=>{try{res.json({ok:true,patterns:await listPatterns(Math.min(300,Math.max(1,num(req.query.limit,100)))),settings:{minSamples:PATTERN_MIN_SAMPLES,minProbability:PATTERN_MIN_PROBABILITY,lookbackDays:PATTERN_LOOKBACK_DAYS,horizonBars:PATTERN_HORIZON_BARS}});}catch(e){res.status(500).json({ok:false,error:e.message});}});
 
 app.get("/api/export.csv",async(req,res)=>{try{const rows=await allSignalsForAnalytics();const cols=["received_at","archived_at","symbol","timeframe","signal","status","result","price","sl","tp1","tp2","tp3","score","adaptive_score","learning_adjustment","news_risk","news_bias","pnl_r","session_name","structure","reason"];const esc=v=>`"${String(v??"").replaceAll('"','""')}"`;const csv=[cols.join(','),...rows.map(r=>cols.map(c=>esc(r[c])).join(','))].join('\n');res.setHeader("content-type","text/csv; charset=utf-8");res.setHeader("content-disposition",'attachment; filename="proptrader-journal.csv"');res.send('\ufeff'+csv);}catch(e){res.status(500).send(e.message);}});
 
@@ -381,11 +525,15 @@ app.post("/webhook", async(req,res)=>{try{
   const key=req.query.key||req.get("x-webhook-key")||""; if(!WEBHOOK_KEY||key!==WEBHOOK_KEY)return res.status(401).json({ok:false,error:"WEBHOOK_KEY incorectă"});
   const payload=parseBody(req); const event=clean(payload.event||"SIGNAL",20).toUpperCase();
   if(event==="CLOSE")return res.json({ok:true,closed:await closeSignal(payload)});
+  if(event==="BAR"){
+    const bar=normalizeBar(payload); await saveBar(bar); const pattern=await analyzeTimePattern(bar); const created=pattern?await savePattern(pattern):false;
+    return res.json({ok:true,event:"BAR",bar,pattern:created?pattern:null});
+  }
   const signal=normalizeSignal(payload);await saveSignal(signal);return res.json({ok:true,signal});
 }catch(e){console.error("POST /webhook:",e);return res.status(400).json({ok:false,error:e.message});}});
 
 initDb().then(async()=>{
   await archiveOldSignals();
   setInterval(()=>archiveOldSignals().catch(e=>console.error("Auto-archive:",e)),15*60*1000).unref();
-  app.listen(PORT,()=>console.log(`PropTrader AI v9.0 rulează pe portul ${PORT}`));
+  app.listen(PORT,()=>console.log(`PropTrader AI v9.1 rulează pe portul ${PORT}`));
 }).catch(e=>{console.error("DB init failed:",e);process.exit(1)});

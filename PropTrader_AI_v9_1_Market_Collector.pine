@@ -1,0 +1,30 @@
+//@version=6
+indicator("PropTrader AI v9.1 — Market Collector", overlay=false)
+
+// Trimite OHLCV la server la închiderea fiecărei lumânări.
+// Nu generează singur intrări dese. Serverul emite un model orar numai
+// când sunt îndeplinite pragurile statistice, trendul și filtrul de știri.
+
+enabled = input.bool(true, "Colectare activă")
+
+f_num(float x) =>
+    str.tostring(x, format.mintick)
+
+f_payload() =>
+    string payload = "{\"event\":\"BAR\""
+    payload := payload + ",\"external_id\":\"BAR-" + syminfo.ticker + "-" + timeframe.period + "-" + str.tostring(time) + "\""
+    payload := payload + ",\"symbol\":\"" + syminfo.ticker + "\""
+    payload := payload + ",\"timeframe\":\"" + timeframe.period + "\""
+    payload := payload + ",\"bar_time\":" + str.tostring(time)
+    payload := payload + ",\"open\":" + f_num(open)
+    payload := payload + ",\"high\":" + f_num(high)
+    payload := payload + ",\"low\":" + f_num(low)
+    payload := payload + ",\"close\":" + f_num(close)
+    payload := payload + ",\"volume\":" + str.tostring(volume)
+    payload := payload + "}"
+    payload
+
+if enabled and barstate.isconfirmed
+    alert(f_payload(), alert.freq_once_per_bar_close)
+
+plot(close, "Collector active", display=display.none)
