@@ -1,48 +1,55 @@
-PROPTRADER AI v3 — MOTOR DE ANALIZĂ
+PROPTRADER AI v4 — VERSIUNE FUNCȚIONALĂ
 
-Actualizare:
-1. Dezarhivează.
-2. În GitHub, în același repository, înlocuiește:
-   - package.json
-   - server.js
-   - render.yaml
-   - public/index.html
-3. Adaugă PropTrader_AI_v3_Engine.pine.
+Flux:
+TradingView -> webhook Render -> PostgreSQL -> dashboard -> rezultate TP/SL -> statistici
+
+ACTUALIZARE
+1. Dezarhivează arhiva.
+2. În GitHub, înlocuiește:
+   package.json
+   server.js
+   render.yaml
+   public/index.html
+3. Adaugă PropTrader_AI_v4_Engine.pine.
 4. Commit changes.
-5. Render va redeploya automat.
+5. Așteaptă redeploy-ul Render.
 
-Motor v3:
-- analiză multi-timeframe
-- EMA trend
-- VWAP
-- BOS / CHOCH
-- FVG
-- liquidity sweep
-- Order Block aproximativ
-- sesiuni London / New York
-- scor ponderat
-- prag minim configurabil
-- TP1 / TP2 / TP3
-- probabilitate euristică
+TEST DASHBOARD
+1. Render > serviciu > Environment.
+2. Copiază valoarea ADMIN_KEY.
+3. Deschide aplicația.
+4. Introdu ADMIN_KEY.
+5. Apasă Creează semnal test.
+6. Poți închide manual testul cu TP1/TP2/TP3/SL/BE.
 
-Test:
-1. Copiază ADMIN_KEY din Render > Environment.
-2. Introdu cheia în dashboard.
-3. Apasă Creează semnal test v3.
-
-TradingView:
+TRADINGVIEW
 1. Deschide Pine Editor.
-2. Copiază PropTrader_AI_v3_Engine.pine.
+2. Copiază PropTrader_AI_v4_Engine.pine.
 3. Save și Add to chart.
-4. Creează alertă: Any alert() function call.
-5. Webhook:
+4. Creează alerta cu Any alert() function call.
+5. Webhook URL:
    https://ADRESA-TA.onrender.com/webhook?key=WEBHOOK_KEY
+6. Creează alerte separate:
+   US30 M5, HTF M15
+   XAUUSD M5, HTF M15
 
-Recomandare inițială:
-- US30 M5 cu timeframe superior M15
-- XAUUSD M5 cu timeframe superior M15
-- prag scor 80
-- testează pe demo
+REZULTATE AUTOMATE
+Scriptul trimite un eveniment SIGNAL la intrare.
+Când prețul atinge SL sau TP, trimite un eveniment CLOSE.
+Dashboard-ul calculează:
+- Win rate
+- Total R
+- Profit factor
+- semnale deschise/închise
+- scor și probabilitate medie
 
-Important:
-Motorul este bazat pe reguli tehnice și scoruri euristice. Nu este încă un model ML antrenat și nu garantează profit.
+TELEGRAM OPȚIONAL
+În Render Environment adaugă:
+TELEGRAM_BOT_TOKEN
+TELEGRAM_CHAT_ID
+
+LIMITARE IMPORTANTĂ
+TradingView urmărește rezultatul numai cât timp alerta este activă.
+Pe aceeași alertă/script este urmărit un singur semnal activ.
+Probabilitatea este euristică, nu predicție garantată și nu model ML validat.
+Testează minimum câteva săptămâni pe demo înainte de cont finanțat.

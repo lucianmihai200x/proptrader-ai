@@ -13,9 +13,9 @@ const pool = DATABASE_URL
   ? new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } })
   : null;
 
-let memory = [];
+let memorySignals = [];
 
-app.use(express.json({ limit: "400kb" }));
+app.use(express.json({ limit: "500kb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
 async function initDb() {
@@ -24,15 +24,21 @@ async function initDb() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS signals (
       id BIGSERIAL PRIMARY KEY,
+      external_id TEXT UNIQUE,
       received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      closed_at TIMESTAMPTZ,
       symbol TEXT NOT NULL,
       timeframe TEXT,
       signal TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'OPEN',
+      result TEXT,
       price NUMERIC,
       sl NUMERIC,
       tp1 NUMERIC,
       tp2 NUMERIC,
       tp3 NUMERIC,
+      exit_price NUMERIC,
+      pnl_r NUMERIC,
       score NUMERIC,
       probability NUMERIC,
       rsi NUMERIC,
@@ -56,12 +62,12 @@ async function initDb() {
   `);
 
   const additions = [
-    ["mtf_trend", "TEXT"],
-    ["vwap_side", "TEXT"],
-    ["order_block", "TEXT"],
-    ["vwap_confirm", "BOOLEAN DEFAULT FALSE"],
-    ["mtf_confirm", "BOOLEAN DEFAULT FALSE"],
-    ["order_block_confirm", "BOOLEAN DEFAULT FALSE"]
+    ["external_id", "TEXT UNIQUE"],
+    ["closed_at", "TIMESTAMPTZ"],
+    ["status", "TEXT NOT NULL DEFAULT 'OPEN'"],
+    ["result", "TEXT"],
+    ["exit_price", "NUMERIC"],
+    ["pnl_r", "NUMERIC"]
   ];
 
   for (const [name, type] of additions) {
@@ -75,20 +81,24 @@ const num = (v, fallback = 0) => {
 };
 const bool = v => v === true || v === "true" || v === 1 || v === "1";
 
-function normalize(p) {
+function normalizeSignal(p) {
   const score = Math.max(0, Math.min(100, num(p.score, 50)));
+  const probability = Math.max(0, Math.min(100, num(p.probability, score)));
+
   return {
+    external_id: String(p.external_id || p.signal_id || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`).slice(0, 120),
     received_at: new Date().toISOString(),
     symbol: String(p.symbol || p.ticker || "N/A").slice(0, 30),
     timeframe: String(p.timeframe || p.interval || "").slice(0, 20),
     signal: String(p.signal || p.side || "WAIT").toUpperCase(),
+    status: "OPEN",
     price: num(p.price ?? p.close),
     sl: num(p.sl),
     tp1: num(p.tp1 ?? p.tp),
     tp2: num(p.tp2),
     tp3: num(p.tp3),
     score,
-    probability: Math.max(0, Math.min(100, num(p.probability, score))),
+    probability,
     rsi: num(p.rsi),
     atr: num(p.atr),
     rr: num(p.rr),
@@ -109,51 +119,123 @@ function normalize(p) {
   };
 }
 
-async function save(s) {
+async function saveSignal(s) {
   if (!pool) {
-    memory.unshift({ id: Date.now(), ...s });
-    memory = memory.slice(0, 600);
+    if (memorySignals.some(x => x.external_id === s.external_id)) return;
+    memorySignals.unshift({ id: Date.now(), ...s });
+    memorySignals = memorySignals.slice(0, 1000);
     return;
   }
 
   await pool.query(`
     INSERT INTO signals (
-      received_at,symbol,timeframe,signal,price,sl,tp1,tp2,tp3,
-      score,probability,rsi,atr,rr,trend,structure,session_name,
-      mtf_trend,vwap_side,order_block,bos,choch,fvg,liquidity_sweep,
-      vwap_confirm,mtf_confirm,order_block_confirm,reason
+      external_id,received_at,symbol,timeframe,signal,status,price,sl,tp1,tp2,tp3,
+      score,probability,rsi,atr,rr,trend,structure,session_name,mtf_trend,vwap_side,
+      order_block,bos,choch,fvg,liquidity_sweep,vwap_confirm,mtf_confirm,
+      order_block_confirm,reason
     ) VALUES (
-      $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,
-      $18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28
+      $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
+      $21,$22,$23,$24,$25,$26,$27,$28,$29,$30
     )
+    ON CONFLICT (external_id) DO NOTHING
   `, [
-    s.received_at,s.symbol,s.timeframe,s.signal,s.price,s.sl,s.tp1,s.tp2,s.tp3,
-    s.score,s.probability,s.rsi,s.atr,s.rr,s.trend,s.structure,s.session_name,
-    s.mtf_trend,s.vwap_side,s.order_block,s.bos,s.choch,s.fvg,s.liquidity_sweep,
-    s.vwap_confirm,s.mtf_confirm,s.order_block_confirm,s.reason
+    s.external_id,s.received_at,s.symbol,s.timeframe,s.signal,s.status,s.price,s.sl,
+    s.tp1,s.tp2,s.tp3,s.score,s.probability,s.rsi,s.atr,s.rr,s.trend,s.structure,
+    s.session_name,s.mtf_trend,s.vwap_side,s.order_block,s.bos,s.choch,s.fvg,
+    s.liquidity_sweep,s.vwap_confirm,s.mtf_confirm,s.order_block_confirm,s.reason
   ]);
 }
 
-async function list() {
-  if (!pool) return memory;
-  return (await pool.query("SELECT * FROM signals ORDER BY received_at DESC LIMIT 400")).rows;
+async function closeSignal(payload) {
+  const externalId = String(payload.external_id || payload.signal_id || "").slice(0, 120);
+  if (!externalId) throw new Error("Lipsește external_id");
+
+  const result = String(payload.result || "").toUpperCase();
+  if (!["TP1", "TP2", "TP3", "SL", "BE", "CLOSED"].includes(result)) {
+    throw new Error("Rezultat invalid");
+  }
+
+  const pnlMap = { TP1: 2, TP2: 3, TP3: 4, SL: -1, BE: 0, CLOSED: num(payload.pnl_r, 0) };
+  const pnlR = result === "CLOSED" ? num(payload.pnl_r, 0) : pnlMap[result];
+  const exitPrice = num(payload.exit_price);
+
+  if (!pool) {
+    const item = memorySignals.find(x => x.external_id === externalId);
+    if (!item) throw new Error("Semnalul nu a fost găsit");
+    item.status = "CLOSED";
+    item.result = result;
+    item.pnl_r = pnlR;
+    item.exit_price = exitPrice;
+    item.closed_at = new Date().toISOString();
+    return item;
+  }
+
+  const resultDb = await pool.query(`
+    UPDATE signals
+    SET status='CLOSED', result=$1, pnl_r=$2, exit_price=$3, closed_at=NOW()
+    WHERE external_id=$4
+    RETURNING *
+  `, [result, pnlR, exitPrice, externalId]);
+
+  if (!resultDb.rows.length) throw new Error("Semnalul nu a fost găsit");
+  return resultDb.rows[0];
+}
+
+async function listSignals() {
+  if (!pool) return memorySignals;
+  return (await pool.query("SELECT * FROM signals ORDER BY received_at DESC LIMIT 1000")).rows;
+}
+
+async function stats() {
+  const data = await listSignals();
+  const closed = data.filter(x => x.status === "CLOSED");
+  const wins = closed.filter(x => Number(x.pnl_r) > 0);
+  const losses = closed.filter(x => Number(x.pnl_r) < 0);
+  const totalR = closed.reduce((a, x) => a + Number(x.pnl_r || 0), 0);
+  const grossWin = wins.reduce((a, x) => a + Number(x.pnl_r || 0), 0);
+  const grossLoss = Math.abs(losses.reduce((a, x) => a + Number(x.pnl_r || 0), 0));
+
+  return {
+    total: data.length,
+    open: data.filter(x => x.status === "OPEN").length,
+    closed: closed.length,
+    wins: wins.length,
+    losses: losses.length,
+    winRate: closed.length ? wins.length / closed.length * 100 : 0,
+    totalR,
+    profitFactor: grossLoss ? grossWin / grossLoss : grossWin ? 99 : 0,
+    avgScore: data.length ? data.reduce((a, x) => a + Number(x.score || 0), 0) / data.length : 0,
+    avgProbability: data.length ? data.reduce((a, x) => a + Number(x.probability || 0), 0) / data.length : 0
+  };
 }
 
 async function clearAll() {
   if (pool) await pool.query("DELETE FROM signals");
-  else memory = [];
+  else memorySignals = [];
+}
+
+async function sendTelegram(text) {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+  if (!token || !chatId) return;
+
+  await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, text })
+  });
 }
 
 app.get("/health", (req, res) => {
-  res.json({ ok: true, version: "3.0.0", database: pool ? "postgres" : "memory", time: new Date().toISOString() });
+  res.json({ ok: true, version: "4.0.0", database: pool ? "postgres" : "memory", time: new Date().toISOString() });
 });
 
 app.get("/api/signals", async (req, res) => {
   try {
-    res.json({ ok: true, signals: await list() });
+    res.json({ ok: true, signals: await listSignals(), stats: await stats() });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ ok: false, error: "Nu pot citi semnalele." });
+    res.status(500).json({ ok: false, error: "Nu pot citi datele." });
   }
 });
 
@@ -164,26 +246,64 @@ app.post("/webhook", async (req, res) => {
       return res.status(401).json({ ok: false, error: "Cheie webhook invalidă." });
     }
 
-    const s = normalize(req.body);
-    if (!["BUY", "SELL", "WAIT"].includes(s.signal)) {
+    const event = String(req.body.event || "SIGNAL").toUpperCase();
+
+    if (event === "CLOSE") {
+      const closed = await closeSignal(req.body);
+      await sendTelegram(`✅ ${closed.symbol} ${closed.signal} închis: ${closed.result} (${closed.pnl_r}R)`);
+      return res.json({ ok: true, closed });
+    }
+
+    const signal = normalizeSignal(req.body);
+    if (!["BUY", "SELL", "WAIT"].includes(signal.signal)) {
       return res.status(400).json({ ok: false, error: "Semnal invalid." });
     }
 
-    await save(s);
-    res.json({ ok: true, signal: s });
+    await saveSignal(signal);
+
+    if (signal.signal !== "WAIT") {
+      const icon = signal.signal === "BUY" ? "🟢" : "🔴";
+      await sendTelegram([
+        `${icon} ${signal.symbol} — ${signal.signal}`,
+        `TF: ${signal.timeframe}`,
+        `Entry: ${signal.price}`,
+        `SL: ${signal.sl}`,
+        `TP1: ${signal.tp1}`,
+        `TP2: ${signal.tp2}`,
+        `TP3: ${signal.tp3}`,
+        `Scor: ${signal.score}%`,
+        `Probabilitate estimată: ${signal.probability}%`,
+        `ID: ${signal.external_id}`
+      ].join("\n"));
+    }
+
+    res.json({ ok: true, signal });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ ok: false, error: "Eroare webhook." });
+    res.status(500).json({ ok: false, error: e.message || "Eroare webhook." });
+  }
+});
+
+app.post("/api/manual-close", async (req, res) => {
+  try {
+    const key = req.body?.adminKey || "";
+    if (!ADMIN_KEY || key !== ADMIN_KEY) {
+      return res.status(401).json({ ok: false, error: "Neautorizat." });
+    }
+    res.json({ ok: true, closed: await closeSignal(req.body) });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
   }
 });
 
 app.post("/api/test-signal", async (req, res) => {
-  const key = req.body?.adminKey || req.get("x-admin-key") || "";
+  const key = req.body?.adminKey || "";
   if (!ADMIN_KEY || key !== ADMIN_KEY) {
     return res.status(401).json({ ok: false, error: "Neautorizat." });
   }
 
-  const s = normalize({
+  const signal = normalizeSignal({
+    external_id: `TEST-${Date.now()}`,
     symbol: "US30",
     timeframe: "5",
     signal: "BUY",
@@ -209,15 +329,15 @@ app.post("/api/test-signal", async (req, res) => {
     vwap_confirm: true,
     mtf_confirm: true,
     order_block_confirm: true,
-    reason: "Semnal demonstrativ v3."
+    reason: "Semnal demonstrativ v4."
   });
 
-  await save(s);
-  res.json({ ok: true, signal: s });
+  await saveSignal(signal);
+  res.json({ ok: true, signal });
 });
 
 app.post("/api/clear", async (req, res) => {
-  const key = req.body?.adminKey || req.get("x-admin-key") || "";
+  const key = req.body?.adminKey || "";
   if (!ADMIN_KEY || key !== ADMIN_KEY) {
     return res.status(401).json({ ok: false, error: "Neautorizat." });
   }
@@ -226,7 +346,7 @@ app.post("/api/clear", async (req, res) => {
 });
 
 initDb()
-  .then(() => app.listen(PORT, () => console.log(`PropTrader AI v3 rulează pe portul ${PORT}`)))
+  .then(() => app.listen(PORT, () => console.log(`PropTrader AI v4 rulează pe portul ${PORT}`)))
   .catch(err => {
     console.error(err);
     process.exit(1);
