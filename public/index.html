@@ -1,134 +1,44 @@
 <!doctype html>
-<html lang="ro">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PropTrader AI v6</title>
+<html lang="ro"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PropTrader AI v9</title>
 <style>
-:root{--bg:#07101d;--panel:#0f1b2d;--border:#273a55;--text:#edf4ff;--muted:#9db0c9;--green:#34d399;--red:#fb7185;--yellow:#fbbf24;--blue:#60a5fa}
-*{box-sizing:border-box}body{margin:0;font-family:Segoe UI,Arial;background:linear-gradient(#07101d,#0b1424);color:var(--text)}
-header{position:sticky;top:0;z-index:10;background:#08111ff5;border-bottom:1px solid var(--border);padding:14px 20px;display:flex;justify-content:space-between;align-items:center}
-main{max-width:1650px;margin:auto;padding:18px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:13px}
-.card{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:15px}.kpi{font-size:28px;font-weight:700;margin-top:6px}
-.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.right{margin-left:auto}.muted{color:var(--muted)}.small{font-size:12px}
-.badge{padding:5px 10px;border-radius:999px;font-size:12px;font-weight:700}.buy{background:#064e3b;color:var(--green)}.sell{background:#5f1725;color:var(--red)}
-.open{background:#15395b;color:#93c5fd}.closed{background:#344155;color:#e5e7eb}.tp{color:var(--green)}.sl{color:var(--red)}
-button,.btn{background:#1d4ed8;border:1px solid #3b82f6;color:#fff;padding:9px 13px;border-radius:9px;cursor:pointer;text-decoration:none}
-input,select{padding:9px;border-radius:8px;border:1px solid var(--border);background:#091525;color:#fff}
-.signal{margin-top:12px}.status{width:10px;height:10px;border-radius:50%;background:var(--green);display:inline-block}
-.tags{display:flex;gap:6px;flex-wrap:wrap}.tag{font-size:11px;border:1px solid var(--border);padding:3px 7px;border-radius:999px}
-.chart{width:100%;height:290px;background:#091525;border:1px solid var(--border);border-radius:10px}
-table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:8px;border-bottom:1px solid var(--border);text-align:left}th{color:var(--muted)}
-.scoregrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;margin-top:10px}.scoreitem{background:#091525;border:1px solid var(--border);border-radius:8px;padding:8px}
-</style>
-</head>
-<body>
-<header>
-<div><h1 style="margin:0;font-size:21px">PropTrader AI v6</h1><div class="muted small">Structură avansată • Fibonacci • Premium/Discount • Kill Zones • scor explicat</div></div>
-<div class="row"><span class="status"></span><span id="statusText" class="muted small">Conectare...</span></div>
-</header>
+:root{--bg:#07101d;--panel:#101c2e;--panel2:#0a1525;--border:#263a57;--text:#edf5ff;--muted:#9db0c9;--green:#34d399;--red:#fb7185;--yellow:#fbbf24;--blue:#60a5fa}
+*{box-sizing:border-box}body{margin:0;font-family:Segoe UI,Arial,sans-serif;background:linear-gradient(180deg,#06101d,#0b1424);color:var(--text)}
+header{position:sticky;top:0;z-index:5;padding:15px 22px;background:rgba(7,16,29,.96);border-bottom:1px solid var(--border);display:flex;gap:20px;align-items:center;flex-wrap:wrap}
+h1,h2,h3{margin:0}.subtitle{color:var(--muted);font-size:12px;margin-top:4px}.tabs{display:flex;gap:7px;margin-left:auto}.tab{background:#0b1728;border:1px solid var(--border);padding:9px 13px;border-radius:9px;color:var(--text);cursor:pointer}.tab.active{background:#1d4ed8;border-color:#60a5fa}
+main{max-width:1500px;margin:auto;padding:18px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(185px,1fr));gap:12px}.split{display:grid;grid-template-columns:1.4fr 1fr;gap:12px}.card{background:var(--panel);border:1px solid var(--border);border-radius:13px;padding:15px}.kpi{font-size:27px;font-weight:750;margin-top:5px}.muted{color:var(--muted)}.small{font-size:12px}.row{display:flex;gap:9px;align-items:center;flex-wrap:wrap}.right{margin-left:auto}
+button,.btn,input,select{border-radius:8px;border:1px solid var(--border);padding:9px 11px}button,.btn{background:#1d4ed8;color:#fff;cursor:pointer;text-decoration:none}input,select{background:#081424;color:#fff}.danger{background:#881337}.ghost{background:#0b1728}.badge{padding:4px 9px;border-radius:999px;font-size:12px;font-weight:700}.buy{background:#064e3b;color:var(--green)}.sell{background:#5f1725;color:var(--red)}.open{background:#15395b;color:#93c5fd}.closed{background:#374151}.risk-high{color:var(--red)}.risk-med{color:var(--yellow)}.risk-low{color:var(--green)}
+.signal{margin-top:10px;background:var(--panel2)}.tags{display:flex;gap:5px;flex-wrap:wrap}.tag{font-size:11px;border:1px solid var(--border);padding:3px 6px;border-radius:999px}.hidden{display:none!important}.chart{width:100%;height:250px;background:#081424;border:1px solid var(--border);border-radius:9px}table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:8px;border-bottom:1px solid var(--border);text-align:left}th{color:var(--muted)}.news{border-left:4px solid var(--yellow);padding-left:12px;margin:10px 0}.notice{background:#3d2f0b;border:1px solid #7c5c12;padding:10px;border-radius:9px}.section{margin-top:14px}
+@media(max-width:900px){.split{grid-template-columns:1fr}.tabs{margin-left:0;width:100%;overflow:auto}}
+</style></head>
+<body><header><div><h1>PropTrader AI v9</h1><div class="subtitle">Jurnal activ 24h · arhivă · scor adaptiv · risc din știri</div></div><div class="tabs"><button class="tab active" data-page="dashboard">Dashboard</button><button class="tab" data-page="active">Active</button><button class="tab" data-page="archive">Arhivă</button><button class="tab" data-page="news">Știri</button><button class="tab" data-page="admin">Administrare</button></div><span class="right small muted" id="status">Conectare...</span></header>
 <main>
-<div class="grid">
-<div class="card"><div class="muted">Semnale totale</div><div class="kpi" id="total">0</div></div>
-<div class="card"><div class="muted">Deschise</div><div class="kpi" id="openCount">0</div></div>
-<div class="card"><div class="muted">Închise</div><div class="kpi" id="closedCount">0</div></div>
-<div class="card"><div class="muted">Win rate</div><div class="kpi" id="winRate">0%</div></div>
-<div class="card"><div class="muted">Total R</div><div class="kpi" id="totalR">0R</div></div>
-<div class="card"><div class="muted">Profit factor</div><div class="kpi" id="pf">0</div></div>
-<div class="card"><div class="muted">Scor mediu</div><div class="kpi" id="avgScore">0%</div></div>
-<div class="card"><div class="muted">Probabilitate medie</div><div class="kpi" id="avgProb">0%</div></div>
-</div>
-
-<div class="grid" style="margin-top:14px">
-<div class="card"><h2>Curba rezultatelor</h2><canvas id="equityChart" class="chart"></canvas></div>
-<div class="card"><h2>Performanță pe faza pieței</h2><table><thead><tr><th>Fază</th><th>Închise</th><th>Win rate</th><th>Total R</th></tr></thead><tbody id="phaseStats"></tbody></table></div>
-</div>
-
-<div class="grid" style="margin-top:14px">
-<div class="card"><h2>Performanță pe instrument</h2><table><thead><tr><th>Instrument</th><th>Închise</th><th>Win rate</th><th>Total R</th></tr></thead><tbody id="symbolStats"></tbody></table></div>
-<div class="card"><h2>Premium / Discount</h2><table><thead><tr><th>Zonă</th><th>Închise</th><th>Win rate</th><th>Total R</th></tr></thead><tbody id="pdStats"></tbody></table></div>
-</div>
-
-<div class="card" style="margin-top:14px">
-<div class="row"><h2>Filtre</h2>
-<select id="symbolFilter" onchange="renderSignals()"><option value="">Toate instrumentele</option><option>US30</option><option>XAUUSD</option></select>
-<select id="sideFilter" onchange="renderSignals()"><option value="">BUY + SELL</option><option>BUY</option><option>SELL</option></select>
-<select id="statusFilter" onchange="renderSignals()"><option value="">Toate statusurile</option><option value="OPEN">Deschise</option><option value="CLOSED">Închise</option></select>
-<select id="minScore" onchange="renderSignals()"><option value="0">Orice scor</option><option value="80">Minim 80</option><option value="85">Minim 85</option><option value="90">Minim 90</option></select>
-<a class="btn right" href="/api/export.csv">Export CSV</a>
-<button onclick="loadData()">Actualizează</button>
-</div>
-</div>
-
-<div class="card" style="margin-top:14px"><h2>Jurnal semnale</h2><div id="signals"><p class="muted">Se încarcă...</p></div></div>
-
-<div class="card" style="margin-top:14px">
-<h2>Administrare</h2>
-<div class="row"><input id="adminKey" type="password" placeholder="ADMIN_KEY"><button onclick="testSignal()">Creează semnal test v6</button><button onclick="clearSignals()">Șterge toate semnalele</button></div>
-</div>
+<section id="dashboard" class="page">
+<div class="grid"><div class="card"><div class="muted">Total</div><div class="kpi" id="kTotal">0</div></div><div class="card"><div class="muted">Active 24h</div><div class="kpi" id="kActive">0</div></div><div class="card"><div class="muted">Arhivate</div><div class="kpi" id="kArchived">0</div></div><div class="card"><div class="muted">Win rate</div><div class="kpi" id="kWin">0%</div></div><div class="card"><div class="muted">Total R</div><div class="kpi" id="kR">0R</div></div><div class="card"><div class="muted">Profit factor</div><div class="kpi" id="kPf">0</div></div><div class="card"><div class="muted">Scor adaptiv mediu</div><div class="kpi" id="kAdaptive">0</div></div></div>
+<div class="split section"><div class="card"><h2>Curba rezultatelor</h2><canvas id="chart" class="chart"></canvas></div><div class="card"><h2>Top setup-uri învățate</h2><table><thead><tr><th>Setup</th><th>N</th><th>Win</th><th>Medie R</th></tr></thead><tbody id="topSetups"></tbody></table></div></div>
+<div class="split section"><div class="card"><h2>Pe instrument</h2><table><thead><tr><th>Instrument</th><th>Închise</th><th>Win</th><th>Total R</th></tr></thead><tbody id="symbols"></tbody></table></div><div class="card"><h2>Pe sesiune</h2><table><thead><tr><th>Sesiune</th><th>Închise</th><th>Win</th><th>Total R</th></tr></thead><tbody id="sessions"></tbody></table></div></div>
+</section>
+<section id="active" class="page hidden"><div class="card"><div class="row"><h2>Tranzacții active și recente</h2><span class="muted small">Se arhivează automat după 24 de ore.</span><button class="right" onclick="loadSignals('active')">Actualizează</button></div><div class="row section"><input id="activeSearch" placeholder="Caută US30, XAUUSD..." oninput="renderList('active')"><select id="activeSide" onchange="renderList('active')"><option value="">BUY + SELL</option><option>BUY</option><option>SELL</option></select><select id="activeStatus" onchange="renderList('active')"><option value="">Toate</option><option>OPEN</option><option>CLOSED</option></select></div><div id="activeList"></div></div></section>
+<section id="archive" class="page hidden"><div class="card"><div class="row"><h2>Arhivă</h2><a class="btn right" href="/api/export.csv">Export CSV</a><button onclick="loadSignals('archive')">Actualizează</button></div><div class="row section"><input id="archiveSearch" placeholder="Caută instrument" oninput="renderList('archive')"><select id="archiveSide" onchange="renderList('archive')"><option value="">BUY + SELL</option><option>BUY</option><option>SELL</option></select><select id="archiveStatus" onchange="renderList('archive')"><option value="">Toate</option><option>OPEN</option><option>CLOSED</option></select></div><div id="archiveList"></div></div></section>
+<section id="news" class="page hidden"><div class="split"><div class="card"><div class="row"><h2>Știri analizate</h2><button class="right" onclick="loadNews()">Actualizează</button></div><div id="newsList"></div></div><div class="card"><h2>Cum influențează semnalele</h2><p class="muted">Fiecare știre primește impact 0–100, bias și instrumente relevante. La salvarea unui semnal, scorul adaptiv este penalizat cu 6 puncte pentru risc mediu și 12 puncte pentru risc ridicat.</p><div class="notice small">Fluxul automat de știri trebuie conectat la endpoint-ul <b>/news-webhook</b>. Modulul local analizează imediat titlul și rezumatul primit.</div></div></div></section>
+<section id="admin" class="page hidden"><div class="card"><h2>Administrare</h2><div class="row section"><input id="adminKey" type="password" placeholder="ADMIN_KEY"><button onclick="testSignal()">Semnal test</button><button onclick="testNews()">Știre test</button><button onclick="archiveNow()">Arhivează acum</button><button class="danger" onclick="clearAll()">Șterge toate datele</button></div><p class="muted small">ADMIN_KEY nu este salvat în browser.</p></div></section>
 </main>
 <script>
-const $=id=>document.getElementById(id);
-const fmt=v=>Number(v||0).toLocaleString('ro-RO',{maximumFractionDigits:2});
-let all=[],analytics={summary:{},bySymbol:[],byMarketPhase:[],byPremiumDiscount:[],equityCurve:[]};
-
-async function loadData(){
- try{
-  const d=await(await fetch('/api/signals',{cache:'no-store'})).json();
-  all=d.signals||[];analytics=d.analytics||analytics;
-  $('statusText').textContent='Actualizat '+new Date().toLocaleTimeString('ro-RO');
-  renderSummary();renderTables();renderChart();renderSignals();
- }catch(e){$('statusText').textContent='Eroare conexiune'}
-}
-function renderSummary(){
- const s=analytics.summary||{};
- $('total').textContent=s.total||0;$('openCount').textContent=s.open||0;$('closedCount').textContent=s.closed||0;
- $('winRate').textContent=fmt(s.winRate||0)+'%';$('totalR').textContent=fmt(s.totalR||0)+'R';$('pf').textContent=fmt(s.profitFactor||0);
- $('avgScore').textContent=fmt(s.avgScore||0)+'%';$('avgProb').textContent=fmt(s.avgProbability||0)+'%';
-}
-function rows(items){
- return (items||[]).map(x=>`<tr><td>${x.key}</td><td>${x.closed}</td><td>${fmt(x.winRate)}%</td><td>${fmt(x.totalR)}R</td></tr>`).join('')||'<tr><td colspan="4" class="muted">Fără date</td></tr>';
-}
-function renderTables(){
- $('symbolStats').innerHTML=rows(analytics.bySymbol);
- $('phaseStats').innerHTML=rows(analytics.byMarketPhase);
- $('pdStats').innerHTML=rows(analytics.byPremiumDiscount);
-}
-function renderChart(){
- const c=$('equityChart'),ctx=c.getContext('2d'),ratio=devicePixelRatio||1;
- const w=c.width=c.clientWidth*ratio,h=c.height=c.clientHeight*ratio;ctx.clearRect(0,0,w,h);
- const data=analytics.equityCurve||[];
- if(!data.length){ctx.fillStyle='#9db0c9';ctx.font=`${14*ratio}px Segoe UI`;ctx.fillText('Nu există încă rezultate închise.',20*ratio,35*ratio);return}
- const vals=[0,...data.map(x=>Number(x.equity||0))],mn=Math.min(...vals),mx=Math.max(...vals),range=Math.max(1,mx-mn);
- ctx.strokeStyle='#60a5fa';ctx.lineWidth=2*ratio;ctx.beginPath();
- vals.forEach((v,i)=>{const x=i/(vals.length-1)*w,y=h-((v-mn)/range*h*.82+h*.09);i?ctx.lineTo(x,y):ctx.moveTo(x,y)});ctx.stroke();
-}
-function tagList(x){
- return [x.bos?'BOS':'',x.choch?'CHOCH':'',x.fvg?'FVG':'',x.liquidity_sweep?'Liquidity Sweep':'',x.equal_highs?'Equal Highs':'',x.equal_lows?'Equal Lows':'',x.vwap_confirm?'VWAP':'',x.mtf_confirm?'MTF':'',x.order_block_confirm?'Order Block':'']
- .filter(Boolean).map(t=>`<span class="tag">${t}</span>`).join('');
-}
-function scoreGrid(x){
- const b=x.score_breakdown||{};
- return Object.entries(b).map(([k,v])=>`<div class="scoreitem"><div class="muted small">${k}</div><b>+${fmt(v)}</b></div>`).join('');
-}
-function renderSignals(){
- const sf=$('symbolFilter').value,df=$('sideFilter').value,st=$('statusFilter').value,ms=Number($('minScore').value||0);
- const s=all.filter(x=>(!sf||x.symbol.includes(sf))&&(!df||x.signal===df)&&(!st||x.status===st)&&Number(x.score||0)>=ms);
- $('signals').innerHTML=s.length?s.map(x=>`<div class="card signal">
- <div class="row"><b>${x.symbol}</b><span class="badge ${x.signal.toLowerCase()}">${x.signal}</span><span class="badge ${String(x.status||'OPEN').toLowerCase()}">${x.status||'OPEN'}</span>${x.result?`<span class="${x.result==='SL'?'sl':'tp'}"><b>${x.result}</b> (${fmt(x.pnl_r)}R)</span>`:''}<span class="muted small">${x.timeframe||''}</span><span class="muted small">${x.kill_zone||x.session_name||''}</span><span class="right muted small">${new Date(x.received_at).toLocaleString('ro-RO')}</span></div>
- <p>Entry: <b>${fmt(x.price)}</b> · SL: <b>${fmt(x.sl)}</b> · TP1: <b>${fmt(x.tp1)}</b>${Number(x.tp2)?` · TP2: <b>${fmt(x.tp2)}</b>`:''}${Number(x.tp3)?` · TP3: <b>${fmt(x.tp3)}</b>`:''}</p>
- <p>Scor: <b>${fmt(x.score)}%</b> · Probabilitate estimată: <b>${fmt(x.probability)}%</b></p>
- <p class="small">Structură: <b>${x.structure||'-'}</b> · Fază: <b>${x.market_phase||'-'}</b> · Zonă: <b>${x.premium_discount||'-'}</b> · Fib: <b>${x.fib_zone||'-'}</b></p>
- <p class="small">FVG: <b>${x.fvg_state||'-'}</b> · Order Block: <b>${x.ob_state||x.order_block||'-'}</b></p>
- <div class="tags">${tagList(x)}</div>
- <div class="scoregrid">${scoreGrid(x)}</div>
- ${x.status==='OPEN'?`<div class="row" style="margin-top:10px"><select id="res-${x.external_id}"><option>TP1</option><option>TP2</option><option>TP3</option><option>SL</option><option>BE</option></select><button onclick="closeManual('${x.external_id}')">Închide manual</button></div>`:''}
- </div>`).join(''):'<p class="muted">Nu există semnale pentru filtrele selectate.</p>';
-}
-async function closeManual(id){const result=$('res-'+id).value;const r=await fetch('/api/manual-close',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({adminKey:$('adminKey').value,external_id:id,result})});const d=await r.json();if(!d.ok)return alert(d.error||'Eroare');loadData()}
-async function testSignal(){const r=await fetch('/api/test-signal',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({adminKey:$('adminKey').value})});const d=await r.json();if(!d.ok)return alert(d.error||'Eroare');loadData()}
-async function clearSignals(){if(!confirm('Ștergi toate semnalele?'))return;const r=await fetch('/api/clear',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({adminKey:$('adminKey').value})});const d=await r.json();if(!d.ok)return alert(d.error||'Eroare');loadData()}
-loadData();setInterval(loadData,15000);
-</script>
-</body>
-</html>
+const $=id=>document.getElementById(id),fmt=v=>Number(v||0).toLocaleString('ro-RO',{maximumFractionDigits:2});
+let active=[],archive=[],analytics={summary:{},topSetups:[],bySymbol:[],bySession:[],equityCurve:[]},news=[];
+document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));b.classList.add('active');document.querySelectorAll('.page').forEach(x=>x.classList.add('hidden'));$(b.dataset.page).classList.remove('hidden');if(b.dataset.page==='archive')loadSignals('archive');if(b.dataset.page==='news')loadNews();});
+async function jsonFetch(url,opt){const r=await fetch(url,opt);const d=await r.json();if(!r.ok||d.ok===false)throw new Error(d.error||'Eroare');return d}
+async function loadSignals(mode='active'){try{const d=await jsonFetch('/api/signals?mode='+mode+'&limit=300');if(mode==='active')active=d.signals||[];else archive=d.signals||[];analytics=d.analytics||analytics;renderDashboard();renderList(mode);$('status').textContent='Actualizat '+new Date().toLocaleTimeString('ro-RO')}catch(e){$('status').textContent='Eroare: '+e.message}}
+function renderDashboard(){const s=analytics.summary||{};$('kTotal').textContent=s.total||0;$('kActive').textContent=s.active||0;$('kArchived').textContent=s.archived||0;$('kWin').textContent=fmt(s.winRate)+'%';$('kR').textContent=fmt(s.totalR)+'R';$('kPf').textContent=fmt(s.profitFactor);$('kAdaptive').textContent=fmt(s.avgAdaptiveScore);$('symbols').innerHTML=statsRows(analytics.bySymbol);$('sessions').innerHTML=statsRows(analytics.bySession);$('topSetups').innerHTML=(analytics.topSetups||[]).map(x=>`<tr><td title="${esc(x.key)}">${esc(x.key).slice(0,46)}</td><td>${x.closed}</td><td>${fmt(x.winRate)}%</td><td>${fmt(x.avgR)}R</td></tr>`).join('')||emptyRow();drawChart()}
+function statsRows(a){return(a||[]).map(x=>`<tr><td>${esc(x.key)}</td><td>${x.closed}</td><td>${fmt(x.winRate)}%</td><td>${fmt(x.totalR)}R</td></tr>`).join('')||emptyRow()}function emptyRow(){return'<tr><td colspan="4" class="muted">Fără date suficiente</td></tr>'}
+function drawChart(){const c=$('chart'),ctx=c.getContext('2d'),r=devicePixelRatio||1,w=c.width=c.clientWidth*r,h=c.height=c.clientHeight*r;ctx.clearRect(0,0,w,h);const d=analytics.equityCurve||[];if(!d.length){ctx.fillStyle='#9db0c9';ctx.font=14*r+'px Segoe UI';ctx.fillText('Închide tranzacții pentru a construi curba.',18*r,32*r);return}const a=[0,...d.map(x=>Number(x.equity))],mn=Math.min(...a),mx=Math.max(...a),rg=Math.max(1,mx-mn);ctx.strokeStyle='#60a5fa';ctx.lineWidth=2*r;ctx.beginPath();a.forEach((v,i)=>{const x=i/(a.length-1)*w,y=h-((v-mn)/rg*h*.8+h*.1);i?ctx.lineTo(x,y):ctx.moveTo(x,y)});ctx.stroke()}
+function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
+function age(iso){const h=(Date.now()-new Date(iso))/3600000;return h<1?Math.max(0,Math.round(h*60))+' min':fmt(h)+' h'}
+function riskClass(v){return v>=80?'risk-high':v>=55?'risk-med':'risk-low'}
+function renderList(mode){const data=mode==='active'?active:archive,q=$(mode+'Search').value.toUpperCase(),side=$(mode+'Side').value,status=$(mode+'Status').value;const arr=data.filter(x=>(!q||String(x.symbol).toUpperCase().includes(q))&&(!side||x.signal===side)&&(!status||x.status===status));$(mode+'List').innerHTML=arr.map(signalCard).join('')||'<p class="muted">Nu există tranzacții pentru filtrele selectate.</p>'}
+function signalCard(x){return `<div class="card signal"><div class="row"><b>${esc(x.symbol)}</b><span class="badge ${String(x.signal).toLowerCase()}">${esc(x.signal)}</span><span class="badge ${String(x.status||'OPEN').toLowerCase()}">${esc(x.status||'OPEN')}</span>${x.result?`<b>${esc(x.result)} (${fmt(x.pnl_r)}R)</b>`:''}<span class="muted small">${esc(x.timeframe||'')} · ${esc(x.session_name||x.kill_zone||'')}</span><span class="right muted small">${new Date(x.received_at).toLocaleString('ro-RO')} · ${age(x.received_at)}</span></div><p>Entry <b>${fmt(x.price)}</b> · SL <b>${fmt(x.sl)}</b> · TP1 <b>${fmt(x.tp1)}</b> · TP2 <b>${fmt(x.tp2)}</b> · TP3 <b>${fmt(x.tp3)}</b></p><p>Scor Pine <b>${fmt(x.score)}</b> · ajustare învățare <b>${Number(x.learning_adjustment)>=0?'+':''}${fmt(x.learning_adjustment)}</b> · scor adaptiv <b>${fmt(x.adaptive_score||x.score)}</b></p><p class="small ${riskClass(Number(x.news_risk))}">Risc știri: <b>${fmt(x.news_risk)}/100</b> · bias ${esc(x.news_bias||'NEUTRAL')}</p>${x.news_summary?`<p class="small muted">${esc(x.news_summary)}</p>`:''}<div class="tags">${[x.structure,x.market_phase,x.premium_discount,x.bos?'BOS':'',x.choch?'CHOCH':'',x.fvg?'FVG':'',x.liquidity_sweep?'Sweep':''].filter(Boolean).map(t=>`<span class="tag">${esc(t)}</span>`).join('')}</div>${x.status==='OPEN'?`<div class="row section"><select id="r-${esc(x.external_id)}"><option>TP1</option><option>TP2</option><option>TP3</option><option>SL</option><option>BE</option><option>EXPIRED</option></select><button onclick="closeTrade('${esc(x.external_id)}')">Închide</button></div>`:''}</div>`}
+async function closeTrade(id){try{await jsonFetch('/api/manual-close',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({adminKey:$('adminKey').value,external_id:id,result:$('r-'+id).value})});loadSignals('active')}catch(e){alert(e.message)}}
+async function loadNews(){try{const d=await jsonFetch('/api/news?limit=100');news=d.news||[];$('newsList').innerHTML=news.map(n=>`<div class="news"><div class="row"><b>${esc(n.title)}</b><span class="right ${riskClass(Number(n.impact))}">${fmt(n.impact)}/100</span></div><div class="small muted">${new Date(n.published_at).toLocaleString('ro-RO')} · ${esc(n.source||'sursă nespecificată')} · ${esc(n.category||'GENERAL')} · ${esc(n.bias||'NEUTRAL')}</div><p class="small">${esc(n.summary||'')}</p><div class="tags">${(n.symbols||[]).map(s=>`<span class="tag">${esc(s)}</span>`).join('')}</div></div>`).join('')||'<p class="muted">Nu există încă știri. Folosește testul sau conectează fluxul extern.</p>'}catch(e){alert(e.message)}}
+const adminBody=x=>JSON.stringify({adminKey:$('adminKey').value,...x});async function testSignal(){try{await jsonFetch('/api/test-signal',{method:'POST',headers:{'content-type':'application/json'},body:adminBody({})});loadSignals('active')}catch(e){alert(e.message)}}async function testNews(){try{await jsonFetch('/api/test-news',{method:'POST',headers:{'content-type':'application/json'},body:adminBody({})});loadNews()}catch(e){alert(e.message)}}async function archiveNow(){try{const d=await jsonFetch('/api/archive-now',{method:'POST',headers:{'content-type':'application/json'},body:adminBody({})});alert('Arhivate: '+d.archived);loadSignals('active')}catch(e){alert(e.message)}}async function clearAll(){if(!confirm('Ștergi definitiv toate semnalele și știrile?'))return;try{await jsonFetch('/api/clear',{method:'POST',headers:{'content-type':'application/json'},body:adminBody({})});active=[];archive=[];news=[];loadSignals('active')}catch(e){alert(e.message)}}
+loadSignals('active');setInterval(()=>loadSignals('active'),30000);
+</script></body></html>

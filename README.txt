@@ -1,44 +1,35 @@
-PROPTRADER AI v6 — STRUCTURĂ AVANSATĂ
+PropTrader AI v9.0
 
-Actualizare:
-1. Dezarhivează arhiva.
-2. În GitHub înlocuiește:
-   - package.json
-   - server.js
-   - public/index.html
-3. Adaugă:
-   - PropTrader_AI_v6_Engine.pine
-4. Commit changes și așteaptă redeploy-ul Render.
+Funcții:
+- jurnal activ: numai semnalele nearhivate;
+- arhivare automată după 24 ore (configurabil prin ARCHIVE_AFTER_HOURS);
+- arhivă separată și export CSV;
+- scor adaptiv bazat pe performanța setup-urilor închise;
+- modul de știri cu impact, bias și instrumente relevante;
+- penalizare automată a scorului în jurul știrilor cu impact mediu/ridicat.
 
-Funcții v6:
-- HH / HL / LH / LL
-- Equal Highs / Equal Lows
-- Premium / Discount
-- Fibonacci OTE 0.618–0.705
-- Kill Zones
-- fază de piață
-- stare FVG
-- stare Order Block
-- explicația detaliată a scorului
-- statistici pe faza pieței și premium/discount
-
-Test:
-1. Introdu ADMIN_KEY.
-2. Apasă Creează semnal test v6.
-3. Verifică blocul cu detalierea punctajului.
+Variabile Render:
+DATABASE_URL = baza PostgreSQL
+WEBHOOK_KEY = cheia alertelor TradingView
+ADMIN_KEY = cheia de administrare
+NEWS_WEBHOOK_KEY = cheia fluxului de știri (opțional; implicit WEBHOOK_KEY)
+ARCHIVE_AFTER_HOURS = 24
 
 TradingView:
-1. Copiază PropTrader_AI_v6_Engine.pine în Pine Editor.
-2. Save și Add to chart.
-3. Creează alerta cu Any alert() function call.
-4. Webhook:
-   https://ADRESA-TA.onrender.com/webhook?key=WEBHOOK_KEY
+POST /webhook?key=WEBHOOK_KEY
 
-Configurație inițială:
-- US30 M5, HTF M15
-- XAUUSD M5, HTF M15
-- Scor minim 85
-- Kill Zone activă
+Flux de știri:
+POST /news-webhook?key=NEWS_WEBHOOK_KEY
+Content-Type: application/json
+Exemplu:
+{
+  "external_id":"news-123",
+  "published_at":"2026-07-28T15:00:00Z",
+  "title":"FOMC interest rate decision",
+  "summary":"Federal Reserve announces its rate decision",
+  "source":"Economic feed",
+  "symbols":["US30","NAS100","XAUUSD"]
+}
 
-Notă:
-Motorul rămâne unul bazat pe reguli tehnice și scor euristic. Nu este un model ML validat.
+Observație:
+Modulul învață statistic numai din tranzacții închise. Ajustarea este limitată la +/-12 puncte și capătă greutate treptat până la minimum 30 de exemple, pentru a reduce supraînvățarea.

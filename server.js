@@ -1,4 +1,3 @@
-
 const express = require("express");
 const path = require("path");
 const { Pool } = require("pg");
@@ -7,17 +6,33 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const WEBHOOK_KEY = process.env.WEBHOOK_KEY || "";
 const ADMIN_KEY = process.env.ADMIN_KEY || "";
+const NEWS_WEBHOOK_KEY = process.env.NEWS_WEBHOOK_KEY || WEBHOOK_KEY;
 const DATABASE_URL = process.env.DATABASE_URL || "";
+const ARCHIVE_AFTER_HOURS = Math.max(1, Number(process.env.ARCHIVE_AFTER_HOURS || 24));
 
 const pool = DATABASE_URL
   ? new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } })
   : null;
 
 let memorySignals = [];
+let memoryNews = [];
 
-app.use(express.json({ limit: "600kb" }));
-app.use(express.text({ type: "text/plain", limit: "600kb" }));
+app.use(express.json({ limit: "800kb" }));
+app.use(express.text({ type: ["text/plain", "application/text"], limit: "800kb" }));
 app.use(express.static(path.join(__dirname, "public")));
+
+const num = (v, fallback = 0) => {
+  const x = Number(v);
+  return Number.isFinite(x) ? x : fallback;
+};
+const bool = v => v === true || v === "true" || v === 1 || v === "1";
+const clean = (v, n = 200) => String(v ?? "").trim().slice(0, n);
+const hoursAgoIso = h => new Date(Date.now() - h * 3600000).toISOString();
+
+function safeJson(v, fallback = {}) {
+  if (v && typeof v === "object" && !Array.isArray(v)) return v;
+  try { return JSON.parse(v); } catch { return fallback; }
+}
 
 async function initDb() {
   if (!pool) return;
@@ -32,379 +47,345 @@ async function initDb() {
   `);
 
   const columns = [
-    ["external_id", "TEXT"],
-    ["closed_at", "TIMESTAMPTZ"],
-    ["timeframe", "TEXT"],
-    ["status", "TEXT NOT NULL DEFAULT 'OPEN'"],
-    ["result", "TEXT"],
-    ["price", "NUMERIC"],
-    ["sl", "NUMERIC"],
-    ["tp1", "NUMERIC"],
-    ["tp2", "NUMERIC"],
-    ["tp3", "NUMERIC"],
-    ["exit_price", "NUMERIC"],
-    ["pnl_r", "NUMERIC"],
-    ["score", "NUMERIC"],
-    ["probability", "NUMERIC"],
-    ["rsi", "NUMERIC"],
-    ["atr", "NUMERIC"],
-    ["rr", "NUMERIC"],
-    ["trend", "TEXT"],
-    ["structure", "TEXT"],
-    ["session_name", "TEXT"],
-    ["mtf_trend", "TEXT"],
-    ["vwap_side", "TEXT"],
-    ["order_block", "TEXT"],
-    ["bos", "BOOLEAN DEFAULT FALSE"],
-    ["choch", "BOOLEAN DEFAULT FALSE"],
-    ["fvg", "BOOLEAN DEFAULT FALSE"],
-    ["liquidity_sweep", "BOOLEAN DEFAULT FALSE"],
-    ["vwap_confirm", "BOOLEAN DEFAULT FALSE"],
-    ["mtf_confirm", "BOOLEAN DEFAULT FALSE"],
-    ["order_block_confirm", "BOOLEAN DEFAULT FALSE"],
-    ["market_phase", "TEXT"],
-    ["equal_highs", "BOOLEAN DEFAULT FALSE"],
-    ["equal_lows", "BOOLEAN DEFAULT FALSE"],
-    ["premium_discount", "TEXT"],
-    ["fib_zone", "TEXT"],
-    ["fvg_state", "TEXT"],
-    ["ob_state", "TEXT"],
-    ["kill_zone", "TEXT"],
-    ["score_breakdown", "JSONB"],
-    ["reason", "TEXT"]
+    ["external_id", "TEXT"], ["closed_at", "TIMESTAMPTZ"], ["archived_at", "TIMESTAMPTZ"],
+    ["timeframe", "TEXT"], ["status", "TEXT NOT NULL DEFAULT 'OPEN'"], ["result", "TEXT"],
+    ["price", "NUMERIC"], ["sl", "NUMERIC"], ["tp1", "NUMERIC"], ["tp2", "NUMERIC"],
+    ["tp3", "NUMERIC"], ["exit_price", "NUMERIC"], ["pnl_r", "NUMERIC"], ["score", "NUMERIC"],
+    ["probability", "NUMERIC"], ["adaptive_score", "NUMERIC"], ["learning_adjustment", "NUMERIC DEFAULT 0"],
+    ["rsi", "NUMERIC"], ["atr", "NUMERIC"], ["rr", "NUMERIC"], ["trend", "TEXT"],
+    ["structure", "TEXT"], ["session_name", "TEXT"], ["mtf_trend", "TEXT"], ["vwap_side", "TEXT"],
+    ["order_block", "TEXT"], ["bos", "BOOLEAN DEFAULT FALSE"], ["choch", "BOOLEAN DEFAULT FALSE"],
+    ["fvg", "BOOLEAN DEFAULT FALSE"], ["liquidity_sweep", "BOOLEAN DEFAULT FALSE"],
+    ["vwap_confirm", "BOOLEAN DEFAULT FALSE"], ["mtf_confirm", "BOOLEAN DEFAULT FALSE"],
+    ["order_block_confirm", "BOOLEAN DEFAULT FALSE"], ["market_phase", "TEXT"],
+    ["equal_highs", "BOOLEAN DEFAULT FALSE"], ["equal_lows", "BOOLEAN DEFAULT FALSE"],
+    ["premium_discount", "TEXT"], ["fib_zone", "TEXT"], ["fvg_state", "TEXT"], ["ob_state", "TEXT"],
+    ["kill_zone", "TEXT"], ["score_breakdown", "JSONB"], ["reason", "TEXT"],
+    ["news_risk", "INTEGER DEFAULT 0"], ["news_bias", "TEXT DEFAULT 'NEUTRAL'"],
+    ["news_summary", "TEXT"], ["setup_key", "TEXT"]
   ];
-
   for (const [name, type] of columns) {
     await pool.query(`ALTER TABLE signals ADD COLUMN IF NOT EXISTS ${name} ${type}`);
   }
 
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS signals_external_id_unique ON signals (external_id) WHERE external_id IS NOT NULL`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS signals_received_idx ON signals (received_at DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS signals_archive_idx ON signals (archived_at, received_at DESC)`);
+
   await pool.query(`
-    CREATE UNIQUE INDEX IF NOT EXISTS signals_external_id_unique
-    ON signals (external_id)
-    WHERE external_id IS NOT NULL
+    CREATE TABLE IF NOT EXISTS news_events (
+      id BIGSERIAL PRIMARY KEY,
+      external_id TEXT,
+      published_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      title TEXT NOT NULL,
+      summary TEXT,
+      source TEXT,
+      url TEXT,
+      symbols TEXT[] DEFAULT '{}',
+      impact INTEGER NOT NULL DEFAULT 0,
+      bias TEXT NOT NULL DEFAULT 'NEUTRAL',
+      category TEXT,
+      raw JSONB
+    )
   `);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS news_external_id_unique ON news_events (external_id) WHERE external_id IS NOT NULL`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS news_published_idx ON news_events (published_at DESC)`);
 }
 
-const num = (v, fallback = 0) => {
-  const x = Number(v);
-  return Number.isFinite(x) ? x : fallback;
-};
-
-const bool = v => v === true || v === "true" || v === 1 || v === "1";
-
-function safeBreakdown(v) {
-  if (!v) return {};
-  if (typeof v === "object" && !Array.isArray(v)) return v;
-  try { return JSON.parse(v); } catch { return {}; }
+function setupKey(p) {
+  return [
+    clean(p.symbol || "N/A", 30).toUpperCase(), clean(p.signal || p.side || "WAIT", 10).toUpperCase(),
+    clean(p.session || p.session_name || "N/A", 40), clean(p.structure || "N/A", 80),
+    bool(p.bos) ? "BOS" : "", bool(p.choch) ? "CHOCH" : "", bool(p.fvg) ? "FVG" : "",
+    bool(p.liquidity_sweep || p.sweep) ? "SWEEP" : "", bool(p.vwap_confirm) ? "VWAP" : "",
+    bool(p.mtf_confirm) ? "MTF" : ""
+  ].filter(Boolean).join("|").slice(0, 300);
 }
 
 function normalizeSignal(p) {
   const score = Math.max(0, Math.min(100, num(p.score, 50)));
   return {
-    external_id: String(p.external_id || p.signal_id || `${Date.now()}-${Math.random().toString(36).slice(2,8)}`).slice(0,120),
-    received_at: new Date().toISOString(),
-    symbol: String(p.symbol || p.ticker || "N/A").slice(0,30),
-    timeframe: String(p.timeframe || p.interval || "").slice(0,20),
-    signal: String(p.signal || p.side || "WAIT").toUpperCase(),
-    status: "OPEN",
-    price: num(p.price ?? p.close),
-    sl: num(p.sl),
-    tp1: num(p.tp1 ?? p.tp),
-    tp2: num(p.tp2),
-    tp3: num(p.tp3),
-    score,
-    probability: Math.max(0, Math.min(100, num(p.probability, score))),
-    rsi: num(p.rsi),
-    atr: num(p.atr),
-    rr: num(p.rr),
-    trend: String(p.trend || "").slice(0,50),
-    structure: String(p.structure || "").slice(0,120),
-    session_name: String(p.session || p.session_name || "").slice(0,50),
-    mtf_trend: String(p.mtf_trend || "").slice(0,50),
-    vwap_side: String(p.vwap_side || "").slice(0,50),
-    order_block: String(p.order_block || "").slice(0,100),
-    bos: bool(p.bos),
-    choch: bool(p.choch),
-    fvg: bool(p.fvg),
-    liquidity_sweep: bool(p.liquidity_sweep || p.sweep),
-    vwap_confirm: bool(p.vwap_confirm),
-    mtf_confirm: bool(p.mtf_confirm),
-    order_block_confirm: bool(p.order_block_confirm),
-    market_phase: String(p.market_phase || "").slice(0,40),
-    equal_highs: bool(p.equal_highs),
-    equal_lows: bool(p.equal_lows),
-    premium_discount: String(p.premium_discount || "").slice(0,40),
-    fib_zone: String(p.fib_zone || "").slice(0,60),
-    fvg_state: String(p.fvg_state || "").slice(0,50),
-    ob_state: String(p.ob_state || "").slice(0,50),
-    kill_zone: String(p.kill_zone || "").slice(0,50),
-    score_breakdown: safeBreakdown(p.score_breakdown),
-    reason: String(p.reason || p.setup || "").slice(0,2200)
+    external_id: clean(p.external_id || p.signal_id || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, 120),
+    received_at: new Date().toISOString(), symbol: clean(p.symbol || p.ticker || "N/A", 30).toUpperCase(),
+    timeframe: clean(p.timeframe || p.interval, 20), signal: clean(p.signal || p.side || "WAIT", 10).toUpperCase(),
+    status: "OPEN", price: num(p.price ?? p.close), sl: num(p.sl), tp1: num(p.tp1 ?? p.tp), tp2: num(p.tp2), tp3: num(p.tp3),
+    score, probability: Math.max(0, Math.min(100, num(p.probability, score))), adaptive_score: score, learning_adjustment: 0,
+    rsi: num(p.rsi), atr: num(p.atr), rr: num(p.rr), trend: clean(p.trend, 50), structure: clean(p.structure, 120),
+    session_name: clean(p.session || p.session_name, 50), mtf_trend: clean(p.mtf_trend, 50), vwap_side: clean(p.vwap_side, 50),
+    order_block: clean(p.order_block, 100), bos: bool(p.bos), choch: bool(p.choch), fvg: bool(p.fvg),
+    liquidity_sweep: bool(p.liquidity_sweep || p.sweep), vwap_confirm: bool(p.vwap_confirm), mtf_confirm: bool(p.mtf_confirm),
+    order_block_confirm: bool(p.order_block_confirm), market_phase: clean(p.market_phase, 40), equal_highs: bool(p.equal_highs),
+    equal_lows: bool(p.equal_lows), premium_discount: clean(p.premium_discount, 40), fib_zone: clean(p.fib_zone, 60),
+    fvg_state: clean(p.fvg_state, 50), ob_state: clean(p.ob_state, 50), kill_zone: clean(p.kill_zone, 50),
+    score_breakdown: safeJson(p.score_breakdown), reason: clean(p.reason || p.setup, 2200), setup_key: setupKey(p),
+    news_risk: 0, news_bias: "NEUTRAL", news_summary: ""
   };
 }
 
+function newsSymbols(text) {
+  const t = text.toUpperCase();
+  const out = new Set();
+  if (/DOW|US30|DJIA|WALL STREET|FED|FOMC|CPI|NFP|JOBS|INFLATION|INTEREST RATE/.test(t)) out.add("US30");
+  if (/NASDAQ|NAS100|NDX|TECH STOCK|SEMICONDUCTOR/.test(t)) out.add("NAS100");
+  if (/GOLD|XAU|BULLION|METAL|FED|FOMC|CPI|INFLATION|DOLLAR|TREASURY/.test(t)) out.add("XAUUSD");
+  return [...out];
+}
+
+function analyzeNewsText(title, summary = "") {
+  const text = `${title} ${summary}`.toLowerCase();
+  let impact = 15;
+  let category = "GENERAL";
+  const high = ["fomc", "federal reserve", "interest rate", "rate decision", "cpi", "inflation", "nonfarm", "nfp", "payroll", "unemployment", "gdp", "pce", "powell", "war", "missile", "sanction", "tariff", "bank crisis"];
+  const medium = ["jobless claims", "retail sales", "consumer confidence", "ism", "pmi", "treasury yield", "dollar index", "earnings", "oil price"];
+  if (high.some(k => text.includes(k))) impact = 90;
+  else if (medium.some(k => text.includes(k))) impact = 60;
+  else if (/breaking|unexpected|surprise|emergency|record/.test(text)) impact = 45;
+
+  if (/fomc|federal reserve|interest rate|powell/.test(text)) category = "CENTRAL_BANK";
+  else if (/cpi|inflation|pce/.test(text)) category = "INFLATION";
+  else if (/nonfarm|nfp|payroll|unemployment|jobless/.test(text)) category = "LABOR";
+  else if (/war|missile|sanction|tariff/.test(text)) category = "GEOPOLITICAL";
+  else if (/earnings/.test(text)) category = "EARNINGS";
+
+  const positive = ["beats", "stronger", "growth", "rally", "easing", "rate cut", "cooling inflation", "ceasefire", "stimulus"];
+  const negative = ["misses", "weaker", "recession", "selloff", "rate hike", "hot inflation", "escalation", "default", "crisis"];
+  const pos = positive.filter(k => text.includes(k)).length;
+  const neg = negative.filter(k => text.includes(k)).length;
+  const bias = pos > neg ? "POSITIVE" : neg > pos ? "NEGATIVE" : "NEUTRAL";
+  return { impact, bias, category, symbols: newsSymbols(`${title} ${summary}`) };
+}
+
+function normalizeNews(p) {
+  const title = clean(p.title || p.headline || p.name || "Știre fără titlu", 500);
+  const summary = clean(p.summary || p.description || p.content, 3000);
+  const a = analyzeNewsText(title, summary);
+  const suppliedImpact = num(p.impact, NaN);
+  return {
+    external_id: clean(p.external_id || p.id || p.guid || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, 180),
+    published_at: p.published_at || p.publishedAt || p.date || new Date().toISOString(), title, summary,
+    source: clean(p.source?.name || p.source, 150), url: clean(p.url, 1000),
+    symbols: Array.isArray(p.symbols) && p.symbols.length ? p.symbols.map(x => clean(x, 30).toUpperCase()) : a.symbols,
+    impact: Number.isFinite(suppliedImpact) ? Math.max(0, Math.min(100, suppliedImpact)) : a.impact,
+    bias: clean(p.bias || a.bias, 20).toUpperCase(), category: clean(p.category || a.category, 50), raw: p
+  };
+}
+
+async function recentNewsRisk(symbol, at = new Date()) {
+  const from = new Date(at.getTime() - 3 * 3600000).toISOString();
+  const to = new Date(at.getTime() + 1 * 3600000).toISOString();
+  let rows;
+  if (!pool) {
+    rows = memoryNews.filter(n => new Date(n.published_at) >= new Date(from) && new Date(n.published_at) <= new Date(to));
+  } else {
+    rows = (await pool.query(`SELECT * FROM news_events WHERE published_at BETWEEN $1 AND $2 ORDER BY impact DESC, published_at DESC LIMIT 20`, [from, to])).rows;
+  }
+  const relevant = rows.filter(n => !n.symbols?.length || n.symbols.includes(symbol) || (symbol.includes("XAU") && n.symbols.includes("XAUUSD")));
+  if (!relevant.length) return { risk: 0, bias: "NEUTRAL", summary: "Fără știri relevante în fereastra ±3h." };
+  const max = relevant.reduce((a, n) => Number(n.impact) > Number(a.impact) ? n : a, relevant[0]);
+  return { risk: Number(max.impact || 0), bias: max.bias || "NEUTRAL", summary: relevant.slice(0, 3).map(n => n.title).join(" • ").slice(0, 1200) };
+}
+
+async function archiveOldSignals() {
+  const cutoff = hoursAgoIso(ARCHIVE_AFTER_HOURS);
+  if (!pool) {
+    let count = 0;
+    for (const s of memorySignals) if (!s.archived_at && new Date(s.received_at) < new Date(cutoff)) { s.archived_at = new Date().toISOString(); count++; }
+    return count;
+  }
+  const q = await pool.query(`UPDATE signals SET archived_at=NOW() WHERE archived_at IS NULL AND received_at < $1 RETURNING id`, [cutoff]);
+  return q.rowCount;
+}
+
+async function setupPerformance(key) {
+  if (!key) return { samples: 0, adjustment: 0, winRate: 0, avgR: 0 };
+  let rows;
+  if (!pool) rows = memorySignals.filter(x => x.setup_key === key && x.status === "CLOSED").slice(0, 200);
+  else rows = (await pool.query(`SELECT pnl_r FROM signals WHERE setup_key=$1 AND status='CLOSED' ORDER BY closed_at DESC LIMIT 200`, [key])).rows;
+  const samples = rows.length;
+  if (!samples) return { samples: 0, adjustment: 0, winRate: 0, avgR: 0 };
+  const totalR = rows.reduce((a, x) => a + num(x.pnl_r), 0);
+  const wins = rows.filter(x => num(x.pnl_r) > 0).length;
+  const winRate = wins / samples * 100;
+  const avgR = totalR / samples;
+  const confidence = Math.min(1, samples / 30);
+  const raw = (winRate - 50) * 0.18 + avgR * 4;
+  const adjustment = Math.max(-12, Math.min(12, raw * confidence));
+  return { samples, adjustment, winRate, avgR };
+}
+
 async function saveSignal(s) {
+  const perf = await setupPerformance(s.setup_key);
+  const news = await recentNewsRisk(s.symbol);
+  const newsPenalty = news.risk >= 80 ? -12 : news.risk >= 55 ? -6 : 0;
+  s.learning_adjustment = Number(perf.adjustment.toFixed(2));
+  s.adaptive_score = Math.max(0, Math.min(100, Number((s.score + perf.adjustment + newsPenalty).toFixed(2))));
+  s.news_risk = news.risk; s.news_bias = news.bias; s.news_summary = news.summary;
+
   if (!pool) {
     if (memorySignals.some(x => x.external_id === s.external_id)) return;
-    memorySignals.unshift({ id: Date.now(), ...s });
+    memorySignals.unshift({ id: Date.now(), archived_at: null, ...s });
     return;
   }
-
   await pool.query(`
     INSERT INTO signals (
-      external_id,received_at,symbol,timeframe,signal,status,price,sl,tp1,tp2,tp3,
-      score,probability,rsi,atr,rr,trend,structure,session_name,mtf_trend,vwap_side,
-      order_block,bos,choch,fvg,liquidity_sweep,vwap_confirm,mtf_confirm,
-      order_block_confirm,market_phase,equal_highs,equal_lows,premium_discount,
-      fib_zone,fvg_state,ob_state,kill_zone,score_breakdown,reason
-    ) VALUES (
-      $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
-      $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39
-    )
-    ON CONFLICT DO NOTHING
+      external_id,received_at,symbol,timeframe,signal,status,price,sl,tp1,tp2,tp3,score,probability,
+      adaptive_score,learning_adjustment,rsi,atr,rr,trend,structure,session_name,mtf_trend,vwap_side,
+      order_block,bos,choch,fvg,liquidity_sweep,vwap_confirm,mtf_confirm,order_block_confirm,market_phase,
+      equal_highs,equal_lows,premium_discount,fib_zone,fvg_state,ob_state,kill_zone,score_breakdown,reason,
+      news_risk,news_bias,news_summary,setup_key
+    ) VALUES (${Array.from({length:45},(_,i)=>`$${i+1}`).join(',')}) ON CONFLICT DO NOTHING
   `, [
-    s.external_id,s.received_at,s.symbol,s.timeframe,s.signal,s.status,s.price,s.sl,
-    s.tp1,s.tp2,s.tp3,s.score,s.probability,s.rsi,s.atr,s.rr,s.trend,s.structure,
-    s.session_name,s.mtf_trend,s.vwap_side,s.order_block,s.bos,s.choch,s.fvg,
-    s.liquidity_sweep,s.vwap_confirm,s.mtf_confirm,s.order_block_confirm,
-    s.market_phase,s.equal_highs,s.equal_lows,s.premium_discount,s.fib_zone,
-    s.fvg_state,s.ob_state,s.kill_zone,JSON.stringify(s.score_breakdown),s.reason
+    s.external_id,s.received_at,s.symbol,s.timeframe,s.signal,s.status,s.price,s.sl,s.tp1,s.tp2,s.tp3,s.score,s.probability,
+    s.adaptive_score,s.learning_adjustment,s.rsi,s.atr,s.rr,s.trend,s.structure,s.session_name,s.mtf_trend,s.vwap_side,
+    s.order_block,s.bos,s.choch,s.fvg,s.liquidity_sweep,s.vwap_confirm,s.mtf_confirm,s.order_block_confirm,s.market_phase,
+    s.equal_highs,s.equal_lows,s.premium_discount,s.fib_zone,s.fvg_state,s.ob_state,s.kill_zone,JSON.stringify(s.score_breakdown),s.reason,
+    s.news_risk,s.news_bias,s.news_summary,s.setup_key
   ]);
 }
 
-async function listSignals() {
+async function saveNews(n) {
+  if (!pool) {
+    if (memoryNews.some(x => x.external_id === n.external_id)) return;
+    memoryNews.unshift({ id: Date.now(), received_at: new Date().toISOString(), ...n });
+    memoryNews = memoryNews.slice(0, 1000);
+    return;
+  }
+  await pool.query(`INSERT INTO news_events (external_id,published_at,title,summary,source,url,symbols,impact,bias,category,raw)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT DO NOTHING`,
+    [n.external_id,n.published_at,n.title,n.summary,n.source,n.url,n.symbols,n.impact,n.bias,n.category,JSON.stringify(n.raw)]);
+}
+
+async function listSignals(mode = "active", filters = {}) {
+  await archiveOldSignals();
+  const limit = Math.min(500, Math.max(1, num(filters.limit, mode === "archive" ? 200 : 100)));
+  if (!pool) {
+    let arr = memorySignals.filter(x => mode === "archive" ? !!x.archived_at : !x.archived_at);
+    if (filters.symbol) arr = arr.filter(x => x.symbol.includes(filters.symbol.toUpperCase()));
+    if (filters.side) arr = arr.filter(x => x.signal === filters.side.toUpperCase());
+    if (filters.status) arr = arr.filter(x => x.status === filters.status.toUpperCase());
+    return arr.slice(0, limit);
+  }
+  const cond = [mode === "archive" ? "archived_at IS NOT NULL" : "archived_at IS NULL"];
+  const vals = [];
+  const add = (sql, val) => { vals.push(val); cond.push(sql.replace("?", `$${vals.length}`)); };
+  if (filters.symbol) add("symbol ILIKE ?", `%${filters.symbol}%`);
+  if (filters.side) add("signal = ?", filters.side.toUpperCase());
+  if (filters.status) add("status = ?", filters.status.toUpperCase());
+  vals.push(limit);
+  return (await pool.query(`SELECT * FROM signals WHERE ${cond.join(" AND ")} ORDER BY received_at DESC LIMIT $${vals.length}`, vals)).rows;
+}
+
+async function allSignalsForAnalytics() {
   if (!pool) return memorySignals;
-  return (await pool.query("SELECT * FROM signals ORDER BY received_at DESC LIMIT 2500")).rows;
+  return (await pool.query("SELECT * FROM signals ORDER BY received_at DESC LIMIT 10000")).rows;
 }
 
 function groupStats(data, keyFn) {
   const map = {};
   for (const x of data) {
     const key = keyFn(x) || "N/A";
-    if (!map[key]) map[key] = { key, total:0, closed:0, wins:0, losses:0, totalR:0 };
-    const g = map[key];
-    g.total++;
-    if (x.status === "CLOSED") {
-      g.closed++;
-      const r = Number(x.pnl_r || 0);
-      g.totalR += r;
-      if (r > 0) g.wins++;
-      if (r < 0) g.losses++;
-    }
+    if (!map[key]) map[key] = { key, total: 0, closed: 0, wins: 0, losses: 0, totalR: 0 };
+    const g = map[key]; g.total++;
+    if (x.status === "CLOSED") { g.closed++; const r = num(x.pnl_r); g.totalR += r; if (r > 0) g.wins++; if (r < 0) g.losses++; }
   }
-  return Object.values(map).map(g => ({...g, winRate:g.closed ? g.wins/g.closed*100 : 0}));
+  return Object.values(map).map(g => ({ ...g, winRate: g.closed ? g.wins / g.closed * 100 : 0, avgR: g.closed ? g.totalR / g.closed : 0 }));
 }
 
 async function analytics() {
-  const data = await listSignals();
+  const data = await allSignalsForAnalytics();
   const closed = data.filter(x => x.status === "CLOSED");
-  const wins = closed.filter(x => Number(x.pnl_r) > 0);
-  const losses = closed.filter(x => Number(x.pnl_r) < 0);
-  const totalR = closed.reduce((a,x)=>a+Number(x.pnl_r||0),0);
-  const grossWin = wins.reduce((a,x)=>a+Number(x.pnl_r||0),0);
-  const grossLoss = Math.abs(losses.reduce((a,x)=>a+Number(x.pnl_r||0),0));
+  const wins = closed.filter(x => num(x.pnl_r) > 0), losses = closed.filter(x => num(x.pnl_r) < 0);
+  const totalR = closed.reduce((a, x) => a + num(x.pnl_r), 0);
+  const grossWin = wins.reduce((a, x) => a + num(x.pnl_r), 0);
+  const grossLoss = Math.abs(losses.reduce((a, x) => a + num(x.pnl_r), 0));
   let eq = 0;
-  const equityCurve = [...closed]
-    .sort((a,b)=>new Date(a.closed_at||a.received_at)-new Date(b.closed_at||b.received_at))
-    .map(x=>({time:x.closed_at||x.received_at,equity:(eq+=Number(x.pnl_r||0))}));
-
-  return {
-    summary:{
-      total:data.length,
-      open:data.filter(x=>x.status==="OPEN").length,
-      closed:closed.length,
-      wins:wins.length,
-      losses:losses.length,
-      winRate:closed.length?wins.length/closed.length*100:0,
-      totalR,
-      profitFactor:grossLoss?grossWin/grossLoss:grossWin?99:0,
-      avgScore:data.length?data.reduce((a,x)=>a+Number(x.score||0),0)/data.length:0,
-      avgProbability:data.length?data.reduce((a,x)=>a+Number(x.probability||0),0)/data.length:0
-    },
-    bySymbol:groupStats(data,x=>x.symbol),
-    bySession:groupStats(data,x=>x.session_name),
-    byMarketPhase:groupStats(data,x=>x.market_phase),
-    byPremiumDiscount:groupStats(data,x=>x.premium_discount),
-    equityCurve
-  };
+  const equityCurve = [...closed].sort((a,b)=>new Date(a.closed_at||a.received_at)-new Date(b.closed_at||b.received_at))
+    .map(x=>({time:x.closed_at||x.received_at,equity:(eq+=num(x.pnl_r))}));
+  const setups = groupStats(closed, x => x.setup_key).filter(x => x.closed >= 3).sort((a,b) => b.avgR - a.avgR).slice(0, 15);
+  return { summary: {
+      total:data.length, active:data.filter(x=>!x.archived_at).length, archived:data.filter(x=>x.archived_at).length,
+      open:data.filter(x=>x.status==="OPEN").length, closed:closed.length, wins:wins.length, losses:losses.length,
+      winRate:closed.length?wins.length/closed.length*100:0, totalR, profitFactor:grossLoss?grossWin/grossLoss:grossWin?99:0,
+      avgScore:data.length?data.reduce((a,x)=>a+num(x.score),0)/data.length:0,
+      avgAdaptiveScore:data.length?data.reduce((a,x)=>a+num(x.adaptive_score,x.score),0)/data.length:0
+    }, bySymbol:groupStats(data,x=>x.symbol), bySession:groupStats(data,x=>x.session_name),
+    byMarketPhase:groupStats(data,x=>x.market_phase), topSetups:setups, equityCurve };
 }
 
 async function closeSignal(payload) {
-  const externalId = String(payload.external_id || payload.signal_id || "").slice(0,120);
-  const result = String(payload.result || "").toUpperCase();
+  const externalId = clean(payload.external_id || payload.signal_id, 120);
+  const result = clean(payload.result, 20).toUpperCase();
   if (!externalId) throw new Error("Lipsește external_id");
-  if (!["TP1","TP2","TP3","SL","BE","CLOSED"].includes(result)) throw new Error("Rezultat invalid");
-
-  const pnlMap = {TP1:2,TP2:3,TP3:4,SL:-1,BE:0,CLOSED:num(payload.pnl_r,0)};
-  const pnlR = result === "CLOSED" ? num(payload.pnl_r,0) : pnlMap[result];
-
+  if (!["TP1","TP2","TP3","SL","BE","CLOSED","EXPIRED"].includes(result)) throw new Error("Rezultat invalid");
+  const pnlMap = {TP1:1.5,TP2:2.5,TP3:3.5,SL:-1,BE:0,EXPIRED:0};
+  const pnlR = result === "CLOSED" ? num(payload.pnl_r) : pnlMap[result];
   if (!pool) {
-    const item = memorySignals.find(x=>x.external_id===externalId);
-    if (!item) throw new Error("Semnal negăsit");
-    Object.assign(item,{status:"CLOSED",result,pnl_r:pnlR,closed_at:new Date().toISOString()});
-    return item;
+    const item = memorySignals.find(x=>x.external_id===externalId); if (!item) throw new Error("Semnal negăsit");
+    Object.assign(item,{status:"CLOSED",result,pnl_r:pnlR,exit_price:num(payload.exit_price),closed_at:new Date().toISOString()}); return item;
   }
-
-  const q = await pool.query(`
-    UPDATE signals SET status='CLOSED',result=$1,pnl_r=$2,closed_at=NOW()
-    WHERE external_id=$3 RETURNING *
-  `,[result,pnlR,externalId]);
-
-  if (!q.rows.length) throw new Error("Semnal negăsit");
-  return q.rows[0];
+  const q = await pool.query(`UPDATE signals SET status='CLOSED',result=$1,pnl_r=$2,exit_price=$3,closed_at=NOW() WHERE external_id=$4 RETURNING *`,[result,pnlR,num(payload.exit_price),externalId]);
+  if (!q.rows.length) throw new Error("Semnal negăsit"); return q.rows[0];
 }
 
-app.get("/health",(req,res)=>res.json({
-  ok:true,
-  version:"7.1.0",
-  database:pool?"postgres":"memory",
-  adminKeyConfigured:Boolean(ADMIN_KEY),
-  time:new Date().toISOString()
-}));
-
-app.get("/api/signals",async(req,res)=>{
-  try {
-    res.json({ok:true,signals:await listSignals(),analytics:await analytics()});
-  } catch (e) {
-    console.error("GET /api/signals:", e);
-    res.status(500).json({ok:false,error:e.message});
+function parseBody(req) {
+  let payload = req.body;
+  if (Buffer.isBuffer(payload)) payload = payload.toString("utf8");
+  if (typeof payload === "string") {
+    const raw = payload.trim(); if (!raw) throw new Error("Payload gol");
+    try { payload = JSON.parse(raw); } catch { throw new Error("Mesajul nu este JSON valid"); }
   }
-});
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) throw new Error("Payload invalid");
+  return payload;
+}
 
-app.post("/api/test-signal",async(req,res)=>{
-  try {
-    if (!ADMIN_KEY || req.body?.adminKey !== ADMIN_KEY) {
-      return res.status(401).json({ok:false,error:"ADMIN_KEY incorectă"});
-    }
+function requireAdmin(req, res) {
+  const key = req.body?.adminKey || req.query.adminKey || req.get("x-admin-key") || "";
+  if (!ADMIN_KEY || key !== ADMIN_KEY) { res.status(401).json({ok:false,error:"ADMIN_KEY incorectă"}); return false; }
+  return true;
+}
 
-    const s = normalizeSignal({
-      external_id:`TEST-${Date.now()}`,
-      symbol:"US30",timeframe:"5",signal:"BUY",
-      price:45000,sl:44920,tp1:45160,tp2:45240,tp3:45320,
-      score:91,probability:81,rsi:58.4,atr:72,rr:2,
-      trend:"Bullish",structure:"HH + HL + BOS",
-      session:"New York",mtf_trend:"M15 bullish",vwap_side:"Above VWAP",
-      order_block:"Fresh bullish OB",bos:true,fvg:true,liquidity_sweep:true,
-      vwap_confirm:true,mtf_confirm:true,order_block_confirm:true,
-      market_phase:"Expansion",equal_lows:true,premium_discount:"Discount",
-      fib_zone:"0.618–0.705",fvg_state:"Valid / unfilled",ob_state:"Fresh",
-      kill_zone:"New York Open",
-      score_breakdown:{trend:15,mtf:15,vwap:10,structure:20,liquidity:10,fvg:8,order_block:8,session:5},
-      reason:"Semnal demonstrativ v6.1."
-    });
+app.get("/health", (req,res)=>res.json({ok:true,version:"9.0.0",database:pool?"postgres":"memory",archiveAfterHours:ARCHIVE_AFTER_HOURS,adminKeyConfigured:Boolean(ADMIN_KEY),newsWebhookConfigured:Boolean(NEWS_WEBHOOK_KEY),time:new Date().toISOString()}));
 
-    await saveSignal(s);
-    res.json({ok:true,signal:s});
-  } catch (e) {
-    console.error("POST /api/test-signal:", e);
-    res.status(500).json({ok:false,error:e.message});
-  }
-});
+app.get("/api/signals", async(req,res)=>{ try { const mode=req.query.mode==="archive"?"archive":"active"; res.json({ok:true,mode,signals:await listSignals(mode,req.query),analytics:await analytics()}); } catch(e){ console.error(e); res.status(500).json({ok:false,error:e.message}); } });
+app.get("/api/analytics", async(req,res)=>{ try { res.json({ok:true,analytics:await analytics()}); } catch(e){res.status(500).json({ok:false,error:e.message});} });
+app.post("/api/archive-now", async(req,res)=>{ if(!requireAdmin(req,res))return; try{res.json({ok:true,archived:await archiveOldSignals()});}catch(e){res.status(500).json({ok:false,error:e.message});} });
 
-app.post("/api/manual-close",async(req,res)=>{
-  try {
-    if (!ADMIN_KEY || req.body?.adminKey !== ADMIN_KEY) {
-      return res.status(401).json({ok:false,error:"ADMIN_KEY incorectă"});
-    }
-    res.json({ok:true,closed:await closeSignal(req.body)});
-  } catch(e) {
-    res.status(400).json({ok:false,error:e.message});
-  }
-});
+app.get("/api/news", async(req,res)=>{ try {
+  const limit=Math.min(200,Math.max(1,num(req.query.limit,50))); let rows;
+  if(!pool) rows=memoryNews.slice(0,limit); else rows=(await pool.query("SELECT * FROM news_events ORDER BY published_at DESC LIMIT $1",[limit])).rows;
+  res.json({ok:true,news:rows});
+} catch(e){res.status(500).json({ok:false,error:e.message});} });
 
-app.post("/api/clear",async(req,res)=>{
-  try {
-    if (!ADMIN_KEY || req.body?.adminKey !== ADMIN_KEY) {
-      return res.status(401).json({ok:false,error:"ADMIN_KEY incorectă"});
-    }
-    if (pool) await pool.query("DELETE FROM signals");
-    else memorySignals = [];
-    res.json({ok:true});
-  } catch(e) {
-    res.status(500).json({ok:false,error:e.message});
-  }
-});
+app.post("/api/news", async(req,res)=>{ if(!requireAdmin(req,res))return; try{ const list=Array.isArray(req.body.items)?req.body.items:[req.body]; const saved=[]; for(const p of list){const n=normalizeNews(p);await saveNews(n);saved.push(n);}res.json({ok:true,saved}); }catch(e){res.status(400).json({ok:false,error:e.message});} });
 
-app.post("/webhook", async (req, res) => {
-  try {
-    const key = req.query.key || req.get("x-webhook-key") || "";
+app.post("/news-webhook", async(req,res)=>{ try{
+  const key=req.query.key||req.get("x-news-key")||""; if(!NEWS_WEBHOOK_KEY||key!==NEWS_WEBHOOK_KEY)return res.status(401).json({ok:false,error:"NEWS_WEBHOOK_KEY incorectă"});
+  const payload=parseBody(req); const list=Array.isArray(payload)?payload:(Array.isArray(payload.items)?payload.items:[payload]); const saved=[];
+  for(const p of list){const n=normalizeNews(p);await saveNews(n);saved.push(n);} res.json({ok:true,count:saved.length,saved});
+}catch(e){res.status(400).json({ok:false,error:e.message});} });
 
-    if (!WEBHOOK_KEY || key !== WEBHOOK_KEY) {
-      return res.status(401).json({
-        ok: false,
-        error: "WEBHOOK_KEY incorectă"
-      });
-    }
+app.post("/api/test-signal",async(req,res)=>{ if(!requireAdmin(req,res))return; try{
+  const s=normalizeSignal({external_id:`TEST-${Date.now()}`,symbol:"US30",timeframe:"5",signal:"BUY",price:45000,sl:44920,tp1:45120,tp2:45200,tp3:45280,score:88,probability:79,rsi:58.4,atr:72,rr:3.5,trend:"Bullish",structure:"Bullish BOS",session:"New York",bos:true,fvg:true,liquidity_sweep:true,vwap_confirm:true,mtf_confirm:true,market_phase:"Expansion",premium_discount:"Discount",reason:"Semnal demonstrativ v9."});
+  await saveSignal(s);res.json({ok:true,signal:s});
+}catch(e){res.status(500).json({ok:false,error:e.message});} });
 
-    let payload = req.body;
+app.post("/api/test-news",async(req,res)=>{ if(!requireAdmin(req,res))return; try{const n=normalizeNews({external_id:`NEWS-${Date.now()}`,title:"FOMC interest rate decision and Powell press conference",summary:"High-impact Federal Reserve event may increase volatility in US indices and gold.",source:"PropTrader test",symbols:["US30","NAS100","XAUUSD"],impact:90});await saveNews(n);res.json({ok:true,news:n});}catch(e){res.status(500).json({ok:false,error:e.message});} });
 
-    // TradingView poate trimite JSON fie ca application/json,
-    // fie ca text/plain. Convertim textul în obiect înainte de procesare.
-    if (Buffer.isBuffer(payload)) {
-      payload = payload.toString("utf8");
-    }
+app.post("/api/manual-close",async(req,res)=>{if(!requireAdmin(req,res))return;try{res.json({ok:true,closed:await closeSignal(req.body)});}catch(e){res.status(400).json({ok:false,error:e.message});}});
+app.post("/api/clear",async(req,res)=>{if(!requireAdmin(req,res))return;try{if(pool){await pool.query("DELETE FROM signals");await pool.query("DELETE FROM news_events");}else{memorySignals=[];memoryNews=[];}res.json({ok:true});}catch(e){res.status(500).json({ok:false,error:e.message});}});
 
-    if (typeof payload === "string") {
-      const raw = payload.trim();
+app.get("/api/export.csv",async(req,res)=>{try{const rows=await allSignalsForAnalytics();const cols=["received_at","archived_at","symbol","timeframe","signal","status","result","price","sl","tp1","tp2","tp3","score","adaptive_score","learning_adjustment","news_risk","news_bias","pnl_r","session_name","structure","reason"];const esc=v=>`"${String(v??"").replaceAll('"','""')}"`;const csv=[cols.join(','),...rows.map(r=>cols.map(c=>esc(r[c])).join(','))].join('\n');res.setHeader("content-type","text/csv; charset=utf-8");res.setHeader("content-disposition",'attachment; filename="proptrader-journal.csv"');res.send('\ufeff'+csv);}catch(e){res.status(500).send(e.message);}});
 
-      if (!raw) {
-        return res.status(400).json({
-          ok: false,
-          error: "Payload webhook gol"
-        });
-      }
+app.post("/webhook", async(req,res)=>{try{
+  const key=req.query.key||req.get("x-webhook-key")||""; if(!WEBHOOK_KEY||key!==WEBHOOK_KEY)return res.status(401).json({ok:false,error:"WEBHOOK_KEY incorectă"});
+  const payload=parseBody(req); const event=clean(payload.event||"SIGNAL",20).toUpperCase();
+  if(event==="CLOSE")return res.json({ok:true,closed:await closeSignal(payload)});
+  const signal=normalizeSignal(payload);await saveSignal(signal);return res.json({ok:true,signal});
+}catch(e){console.error("POST /webhook:",e);return res.status(400).json({ok:false,error:e.message});}});
 
-      try {
-        payload = JSON.parse(raw);
-      } catch (parseError) {
-        console.error("Webhook JSON invalid:", raw);
-        return res.status(400).json({
-          ok: false,
-          error: "Payload webhook invalid: mesajul nu este JSON valid"
-        });
-      }
-    }
-
-    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
-      return res.status(400).json({
-        ok: false,
-        error: "Payload webhook invalid"
-      });
-    }
-
-    console.log("Webhook primit:", {
-      contentType: req.get("content-type") || "",
-      event: payload.event || "SIGNAL",
-      symbol: payload.symbol || payload.ticker || "N/A",
-      signal: payload.signal || payload.side || "WAIT",
-      external_id: payload.external_id || payload.signal_id || null
-    });
-
-    const event = String(payload.event || "SIGNAL").toUpperCase();
-
-    if (event === "CLOSE") {
-      return res.json({
-        ok: true,
-        closed: await closeSignal(payload)
-      });
-    }
-
-    const signal = normalizeSignal(payload);
-    await saveSignal(signal);
-
-    return res.json({
-      ok: true,
-      signal
-    });
-  } catch (e) {
-    console.error("POST /webhook:", e);
-    return res.status(500).json({
-      ok: false,
-      error: e.message
-    });
-  }
-});
-
-initDb()
-  .then(()=>app.listen(PORT,()=>console.log("PropTrader AI v7.1 rulează pe portul "+PORT)))
-  .catch(e=>{console.error("DB init failed:",e);process.exit(1)});
+initDb().then(async()=>{
+  await archiveOldSignals();
+  setInterval(()=>archiveOldSignals().catch(e=>console.error("Auto-archive:",e)),15*60*1000).unref();
+  app.listen(PORT,()=>console.log(`PropTrader AI v9.0 rulează pe portul ${PORT}`));
+}).catch(e=>{console.error("DB init failed:",e);process.exit(1)});
