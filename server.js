@@ -14,6 +14,12 @@ const PATTERN_MIN_PROBABILITY = Math.max(50, Math.min(95, Number(process.env.PAT
 const PATTERN_LOOKBACK_DAYS = Math.max(14, Number(process.env.PATTERN_LOOKBACK_DAYS || 180));
 const PATTERN_HORIZON_BARS = Math.max(1, Math.min(12, Number(process.env.PATTERN_HORIZON_BARS || 3)));
 const PATTERN_COOLDOWN_MINUTES = Math.max(5, Number(process.env.PATTERN_COOLDOWN_MINUTES || 60));
+const FMP_API_KEY = process.env.FMP_API_KEY || "";
+const NEWS_AUTO_SYNC_MINUTES = Math.max(15, Number(process.env.NEWS_AUTO_SYNC_MINUTES || 60));
+const AUTO_TRACK_TRADES = String(process.env.AUTO_TRACK_TRADES || "true").toLowerCase() !== "false";
+const NEWS_COUNTRIES = (process.env.NEWS_COUNTRIES || "US").split(",").map(x=>x.trim().toUpperCase()).filter(Boolean);
+let lastNewsSync = null;
+let lastNewsSyncError = "";
 
 const pool = DATABASE_URL
   ? new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } })
@@ -69,7 +75,8 @@ async function initDb() {
     ["premium_discount", "TEXT"], ["fib_zone", "TEXT"], ["fvg_state", "TEXT"], ["ob_state", "TEXT"],
     ["kill_zone", "TEXT"], ["score_breakdown", "JSONB"], ["reason", "TEXT"],
     ["news_risk", "INTEGER DEFAULT 0"], ["news_bias", "TEXT DEFAULT 'NEUTRAL'"],
-    ["news_summary", "TEXT"], ["setup_key", "TEXT"]
+    ["news_summary", "TEXT"], ["setup_key", "TEXT"],
+    ["max_favorable_price", "NUMERIC"], ["max_adverse_price", "NUMERIC"], ["auto_closed", "BOOLEAN DEFAULT FALSE"]
   ];
   for (const [name, type] of columns) {
     await pool.query(`ALTER TABLE signals ADD COLUMN IF NOT EXISTS ${name} ${type}`);
@@ -257,6 +264,77 @@ async function saveBar(b) {
   }
   await pool.query(`INSERT INTO market_bars(external_id,bar_time,symbol,timeframe,open,high,low,close,volume)
     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT DO NOTHING`,[b.external_id,b.bar_time,b.symbol,b.timeframe,b.open,b.high,b.low,b.close,b.volume]);
+}
+
+
+async function openSignalsForSymbol(symbol) {
+  if (!pool) return memorySignals.filter(x=>x.symbol===symbol && x.status==="OPEN");
+  return (await pool.query(`SELECT * FROM signals WHERE symbol=$1 AND status='OPEN' ORDER BY received_at ASC`,[symbol])).rows;
+}
+
+async function trackSignalsWithBar(bar) {
+  if (!AUTO_TRACK_TRADES) return [];
+  const signals=await openSignalsForSymbol(bar.symbol);
+  const updates=[];
+  for(const s of signals){
+    const side=String(s.signal||"").toUpperCase();
+    if(!["BUY","SELL"].includes(side)) continue;
+    const hi=num(bar.high), lo=num(bar.low), entry=num(s.price), sl=num(s.sl), tp1=num(s.tp1), tp2=num(s.tp2), tp3=num(s.tp3);
+    const favorable=side==="BUY"?hi:lo, adverse=side==="BUY"?lo:hi;
+    let result=null, exitPrice=0;
+    const slHit=sl>0 && (side==="BUY"?lo<=sl:hi>=sl);
+    const tp3Hit=tp3>0 && (side==="BUY"?hi>=tp3:lo<=tp3);
+    const tp2Hit=tp2>0 && (side==="BUY"?hi>=tp2:lo<=tp2);
+    const tp1Hit=tp1>0 && (side==="BUY"?hi>=tp1:lo<=tp1);
+    // Conservator: dacă aceeași lumânare atinge și SL, și TP, se consideră SL deoarece ordinea intrabar nu este cunoscută.
+    if(slHit){result="SL";exitPrice=sl;}
+    else if(tp3Hit){result="TP3";exitPrice=tp3;}
+    else if(tp2Hit){result="TP2";exitPrice=tp2;}
+    else if(tp1Hit){result="TP1";exitPrice=tp1;}
+    if(!pool){
+      const item=memorySignals.find(x=>x.external_id===s.external_id);
+      if(item){item.max_favorable_price=side==="BUY"?Math.max(num(item.max_favorable_price,entry),favorable):Math.min(num(item.max_favorable_price,entry),favorable);item.max_adverse_price=side==="BUY"?Math.min(num(item.max_adverse_price,entry),adverse):Math.max(num(item.max_adverse_price,entry),adverse);}
+    }else{
+      await pool.query(`UPDATE signals SET max_favorable_price=CASE WHEN signal='BUY' THEN GREATEST(COALESCE(max_favorable_price,price),$1) ELSE LEAST(COALESCE(max_favorable_price,price),$1) END,max_adverse_price=CASE WHEN signal='BUY' THEN LEAST(COALESCE(max_adverse_price,price),$2) ELSE GREATEST(COALESCE(max_adverse_price,price),$2) END WHERE external_id=$3`,[favorable,adverse,s.external_id]);
+    }
+    if(result){
+      const closed=await closeSignal({external_id:s.external_id,result,exit_price:exitPrice});
+      if(pool) await pool.query(`UPDATE signals SET auto_closed=TRUE WHERE external_id=$1`,[s.external_id]);
+      else {const item=memorySignals.find(x=>x.external_id===s.external_id);if(item)item.auto_closed=true;}
+      updates.push(closed);
+    }
+  }
+  return updates;
+}
+
+function fmpImpact(importance){
+  const x=String(importance||"").toLowerCase();
+  if(x.includes("high"))return 90;if(x.includes("medium"))return 60;if(x.includes("low"))return 30;return 45;
+}
+
+async function syncRealNews() {
+  if(!FMP_API_KEY) throw new Error("FMP_API_KEY nu este configurată în Render");
+  const now=new Date(), from=new Date(now.getTime()-24*3600000), to=new Date(now.getTime()+7*86400000);
+  const iso=d=>d.toISOString().slice(0,10);
+  const url=`https://financialmodelingprep.com/stable/economic-calendar?from=${iso(from)}&to=${iso(to)}&apikey=${encodeURIComponent(FMP_API_KEY)}`;
+  const response=await fetch(url,{headers:{accept:"application/json"}});
+  if(!response.ok) throw new Error(`FMP a răspuns cu HTTP ${response.status}`);
+  const items=await response.json();
+  if(!Array.isArray(items)) throw new Error("Răspuns FMP neașteptat");
+  let saved=0, accepted=0;
+  for(const item of items){
+    const country=String(item.country||item.countryCode||"").toUpperCase();
+    if(NEWS_COUNTRIES.length && country && !NEWS_COUNTRIES.includes(country))continue;
+    accepted++;
+    const title=clean(item.event||item.name||item.title||"Eveniment economic",500);
+    const summary=[item.actual!=null?`Actual: ${item.actual}`:"",item.estimate!=null?`Estimare: ${item.estimate}`:"",item.previous!=null?`Anterior: ${item.previous}`:""].filter(Boolean).join(" · ");
+    const n=normalizeNews({external_id:`FMP-${item.id||`${item.date}-${title}`}`,published_at:item.date||item.datetime||new Date().toISOString(),title,summary,source:"Financial Modeling Prep",impact:fmpImpact(item.impact||item.importance),category:"ECONOMIC_CALENDAR",raw:item});
+    const before=pool?null:memoryNews.length;
+    await saveNews(n);
+    if(!pool){if(memoryNews.length>before)saved++;}else saved++;
+  }
+  lastNewsSync=new Date().toISOString();lastNewsSyncError="";
+  return {received:items.length,accepted,saved,lastNewsSync};
 }
 
 async function recentBars(symbol,timeframe,limit=20000) {
@@ -482,7 +560,7 @@ function requireAdmin(req, res) {
   return true;
 }
 
-app.get("/health", (req,res)=>res.json({ok:true,version:"9.1.0",database:pool?"postgres":"memory",archiveAfterHours:ARCHIVE_AFTER_HOURS,adminKeyConfigured:Boolean(ADMIN_KEY),newsWebhookConfigured:Boolean(NEWS_WEBHOOK_KEY),patternMinSamples:PATTERN_MIN_SAMPLES,patternMinProbability:PATTERN_MIN_PROBABILITY,patternHorizonBars:PATTERN_HORIZON_BARS,time:new Date().toISOString()}));
+app.get("/health", (req,res)=>res.json({ok:true,version:"10.0.0",database:pool?"postgres":"memory",archiveAfterHours:ARCHIVE_AFTER_HOURS,adminKeyConfigured:Boolean(ADMIN_KEY),newsWebhookConfigured:Boolean(NEWS_WEBHOOK_KEY),fmpConfigured:Boolean(FMP_API_KEY),autoTrackTrades:AUTO_TRACK_TRADES,lastNewsSync,lastNewsSyncError,patternMinSamples:PATTERN_MIN_SAMPLES,patternMinProbability:PATTERN_MIN_PROBABILITY,patternHorizonBars:PATTERN_HORIZON_BARS,time:new Date().toISOString()}));
 
 app.get("/api/signals", async(req,res)=>{ try { const mode=req.query.mode==="archive"?"archive":"active"; res.json({ok:true,mode,signals:await listSignals(mode,req.query),analytics:await analytics()}); } catch(e){ console.error(e); res.status(500).json({ok:false,error:e.message}); } });
 app.get("/api/analytics", async(req,res)=>{ try { res.json({ok:true,analytics:await analytics()}); } catch(e){res.status(500).json({ok:false,error:e.message});} });
@@ -493,6 +571,10 @@ app.get("/api/news", async(req,res)=>{ try {
   if(!pool) rows=memoryNews.slice(0,limit); else rows=(await pool.query("SELECT * FROM news_events ORDER BY published_at DESC LIMIT $1",[limit])).rows;
   res.json({ok:true,news:rows});
 } catch(e){res.status(500).json({ok:false,error:e.message});} });
+
+app.get("/api/news-status",(req,res)=>res.json({ok:true,fmpConfigured:Boolean(FMP_API_KEY),lastNewsSync,lastNewsSyncError,autoSyncMinutes:NEWS_AUTO_SYNC_MINUTES}));
+
+app.post("/api/news-sync",async(req,res)=>{if(!requireAdmin(req,res))return;try{res.json({ok:true,...await syncRealNews()});}catch(e){lastNewsSyncError=e.message;res.status(400).json({ok:false,error:e.message});}});
 
 app.post("/api/news", async(req,res)=>{ if(!requireAdmin(req,res))return; try{ const list=Array.isArray(req.body.items)?req.body.items:[req.body]; const saved=[]; for(const p of list){const n=normalizeNews(p);await saveNews(n);saved.push(n);}res.json({ok:true,saved}); }catch(e){res.status(400).json({ok:false,error:e.message});} });
 
@@ -526,8 +608,8 @@ app.post("/webhook", async(req,res)=>{try{
   const payload=parseBody(req); const event=clean(payload.event||"SIGNAL",20).toUpperCase();
   if(event==="CLOSE")return res.json({ok:true,closed:await closeSignal(payload)});
   if(event==="BAR"){
-    const bar=normalizeBar(payload); await saveBar(bar); const pattern=await analyzeTimePattern(bar); const created=pattern?await savePattern(pattern):false;
-    return res.json({ok:true,event:"BAR",bar,pattern:created?pattern:null});
+    const bar=normalizeBar(payload); await saveBar(bar); const closed=await trackSignalsWithBar(bar); const pattern=await analyzeTimePattern(bar); const created=pattern?await savePattern(pattern):false;
+    return res.json({ok:true,event:"BAR",bar,autoClosed:closed,pattern:created?pattern:null});
   }
   const signal=normalizeSignal(payload);await saveSignal(signal);return res.json({ok:true,signal});
 }catch(e){console.error("POST /webhook:",e);return res.status(400).json({ok:false,error:e.message});}});
@@ -535,5 +617,6 @@ app.post("/webhook", async(req,res)=>{try{
 initDb().then(async()=>{
   await archiveOldSignals();
   setInterval(()=>archiveOldSignals().catch(e=>console.error("Auto-archive:",e)),15*60*1000).unref();
-  app.listen(PORT,()=>console.log(`PropTrader AI v9.1 rulează pe portul ${PORT}`));
+  if(FMP_API_KEY){syncRealNews().catch(e=>{lastNewsSyncError=e.message;console.error("News sync:",e.message)});setInterval(()=>syncRealNews().catch(e=>{lastNewsSyncError=e.message;console.error("News sync:",e.message)}),NEWS_AUTO_SYNC_MINUTES*60000).unref();}
+  app.listen(PORT,()=>console.log(`PropTrader AI v10.0 rulează pe portul ${PORT}`));
 }).catch(e=>{console.error("DB init failed:",e);process.exit(1)});
