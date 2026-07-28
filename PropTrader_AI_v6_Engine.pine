@@ -1,0 +1,146 @@
+//@version=5
+indicator("PropTrader AI v6 Engine", overlay=true, max_labels_count=500, max_lines_count=500)
+
+fastLen=input.int(20,"EMA rapidă")
+slowLen=input.int(50,"EMA lentă")
+rsiLen=input.int(14,"RSI")
+atrLen=input.int(14,"ATR")
+swingLen=input.int(5,"Swing length")
+equalTolerance=input.float(0.15,"Toleranță Equal High/Low în ATR",step=0.05)
+minScore=input.int(85,"Scor minim",minval=60,maxval=95)
+useSession=input.bool(true,"Filtru Kill Zone")
+htf=input.timeframe("15","Timeframe superior")
+
+emaFast=ta.ema(close,fastLen)
+emaSlow=ta.ema(close,slowLen)
+rsiVal=ta.rsi(close,rsiLen)
+atrVal=ta.atr(atrLen)
+vwapVal=ta.vwap(hlc3)
+
+htfFast=request.security(syminfo.tickerid,htf,ta.ema(close,fastLen))
+htfSlow=request.security(syminfo.tickerid,htf,ta.ema(close,slowLen))
+mtfBull=htfFast>htfSlow
+mtfBear=htfFast<htfSlow
+
+ph=ta.pivothigh(high,swingLen,swingLen)
+pl=ta.pivotlow(low,swingLen,swingLen)
+var float lastHigh=na
+var float prevHigh=na
+var float lastLow=na
+var float prevLow=na
+
+if not na(ph)
+    prevHigh:=lastHigh
+    lastHigh:=ph
+if not na(pl)
+    prevLow:=lastLow
+    lastLow:=pl
+
+hh=not na(lastHigh) and not na(prevHigh) and lastHigh>prevHigh
+lh=not na(lastHigh) and not na(prevHigh) and lastHigh<prevHigh
+hl=not na(lastLow) and not na(prevLow) and lastLow>prevLow
+ll=not na(lastLow) and not na(prevLow) and lastLow<prevLow
+
+bullBos=not na(lastHigh) and close>lastHigh
+bearBos=not na(lastLow) and close<lastLow
+bullChoch=bullBos and emaFast<emaSlow
+bearChoch=bearBos and emaFast>emaSlow
+
+equalHighs=not na(lastHigh) and not na(prevHigh) and math.abs(lastHigh-prevHigh)<=atrVal*equalTolerance
+equalLows=not na(lastLow) and not na(prevLow) and math.abs(lastLow-prevLow)<=atrVal*equalTolerance
+
+bullFvg=low>high[2]
+bearFvg=high<low[2]
+bullSweep=low<ta.lowest(low,10)[1] and close>open
+bearSweep=high>ta.highest(high,10)[1] and close<open
+bullTrend=emaFast>emaSlow
+bearTrend=emaFast<emaSlow
+bullVWAP=close>vwapVal
+bearVWAP=close<vwapVal
+bullOB=close[1]<open[1] and close>high[1] and bullTrend
+bearOB=close[1]>open[1] and close<low[1] and bearTrend
+
+rangeHigh=ta.highest(high,50)
+rangeLow=ta.lowest(low,50)
+equilibrium=(rangeHigh+rangeLow)/2
+premium=close>equilibrium
+discount=close<equilibrium
+
+fib618Bull=rangeHigh-(rangeHigh-rangeLow)*0.618
+fib705Bull=rangeHigh-(rangeHigh-rangeLow)*0.705
+inBullOTE=close<=fib618Bull and close>=fib705Bull
+fib618Bear=rangeLow+(rangeHigh-rangeLow)*0.618
+fib705Bear=rangeLow+(rangeHigh-rangeLow)*0.705
+inBearOTE=close>=fib618Bear and close<=fib705Bear
+
+hourRO=hour(time,"Europe/Bucharest")
+asia=hourRO>=2 and hourRO<6
+london=hourRO>=9 and hourRO<12
+newYork=hourRO>=15 and hourRO<18
+londonClose=hourRO>=18 and hourRO<20
+sessionOk=not useSession or london or newYork
+killZone=asia?"Asia":london?"London Open":newYork?"New York Open":londonClose?"London Close":"Outside Kill Zone"
+
+marketPhase=bullTrend and mtfBull?"Expansion Bullish":bearTrend and mtfBear?"Expansion Bearish":"Consolidation"
+structureBull=hh and hl?"HH + HL":bullBos?"BOS bullish":bullChoch?"CHOCH bullish":"Bullish mixed"
+structureBear=lh and ll?"LH + LL":bearBos?"BOS bearish":bearChoch?"CHOCH bearish":"Bearish mixed"
+
+trendBuy=bullTrend?15:0
+mtfBuy=mtfBull?15:0
+vwapBuy=bullVWAP?10:0
+structureBuy=(bullBos?15:0)+(hh and hl?5:0)
+liquidityBuy=(bullSweep?10:0)+(equalLows?5:0)
+fvgBuy=bullFvg?8:0
+obBuy=bullOB?8:0
+sessionBuy=sessionOk?5:0
+zoneBuy=discount?5:0
+fibBuy=inBullOTE?4:0
+buyScore=trendBuy+mtfBuy+vwapBuy+structureBuy+liquidityBuy+fvgBuy+obBuy+sessionBuy+zoneBuy+fibBuy
+
+trendSell=bearTrend?15:0
+mtfSell=mtfBear?15:0
+vwapSell=bearVWAP?10:0
+structureSell=(bearBos?15:0)+(lh and ll?5:0)
+liquiditySell=(bearSweep?10:0)+(equalHighs?5:0)
+fvgSell=bearFvg?8:0
+obSell=bearOB?8:0
+sessionSell=sessionOk?5:0
+zoneSell=premium?5:0
+fibSell=inBearOTE?4:0
+sellScore=trendSell+mtfSell+vwapSell+structureSell+liquiditySell+fvgSell+obSell+sessionSell+zoneSell+fibSell
+
+buySignal=barstate.isconfirmed and sessionOk and buyScore>=minScore and bullTrend and mtfBull and bullVWAP and discount and (bullBos or bullSweep or bullOB)
+sellSignal=barstate.isconfirmed and sessionOk and sellScore>=minScore and bearTrend and mtfBear and bearVWAP and premium and (bearBos or bearSweep or bearOB)
+
+entry=close
+buySL=math.min(low,entry-atrVal*1.3)
+sellSL=math.max(high,entry+atrVal*1.3)
+buyRisk=entry-buySL
+sellRisk=sellSL-entry
+buyTP1=entry+buyRisk*2
+buyTP2=entry+buyRisk*3
+buyTP3=entry+buyRisk*4
+sellTP1=entry-sellRisk*2
+sellTP2=entry-sellRisk*3
+sellTP3=entry-sellRisk*4
+buyProb=math.min(90,50+buyScore*0.42)
+sellProb=math.min(90,50+sellScore*0.42)
+
+plot(emaFast,"EMA rapidă")
+plot(emaSlow,"EMA lentă")
+plot(vwapVal,"VWAP")
+plot(equilibrium,"Equilibrium 50%")
+plotshape(buySignal,title="BUY",text="BUY",style=shape.labelup,location=location.belowbar)
+plotshape(sellSignal,title="SELL",text="SELL",style=shape.labeldown,location=location.abovebar)
+
+if buySignal
+    id=syminfo.ticker+"-"+timeframe.period+"-"+str.tostring(time)
+    scoreJson='{"trend":'+str.tostring(trendBuy)+',"mtf":'+str.tostring(mtfBuy)+',"vwap":'+str.tostring(vwapBuy)+',"structure":'+str.tostring(structureBuy)+',"liquidity":'+str.tostring(liquidityBuy)+',"fvg":'+str.tostring(fvgBuy)+',"order_block":'+str.tostring(obBuy)+',"session":'+str.tostring(sessionBuy)+',"zone":'+str.tostring(zoneBuy)+',"fib":'+str.tostring(fibBuy)+'}'
+    msg='{"event":"SIGNAL","external_id":"' + id + '","symbol":"' + syminfo.ticker + '","timeframe":"' + timeframe.period + '","signal":"BUY","price":' + str.tostring(entry) + ',"sl":' + str.tostring(buySL) + ',"tp1":' + str.tostring(buyTP1) + ',"tp2":' + str.tostring(buyTP2) + ',"tp3":' + str.tostring(buyTP3) + ',"score":' + str.tostring(buyScore) + ',"probability":' + str.tostring(buyProb) + ',"rsi":' + str.tostring(rsiVal) + ',"atr":' + str.tostring(atrVal) + ',"rr":2,"trend":"Bullish","structure":"' + structureBull + '","session":"' + killZone + '","mtf_trend":"' + htf + ' bullish","vwap_side":"Above VWAP","order_block":"' + (bullOB?"Bullish OB":"No OB") + '","bos":' + str.tostring(bullBos) + ',"choch":' + str.tostring(bullChoch) + ',"fvg":' + str.tostring(bullFvg) + ',"liquidity_sweep":' + str.tostring(bullSweep) + ',"vwap_confirm":true,"mtf_confirm":true,"order_block_confirm":' + str.tostring(bullOB) + ',"market_phase":"' + marketPhase + '","equal_highs":' + str.tostring(equalHighs) + ',"equal_lows":' + str.tostring(equalLows) + ',"premium_discount":"Discount","fib_zone":"' + (inBullOTE?"0.618-0.705":"Outside OTE") + '","fvg_state":"' + (bullFvg?"Valid / unfilled":"None") + '","ob_state":"' + (bullOB?"Fresh":"None") + '","kill_zone":"' + killZone + '","score_breakdown":' + scoreJson + ',"reason":"Structură bullish, discount, MTF și VWAP confirmate"}'
+    alert(msg,alert.freq_once_per_bar_close)
+
+if sellSignal
+    id=syminfo.ticker+"-"+timeframe.period+"-"+str.tostring(time)
+    scoreJson='{"trend":'+str.tostring(trendSell)+',"mtf":'+str.tostring(mtfSell)+',"vwap":'+str.tostring(vwapSell)+',"structure":'+str.tostring(structureSell)+',"liquidity":'+str.tostring(liquiditySell)+',"fvg":'+str.tostring(fvgSell)+',"order_block":'+str.tostring(obSell)+',"session":'+str.tostring(sessionSell)+',"zone":'+str.tostring(zoneSell)+',"fib":'+str.tostring(fibSell)+'}'
+    msg='{"event":"SIGNAL","external_id":"' + id + '","symbol":"' + syminfo.ticker + '","timeframe":"' + timeframe.period + '","signal":"SELL","price":' + str.tostring(entry) + ',"sl":' + str.tostring(sellSL) + ',"tp1":' + str.tostring(sellTP1) + ',"tp2":' + str.tostring(sellTP2) + ',"tp3":' + str.tostring(sellTP3) + ',"score":' + str.tostring(sellScore) + ',"probability":' + str.tostring(sellProb) + ',"rsi":' + str.tostring(rsiVal) + ',"atr":' + str.tostring(atrVal) + ',"rr":2,"trend":"Bearish","structure":"' + structureBear + '","session":"' + killZone + '","mtf_trend":"' + htf + ' bearish","vwap_side":"Below VWAP","order_block":"' + (bearOB?"Bearish OB":"No OB") + '","bos":' + str.tostring(bearBos) + ',"choch":' + str.tostring(bearChoch) + ',"fvg":' + str.tostring(bearFvg) + ',"liquidity_sweep":' + str.tostring(bearSweep) + ',"vwap_confirm":true,"mtf_confirm":true,"order_block_confirm":' + str.tostring(bearOB) + ',"market_phase":"' + marketPhase + '","equal_highs":' + str.tostring(equalHighs) + ',"equal_lows":' + str.tostring(equalLows) + ',"premium_discount":"Premium","fib_zone":"' + (inBearOTE?"0.618-0.705":"Outside OTE") + '","fvg_state":"' + (bearFvg?"Valid / unfilled":"None") + '","ob_state":"' + (bearOB?"Fresh":"None") + '","kill_zone":"' + killZone + '","score_breakdown":' + scoreJson + ',"reason":"Structură bearish, premium, MTF și VWAP confirmate"}'
+    alert(msg,alert.freq_once_per_bar_close)

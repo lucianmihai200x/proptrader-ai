@@ -15,7 +15,7 @@ const pool = DATABASE_URL
 
 let memorySignals = [];
 
-app.use(express.json({ limit: "500kb" }));
+app.use(express.json({ limit: "600kb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
 async function initDb() {
@@ -57,9 +57,34 @@ async function initDb() {
       vwap_confirm BOOLEAN DEFAULT FALSE,
       mtf_confirm BOOLEAN DEFAULT FALSE,
       order_block_confirm BOOLEAN DEFAULT FALSE,
+      market_phase TEXT,
+      equal_highs BOOLEAN DEFAULT FALSE,
+      equal_lows BOOLEAN DEFAULT FALSE,
+      premium_discount TEXT,
+      fib_zone TEXT,
+      fvg_state TEXT,
+      ob_state TEXT,
+      kill_zone TEXT,
+      score_breakdown JSONB,
       reason TEXT
     )
   `);
+
+  const additions = [
+    ["market_phase", "TEXT"],
+    ["equal_highs", "BOOLEAN DEFAULT FALSE"],
+    ["equal_lows", "BOOLEAN DEFAULT FALSE"],
+    ["premium_discount", "TEXT"],
+    ["fib_zone", "TEXT"],
+    ["fvg_state", "TEXT"],
+    ["ob_state", "TEXT"],
+    ["kill_zone", "TEXT"],
+    ["score_breakdown", "JSONB"]
+  ];
+
+  for (const [name, type] of additions) {
+    await pool.query(`ALTER TABLE signals ADD COLUMN IF NOT EXISTS ${name} ${type}`);
+  }
 }
 
 const num = (v, fallback = 0) => {
@@ -68,13 +93,19 @@ const num = (v, fallback = 0) => {
 };
 const bool = v => v === true || v === "true" || v === 1 || v === "1";
 
+function safeBreakdown(v) {
+  if (!v) return {};
+  if (typeof v === "object" && !Array.isArray(v)) return v;
+  try { return JSON.parse(v); } catch { return {}; }
+}
+
 function normalizeSignal(p) {
   const score = Math.max(0, Math.min(100, num(p.score, 50)));
   return {
-    external_id: String(p.external_id || p.signal_id || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`).slice(0, 120),
+    external_id: String(p.external_id || p.signal_id || `${Date.now()}-${Math.random().toString(36).slice(2,8)}`).slice(0,120),
     received_at: new Date().toISOString(),
-    symbol: String(p.symbol || p.ticker || "N/A").slice(0, 30),
-    timeframe: String(p.timeframe || p.interval || "").slice(0, 20),
+    symbol: String(p.symbol || p.ticker || "N/A").slice(0,30),
+    timeframe: String(p.timeframe || p.interval || "").slice(0,20),
     signal: String(p.signal || p.side || "WAIT").toUpperCase(),
     status: "OPEN",
     price: num(p.price ?? p.close),
@@ -87,12 +118,12 @@ function normalizeSignal(p) {
     rsi: num(p.rsi),
     atr: num(p.atr),
     rr: num(p.rr),
-    trend: String(p.trend || "").slice(0, 50),
-    structure: String(p.structure || "").slice(0, 100),
-    session_name: String(p.session || p.session_name || "").slice(0, 50),
-    mtf_trend: String(p.mtf_trend || "").slice(0, 50),
-    vwap_side: String(p.vwap_side || "").slice(0, 50),
-    order_block: String(p.order_block || "").slice(0, 80),
+    trend: String(p.trend || "").slice(0,50),
+    structure: String(p.structure || "").slice(0,120),
+    session_name: String(p.session || p.session_name || "").slice(0,50),
+    mtf_trend: String(p.mtf_trend || "").slice(0,50),
+    vwap_side: String(p.vwap_side || "").slice(0,50),
+    order_block: String(p.order_block || "").slice(0,100),
     bos: bool(p.bos),
     choch: bool(p.choch),
     fvg: bool(p.fvg),
@@ -100,7 +131,16 @@ function normalizeSignal(p) {
     vwap_confirm: bool(p.vwap_confirm),
     mtf_confirm: bool(p.mtf_confirm),
     order_block_confirm: bool(p.order_block_confirm),
-    reason: String(p.reason || p.setup || "").slice(0, 1800)
+    market_phase: String(p.market_phase || "").slice(0,40),
+    equal_highs: bool(p.equal_highs),
+    equal_lows: bool(p.equal_lows),
+    premium_discount: String(p.premium_discount || "").slice(0,40),
+    fib_zone: String(p.fib_zone || "").slice(0,60),
+    fvg_state: String(p.fvg_state || "").slice(0,50),
+    ob_state: String(p.ob_state || "").slice(0,50),
+    kill_zone: String(p.kill_zone || "").slice(0,50),
+    score_breakdown: safeBreakdown(p.score_breakdown),
+    reason: String(p.reason || p.setup || "").slice(0,2200)
   };
 }
 
@@ -108,7 +148,7 @@ async function saveSignal(s) {
   if (!pool) {
     if (memorySignals.some(x => x.external_id === s.external_id)) return;
     memorySignals.unshift({ id: Date.now(), ...s });
-    memorySignals = memorySignals.slice(0, 2000);
+    memorySignals = memorySignals.slice(0,2500);
     return;
   }
 
@@ -117,27 +157,30 @@ async function saveSignal(s) {
       external_id,received_at,symbol,timeframe,signal,status,price,sl,tp1,tp2,tp3,
       score,probability,rsi,atr,rr,trend,structure,session_name,mtf_trend,vwap_side,
       order_block,bos,choch,fvg,liquidity_sweep,vwap_confirm,mtf_confirm,
-      order_block_confirm,reason
+      order_block_confirm,market_phase,equal_highs,equal_lows,premium_discount,
+      fib_zone,fvg_state,ob_state,kill_zone,score_breakdown,reason
     ) VALUES (
       $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
-      $21,$22,$23,$24,$25,$26,$27,$28,$29,$30
+      $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39
     )
     ON CONFLICT (external_id) DO NOTHING
   `, [
     s.external_id,s.received_at,s.symbol,s.timeframe,s.signal,s.status,s.price,s.sl,
     s.tp1,s.tp2,s.tp3,s.score,s.probability,s.rsi,s.atr,s.rr,s.trend,s.structure,
     s.session_name,s.mtf_trend,s.vwap_side,s.order_block,s.bos,s.choch,s.fvg,
-    s.liquidity_sweep,s.vwap_confirm,s.mtf_confirm,s.order_block_confirm,s.reason
+    s.liquidity_sweep,s.vwap_confirm,s.mtf_confirm,s.order_block_confirm,
+    s.market_phase,s.equal_highs,s.equal_lows,s.premium_discount,s.fib_zone,
+    s.fvg_state,s.ob_state,s.kill_zone,JSON.stringify(s.score_breakdown),s.reason
   ]);
 }
 
 async function closeSignal(payload) {
-  const externalId = String(payload.external_id || payload.signal_id || "").slice(0, 120);
+  const externalId = String(payload.external_id || payload.signal_id || "").slice(0,120);
   const result = String(payload.result || "").toUpperCase();
   if (!externalId) throw new Error("Lipsește external_id");
   if (!["TP1","TP2","TP3","SL","BE","CLOSED"].includes(result)) throw new Error("Rezultat invalid");
 
-  const pnlMap = {TP1:2, TP2:3, TP3:4, SL:-1, BE:0, CLOSED:num(payload.pnl_r,0)};
+  const pnlMap = {TP1:2,TP2:3,TP3:4,SL:-1,BE:0,CLOSED:num(payload.pnl_r,0)};
   const pnlR = result === "CLOSED" ? num(payload.pnl_r,0) : pnlMap[result];
   const exitPrice = num(payload.exit_price);
 
@@ -149,7 +192,8 @@ async function closeSignal(payload) {
   }
 
   const q = await pool.query(`
-    UPDATE signals SET status='CLOSED',result=$1,pnl_r=$2,exit_price=$3,closed_at=NOW()
+    UPDATE signals
+    SET status='CLOSED',result=$1,pnl_r=$2,exit_price=$3,closed_at=NOW()
     WHERE external_id=$4 RETURNING *
   `,[result,pnlR,exitPrice,externalId]);
 
@@ -159,83 +203,52 @@ async function closeSignal(payload) {
 
 async function listSignals() {
   if (!pool) return memorySignals;
-  return (await pool.query("SELECT * FROM signals ORDER BY received_at DESC LIMIT 2000")).rows;
+  return (await pool.query("SELECT * FROM signals ORDER BY received_at DESC LIMIT 2500")).rows;
 }
 
-function groupStats(data, keyFn) {
-  const map = {};
-  for (const x of data) {
-    const key = keyFn(x) || "N/A";
-    if (!map[key]) map[key] = { key, total:0, closed:0, wins:0, losses:0, totalR:0, avgScore:0, avgProbability:0 };
-    const g = map[key];
-    g.total++;
-    g.avgScore += Number(x.score || 0);
-    g.avgProbability += Number(x.probability || 0);
-    if (x.status === "CLOSED") {
-      g.closed++;
-      const r = Number(x.pnl_r || 0);
-      g.totalR += r;
-      if (r > 0) g.wins++;
-      if (r < 0) g.losses++;
+function groupStats(data,keyFn){
+  const map={};
+  for(const x of data){
+    const key=keyFn(x)||"N/A";
+    if(!map[key])map[key]={key,total:0,closed:0,wins:0,losses:0,totalR:0};
+    const g=map[key];g.total++;
+    if(x.status==="CLOSED"){
+      g.closed++;const r=Number(x.pnl_r||0);g.totalR+=r;
+      if(r>0)g.wins++;if(r<0)g.losses++;
     }
   }
-  return Object.values(map).map(g => ({
-    ...g,
-    avgScore: g.total ? g.avgScore / g.total : 0,
-    avgProbability: g.total ? g.avgProbability / g.total : 0,
-    winRate: g.closed ? g.wins / g.closed * 100 : 0
-  }));
+  return Object.values(map).map(g=>({...g,winRate:g.closed?g.wins/g.closed*100:0}));
 }
 
-async function analytics() {
-  const data = await listSignals();
-  const closed = data.filter(x => x.status === "CLOSED");
-  const wins = closed.filter(x => Number(x.pnl_r) > 0);
-  const losses = closed.filter(x => Number(x.pnl_r) < 0);
-  const totalR = closed.reduce((a,x)=>a+Number(x.pnl_r||0),0);
-  const grossWin = wins.reduce((a,x)=>a+Number(x.pnl_r||0),0);
-  const grossLoss = Math.abs(losses.reduce((a,x)=>a+Number(x.pnl_r||0),0));
-
-  const byHour = groupStats(data, x => {
-    const d = new Date(x.received_at);
-    return String(d.getUTCHours()).padStart(2,"0") + ":00 UTC";
-  }).sort((a,b)=>a.key.localeCompare(b.key));
-
-  const bySession = groupStats(data, x => x.session_name || "N/A");
-  const bySymbol = groupStats(data, x => x.symbol || "N/A");
-  const byTimeframe = groupStats(data, x => x.timeframe || "N/A");
-
-  let equity = 0;
-  const equityCurve = [...closed]
-    .sort((a,b)=>new Date(a.closed_at||a.received_at)-new Date(b.closed_at||b.received_at))
-    .map(x => {
-      equity += Number(x.pnl_r || 0);
-      return { time:x.closed_at || x.received_at, equity };
-    });
+async function analytics(){
+  const data=await listSignals();
+  const closed=data.filter(x=>x.status==="CLOSED");
+  const wins=closed.filter(x=>Number(x.pnl_r)>0);
+  const losses=closed.filter(x=>Number(x.pnl_r)<0);
+  const totalR=closed.reduce((a,x)=>a+Number(x.pnl_r||0),0);
+  const grossWin=wins.reduce((a,x)=>a+Number(x.pnl_r||0),0);
+  const grossLoss=Math.abs(losses.reduce((a,x)=>a+Number(x.pnl_r||0),0));
+  let eq=0;
+  const equityCurve=[...closed].sort((a,b)=>new Date(a.closed_at||a.received_at)-new Date(b.closed_at||b.received_at))
+    .map(x=>({time:x.closed_at||x.received_at,equity:(eq+=Number(x.pnl_r||0))}));
 
   return {
-    summary: {
-      total:data.length,
-      open:data.filter(x=>x.status==="OPEN").length,
-      closed:closed.length,
-      wins:wins.length,
-      losses:losses.length,
-      winRate:closed.length?wins.length/closed.length*100:0,
-      totalR,
-      profitFactor:grossLoss?grossWin/grossLoss:grossWin?99:0,
+    summary:{
+      total:data.length,open:data.filter(x=>x.status==="OPEN").length,closed:closed.length,
+      wins:wins.length,losses:losses.length,winRate:closed.length?wins.length/closed.length*100:0,
+      totalR,profitFactor:grossLoss?grossWin/grossLoss:grossWin?99:0,
       avgScore:data.length?data.reduce((a,x)=>a+Number(x.score||0),0)/data.length:0,
       avgProbability:data.length?data.reduce((a,x)=>a+Number(x.probability||0),0)/data.length:0
     },
-    byHour, bySession, bySymbol, byTimeframe, equityCurve
+    bySymbol:groupStats(data,x=>x.symbol),
+    bySession:groupStats(data,x=>x.session_name),
+    byMarketPhase:groupStats(data,x=>x.market_phase),
+    byPremiumDiscount:groupStats(data,x=>x.premium_discount),
+    equityCurve
   };
 }
 
-async function clearAll() {
-  if (pool) await pool.query("DELETE FROM signals");
-  else memorySignals = [];
-}
-
-app.get("/health",(req,res)=>res.json({ok:true,version:"5.0.0",database:pool?"postgres":"memory",time:new Date().toISOString()}));
+app.get("/health",(req,res)=>res.json({ok:true,version:"6.0.0",database:pool?"postgres":"memory",time:new Date().toISOString()}));
 
 app.get("/api/signals",async(req,res)=>{
   try{res.json({ok:true,signals:await listSignals(),analytics:await analytics()})}
@@ -243,15 +256,13 @@ app.get("/api/signals",async(req,res)=>{
 });
 
 app.get("/api/export.csv",async(req,res)=>{
-  try{
-    const rows = await listSignals();
-    const header = ["external_id","received_at","closed_at","symbol","timeframe","signal","status","result","price","sl","tp1","tp2","tp3","exit_price","pnl_r","score","probability","session_name","trend","structure"];
-    const esc = v => `"${String(v ?? "").replaceAll('"','""')}"`;
-    const csv = [header.join(","), ...rows.map(x=>header.map(h=>esc(x[h])).join(","))].join("\n");
-    res.setHeader("content-type","text/csv; charset=utf-8");
-    res.setHeader("content-disposition",'attachment; filename="proptrader_signals.csv"');
-    res.send("\ufeff"+csv);
-  }catch(e){res.status(500).send("Eroare export")}
+  const rows=await listSignals();
+  const header=["external_id","received_at","closed_at","symbol","timeframe","signal","status","result","price","sl","tp1","tp2","tp3","pnl_r","score","probability","session_name","market_phase","premium_discount","fib_zone","fvg_state","ob_state","kill_zone"];
+  const esc=v=>`"${String(v??"").replaceAll('"','""')}"`;
+  const csv=[header.join(","),...rows.map(x=>header.map(h=>esc(x[h])).join(","))].join("\n");
+  res.setHeader("content-type","text/csv; charset=utf-8");
+  res.setHeader("content-disposition",'attachment; filename="proptrader_v6_signals.csv"');
+  res.send("\ufeff"+csv);
 });
 
 app.post("/webhook",async(req,res)=>{
@@ -277,18 +288,24 @@ app.post("/api/test-signal",async(req,res)=>{
   if(!ADMIN_KEY||req.body?.adminKey!==ADMIN_KEY)return res.status(401).json({ok:false,error:"Neautorizat"});
   const s=normalizeSignal({
     external_id:`TEST-${Date.now()}`,symbol:"US30",timeframe:"5",signal:"BUY",
-    price:45000,sl:44920,tp1:45160,tp2:45240,tp3:45320,score:88,probability:78,
-    rsi:58.4,atr:72,rr:2,trend:"Bullish",structure:"BOS bullish + FVG",
+    price:45000,sl:44920,tp1:45160,tp2:45240,tp3:45320,score:91,probability:81,
+    rsi:58.4,atr:72,rr:2,trend:"Bullish",structure:"HH + HL + BOS",
     session:"New York",mtf_trend:"M15 bullish",vwap_side:"Above VWAP",
-    order_block:"Bullish OB retest",bos:true,fvg:true,liquidity_sweep:true,
-    vwap_confirm:true,mtf_confirm:true,order_block_confirm:true,reason:"Semnal demonstrativ v5."
+    order_block:"Fresh bullish OB",bos:true,fvg:true,liquidity_sweep:true,
+    vwap_confirm:true,mtf_confirm:true,order_block_confirm:true,
+    market_phase:"Expansion",equal_highs:false,equal_lows:true,
+    premium_discount:"Discount",fib_zone:"0.618–0.705",fvg_state:"Valid / unfilled",
+    ob_state:"Fresh",kill_zone:"New York Open",
+    score_breakdown:{trend:15,mtf:15,vwap:10,structure:20,liquidity:10,fvg:8,order_block:8,session:5},
+    reason:"Semnal demonstrativ v6."
   });
   await saveSignal(s);res.json({ok:true,signal:s});
 });
 
 app.post("/api/clear",async(req,res)=>{
   if(!ADMIN_KEY||req.body?.adminKey!==ADMIN_KEY)return res.status(401).json({ok:false,error:"Neautorizat"});
-  await clearAll();res.json({ok:true});
+  if(pool)await pool.query("DELETE FROM signals");else memorySignals=[];
+  res.json({ok:true});
 });
 
-initDb().then(()=>app.listen(PORT,()=>console.log("PropTrader AI v5 pe "+PORT))).catch(e=>{console.error(e);process.exit(1)});
+initDb().then(()=>app.listen(PORT,()=>console.log("PropTrader AI v6 pe "+PORT))).catch(e=>{console.error(e);process.exit(1)});
