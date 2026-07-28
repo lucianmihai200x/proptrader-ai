@@ -41,6 +41,9 @@ let memoryBars = [];
 let memoryPatterns = [];
 
 let historyDownloadJob = null;
+const HISTORY_CHUNK_DAYS = Math.max(7, Math.min(90, Number(process.env.HISTORY_CHUNK_DAYS || 30)));
+const HISTORY_RETRY_ATTEMPTS = Math.max(1, Math.min(8, Number(process.env.HISTORY_RETRY_ATTEMPTS || 4)));
+const HISTORY_RETRY_BASE_MS = Math.max(500, Number(process.env.HISTORY_RETRY_BASE_MS || 2000));
 
 app.use(express.json({ limit: "25mb" }));
 app.use(express.text({ type: ["text/plain", "application/text"], limit: "25mb" }));
@@ -824,7 +827,7 @@ async function saveBacktestRun(run){
 }
 async function latestBacktest(){if(!pool)return global.lastMemoryBacktest||null;return (await pool.query(`SELECT * FROM backtest_runs ORDER BY created_at DESC LIMIT 1`)).rows[0]||null;}
 
-app.get("/health", (req,res)=>res.json({ok:true,version:"15.0.0",database:pool?"postgres":"memory",archiveAfterHours:ARCHIVE_AFTER_HOURS,adminKeyConfigured:Boolean(ADMIN_KEY),newsWebhookConfigured:Boolean(NEWS_WEBHOOK_KEY),fmpConfigured:Boolean(FMP_API_KEY),alphaVantageConfigured:Boolean(ALPHAVANTAGE_API_KEY),finnhubConfigured:Boolean(FINNHUB_API_KEY),autoTrackTrades:AUTO_TRACK_TRADES,lastNewsSync,lastNewsSyncError,patternMinSamples:PATTERN_MIN_SAMPLES,patternMinProbability:PATTERN_MIN_PROBABILITY,patternHorizonBars:PATTERN_HORIZON_BARS,liveMinAdaptiveScore:LIVE_MIN_ADAPTIVE_SCORE,learningMinSamples:LEARNING_MIN_SAMPLES,maxNewsRiskLive:MAX_NEWS_RISK_LIVE,maxConsecutiveLosses:MAX_CONSECUTIVE_LOSSES,time:new Date().toISOString()}));
+app.get("/health", (req,res)=>res.json({ok:true,version:"15.1.0",database:pool?"postgres":"memory",archiveAfterHours:ARCHIVE_AFTER_HOURS,adminKeyConfigured:Boolean(ADMIN_KEY),newsWebhookConfigured:Boolean(NEWS_WEBHOOK_KEY),fmpConfigured:Boolean(FMP_API_KEY),alphaVantageConfigured:Boolean(ALPHAVANTAGE_API_KEY),finnhubConfigured:Boolean(FINNHUB_API_KEY),autoTrackTrades:AUTO_TRACK_TRADES,lastNewsSync,lastNewsSyncError,patternMinSamples:PATTERN_MIN_SAMPLES,patternMinProbability:PATTERN_MIN_PROBABILITY,patternHorizonBars:PATTERN_HORIZON_BARS,liveMinAdaptiveScore:LIVE_MIN_ADAPTIVE_SCORE,learningMinSamples:LEARNING_MIN_SAMPLES,maxNewsRiskLive:MAX_NEWS_RISK_LIVE,maxConsecutiveLosses:MAX_CONSECUTIVE_LOSSES,time:new Date().toISOString()}));
 
 app.get("/api/signals", async(req,res)=>{ try { const mode=req.query.mode==="archive"?"archive":"active"; res.json({ok:true,mode,signals:await listSignals(mode,req.query),analytics:await analytics()}); } catch(e){ console.error(e); res.status(500).json({ok:false,error:e.message}); } });
 app.get("/api/analytics", async(req,res)=>{ try { res.json({ok:true,analytics:await analytics()}); } catch(e){res.status(500).json({ok:false,error:e.message});} });
@@ -891,28 +894,52 @@ function dateOnlyUtc(d){return new Date(Date.UTC(d.getUTCFullYear(),d.getUTCMont
 function addUtcDays(d,n){const x=new Date(d);x.setUTCDate(x.getUTCDate()+n);return x;}
 function historyJobPublic(){
   if(!historyDownloadJob)return null;
-  const {id,status,symbol,timeframe,priceType,from,to,startedAt,finishedAt,currentFrom,currentTo,chunksDone,chunksTotal,downloaded,inserted,duplicates,error}=historyDownloadJob;
-  return {id,status,symbol,timeframe,priceType,from,to,startedAt,finishedAt,currentFrom,currentTo,chunksDone,chunksTotal,downloaded,inserted,duplicates,error,progress:chunksTotal?Math.round(chunksDone/chunksTotal*100):0};
+  const {id,status,symbol,timeframe,priceType,from,to,startedAt,finishedAt,currentFrom,currentTo,chunksDone,chunksTotal,downloaded,inserted,duplicates,error,retries,lastSuccessfulTo,log}=historyDownloadJob;
+  return {id,status,symbol,timeframe,priceType,from,to,startedAt,finishedAt,currentFrom,currentTo,chunksDone,chunksTotal,downloaded,inserted,duplicates,error,retries,lastSuccessfulTo,log:(log||[]).slice(-40),progress:chunksTotal?Math.min(100,Math.round(chunksDone/chunksTotal*100)):0};
+}
+const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+function normalizeDukascopyRows(data){
+  if(Array.isArray(data))return data;
+  if(data&&Array.isArray(data.data))return data.data;
+  if(data&&Array.isArray(data.rows))return data.rows;
+  if(data&&Array.isArray(data.candles))return data.candles;
+  return [];
+}
+async function fetchDukascopyChunk(options,job){
+  let lastError;
+  for(let attempt=1;attempt<=HISTORY_RETRY_ATTEMPTS;attempt++){
+    try{
+      if(attempt>1){job.retries++;job.log.push(`${new Date().toISOString()} Retry ${attempt}/${HISTORY_RETRY_ATTEMPTS}`);}
+      return await getHistoricalRates(options);
+    }catch(e){
+      lastError=e;job.log.push(`${new Date().toISOString()} Eroare încercarea ${attempt}: ${e.message||e}`);
+      if(attempt<HISTORY_RETRY_ATTEMPTS)await sleep(HISTORY_RETRY_BASE_MS*Math.pow(2,attempt-1));
+    }
+  }
+  throw lastError||new Error("Descărcarea lotului a eșuat");
 }
 async function runDukascopyDownload(job){
   try{
     const cfg=DUKASCOPY_INSTRUMENTS[job.symbol],tf=DUKASCOPY_TIMEFRAMES[job.timeframe];
-    let cursor=new Date(job.from), finalTo=new Date(job.to);
+    let cursor=new Date(job.resumeFrom||job.from), finalTo=new Date(job.to);
     while(cursor<finalTo){
-      const chunkTo=new Date(Math.min(addUtcDays(cursor,90).getTime(),finalTo.getTime()));
-      job.currentFrom=cursor.toISOString();job.currentTo=chunkTo.toISOString();
-      const data=await getHistoricalRates({instrument:cfg.instrument,dates:{from:cursor,to:chunkTo},timeframe:tf,format:"json",priceType:job.priceType});
-      const rows=(Array.isArray(data)?data:[]).filter(x=>x&&Number.isFinite(Number(x.timestamp))&&Number.isFinite(Number(x.open))&&Number.isFinite(Number(x.high))&&Number.isFinite(Number(x.low))&&Number.isFinite(Number(x.close))).map(x=>({
+      const chunkTo=new Date(Math.min(addUtcDays(cursor,HISTORY_CHUNK_DAYS).getTime(),finalTo.getTime()));
+      job.currentFrom=cursor.toISOString();job.currentTo=chunkTo.toISOString();job.error="";
+      job.log.push(`${new Date().toISOString()} Lot ${job.chunksDone+1}/${job.chunksTotal}: ${job.currentFrom} → ${job.currentTo}`);
+      const data=await fetchDukascopyChunk({instrument:cfg.instrument,dates:{from:cursor,to:chunkTo},timeframe:tf,format:"json",priceType:job.priceType},job);
+      const sourceRows=normalizeDukascopyRows(data);
+      const rows=sourceRows.filter(x=>x&&Number.isFinite(Number(x.timestamp))&&Number.isFinite(Number(x.open))&&Number.isFinite(Number(x.high))&&Number.isFinite(Number(x.low))&&Number.isFinite(Number(x.close))).map(x=>({
         external_id:`DUKA-${cfg.instrument}-${tf}-${job.priceType}-${Number(x.timestamp)}`,
         bar_time:new Date(Number(x.timestamp)).toISOString(),symbol:job.symbol,timeframe:job.timeframe,
         open:Number(x.open),high:Number(x.high),low:Number(x.low),close:Number(x.close),volume:Number(x.volume||0)
       }));
       const added=rows.length?await saveBarsBatch(rows):0;
-      job.downloaded+=rows.length;job.inserted+=added;job.duplicates+=Math.max(0,rows.length-added);job.chunksDone++;
+      job.downloaded+=rows.length;job.inserted+=added;job.duplicates+=Math.max(0,rows.length-added);job.chunksDone++;job.lastSuccessfulTo=chunkTo.toISOString();
+      job.log.push(`${new Date().toISOString()} Salvat: ${added}; duplicate: ${Math.max(0,rows.length-added)}`);
       cursor=chunkTo;
     }
-    job.status="COMPLETED";job.finishedAt=new Date().toISOString();job.currentFrom=null;job.currentTo=null;
-  }catch(e){job.status="FAILED";job.error=e.message||String(e);job.finishedAt=new Date().toISOString();console.error("Dukascopy history download:",e);}
+    job.status="COMPLETED";job.finishedAt=new Date().toISOString();job.currentFrom=null;job.currentTo=null;job.error="";
+  }catch(e){job.status="FAILED";job.error=e.message||String(e);job.resumeFrom=job.lastSuccessfulTo||job.currentFrom||job.from;job.finishedAt=new Date().toISOString();job.log.push(`${new Date().toISOString()} FAILED: ${job.error}`);console.error("Dukascopy history download:",e);}
 }
 app.post("/api/history-download",async(req,res)=>{if(!requireAdmin(req,res))return;try{
   if(historyDownloadJob&&historyDownloadJob.status==="RUNNING")throw new Error("Există deja o descărcare în curs. Așteaptă finalizarea ei.");
@@ -921,8 +948,11 @@ app.post("/api/history-download",async(req,res)=>{if(!requireAdmin(req,res))retu
   const priceType=clean(req.body.priceType||"bid",10).toLowerCase()==="ask"?"ask":"bid";
   const years=Math.max(1,Math.min(10,Math.floor(num(req.body.years,5))));
   const to=dateOnlyUtc(new Date());const from=new Date(to);from.setUTCFullYear(from.getUTCFullYear()-years);
-  const chunksTotal=Math.ceil((to-from)/(90*86400000));
-  historyDownloadJob={id:`HIST-${Date.now()}`,status:"RUNNING",symbol,timeframe,priceType,from:from.toISOString(),to:to.toISOString(),startedAt:new Date().toISOString(),finishedAt:null,currentFrom:null,currentTo:null,chunksDone:0,chunksTotal,downloaded:0,inserted:0,duplicates:0,error:""};
+  const chunksTotal=Math.ceil((to-from)/(HISTORY_CHUNK_DAYS*86400000));
+  const previous=historyDownloadJob&&historyDownloadJob.symbol===symbol&&historyDownloadJob.timeframe===timeframe&&historyDownloadJob.priceType===priceType?historyDownloadJob:null;
+  const resumeFrom=(previous&&previous.status==="FAILED"&&previous.lastSuccessfulTo)?previous.lastSuccessfulTo:from.toISOString();
+  const alreadyDone=Math.max(0,Math.floor((new Date(resumeFrom)-from)/(HISTORY_CHUNK_DAYS*86400000)));
+  historyDownloadJob={id:`HIST-${Date.now()}`,status:"RUNNING",symbol,timeframe,priceType,from:from.toISOString(),to:to.toISOString(),resumeFrom,startedAt:new Date().toISOString(),finishedAt:null,currentFrom:null,currentTo:null,chunksDone:alreadyDone,chunksTotal,downloaded:0,inserted:0,duplicates:0,retries:0,lastSuccessfulTo:resumeFrom,error:"",log:[`${new Date().toISOString()} Pornire${alreadyDone?`/reluare de la lotul ${alreadyDone+1}`:""}`]};
   setImmediate(()=>runDukascopyDownload(historyDownloadJob));
   res.status(202).json({ok:true,job:historyJobPublic()});
 }catch(e){res.status(400).json({ok:false,error:e.message});}});
@@ -936,7 +966,7 @@ app.post("/api/history-import",async(req,res)=>{if(!requireAdmin(req,res))return
 
 app.post("/api/backtest",async(req,res)=>{if(!requireAdmin(req,res))return;try{
   const symbol=clean(req.body.symbol||"US30",30).toUpperCase(),timeframe=clean(req.body.timeframe||"5",20),settings={horizonBars:Math.max(1,Math.min(24,num(req.body.horizonBars,3))),minSamples:Math.max(20,num(req.body.minSamples,40)),minProbability:Math.max(50,Math.min(90,num(req.body.minProbability,60))),costBps:Math.max(0,Math.min(50,num(req.body.costBps,1.5))),walkForwardFolds:Math.max(3,Math.min(10,num(req.body.walkForwardFolds,5)))};
-  const bars=await getBarsForBacktest(symbol,timeframe);if(bars.length<settings.minSamples+settings.horizonBars+20)throw new Error(`Istoric insuficient: ${bars.length} lumânări. Importă mai multe date.`);
+  const barsRaw=await getBarsForBacktest(symbol,timeframe);const bars=Array.isArray(barsRaw)?barsRaw:(barsRaw&&Array.isArray(barsRaw.rows)?barsRaw.rows:[]);if(bars.length<settings.minSamples+settings.horizonBars+20)throw new Error(`Istoric insuficient: ${bars.length} lumânări. Importă mai multe date.`);
   const report=buildBacktest(bars,settings),run=await saveBacktestRun({symbol,timeframe,bars:bars.length,start_time:bars[0].bar_time,end_time:bars[bars.length-1].bar_time,settings,summary:report.summary,results:report.results});res.json({ok:true,run});
 }catch(e){res.status(400).json({ok:false,error:e.message});}});
 app.get("/api/backtest/latest",async(req,res)=>{try{res.json({ok:true,run:await latestBacktest()});}catch(e){res.status(500).json({ok:false,error:e.message});}});
@@ -959,5 +989,5 @@ initDb().then(async()=>{
   await archiveOldSignals();
   setInterval(()=>archiveOldSignals().catch(e=>console.error("Auto-archive:",e)),15*60*1000).unref();
   if(FMP_API_KEY||ALPHAVANTAGE_API_KEY||FINNHUB_API_KEY){syncRealNews().catch(e=>{lastNewsSyncError=e.message;console.error("News sync:",e.message)});setInterval(()=>syncRealNews().catch(e=>{lastNewsSyncError=e.message;console.error("News sync:",e.message)}),NEWS_AUTO_SYNC_MINUTES*60000).unref();}
-  app.listen(PORT,()=>console.log(`PropTrader AI v14.0 rulează pe portul ${PORT}`));
+  app.listen(PORT,()=>console.log(`PropTrader AI v15.1 rulează pe portul ${PORT}`));
 }).catch(e=>{console.error("DB init failed:",e);process.exit(1)});

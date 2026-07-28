@@ -1,9 +1,10 @@
 {
-  "name": "proptrader-ai-v15",
-  "version": "15.0.0",
+  "name": "proptrader-ai-v15-1",
+  "version": "15.1.0",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test tests/*.test.js"
   },
   "engines": {
     "node": ">=20"
