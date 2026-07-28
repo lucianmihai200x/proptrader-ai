@@ -16,6 +16,7 @@ const pool = DATABASE_URL
 let memorySignals = [];
 
 app.use(express.json({ limit: "600kb" }));
+app.use(express.text({ type: "text/plain", limit: "600kb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
 async function initDb() {
@@ -255,7 +256,7 @@ async function closeSignal(payload) {
 
 app.get("/health",(req,res)=>res.json({
   ok:true,
-  version:"6.1.0",
+  version:"7.1.0",
   database:pool?"postgres":"memory",
   adminKeyConfigured:Boolean(ADMIN_KEY),
   time:new Date().toISOString()
@@ -324,21 +325,86 @@ app.post("/api/clear",async(req,res)=>{
   }
 });
 
-app.post("/webhook",async(req,res)=>{
+app.post("/webhook", async (req, res) => {
   try {
-    const key=req.query.key||req.get("x-webhook-key")||"";
-    if(!WEBHOOK_KEY||key!==WEBHOOK_KEY)return res.status(401).json({ok:false,error:"WEBHOOK_KEY incorectă"});
-    const event=String(req.body.event||"SIGNAL").toUpperCase();
-    if(event==="CLOSE")return res.json({ok:true,closed:await closeSignal(req.body)});
-    const s=normalizeSignal(req.body);
-    await saveSignal(s);
-    res.json({ok:true,signal:s});
-  } catch(e) {
-    console.error("POST /webhook:",e);
-    res.status(500).json({ok:false,error:e.message});
+    const key = req.query.key || req.get("x-webhook-key") || "";
+
+    if (!WEBHOOK_KEY || key !== WEBHOOK_KEY) {
+      return res.status(401).json({
+        ok: false,
+        error: "WEBHOOK_KEY incorectă"
+      });
+    }
+
+    let payload = req.body;
+
+    // TradingView poate trimite JSON fie ca application/json,
+    // fie ca text/plain. Convertim textul în obiect înainte de procesare.
+    if (Buffer.isBuffer(payload)) {
+      payload = payload.toString("utf8");
+    }
+
+    if (typeof payload === "string") {
+      const raw = payload.trim();
+
+      if (!raw) {
+        return res.status(400).json({
+          ok: false,
+          error: "Payload webhook gol"
+        });
+      }
+
+      try {
+        payload = JSON.parse(raw);
+      } catch (parseError) {
+        console.error("Webhook JSON invalid:", raw);
+        return res.status(400).json({
+          ok: false,
+          error: "Payload webhook invalid: mesajul nu este JSON valid"
+        });
+      }
+    }
+
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+      return res.status(400).json({
+        ok: false,
+        error: "Payload webhook invalid"
+      });
+    }
+
+    console.log("Webhook primit:", {
+      contentType: req.get("content-type") || "",
+      event: payload.event || "SIGNAL",
+      symbol: payload.symbol || payload.ticker || "N/A",
+      signal: payload.signal || payload.side || "WAIT",
+      external_id: payload.external_id || payload.signal_id || null
+    });
+
+    const event = String(payload.event || "SIGNAL").toUpperCase();
+
+    if (event === "CLOSE") {
+      return res.json({
+        ok: true,
+        closed: await closeSignal(payload)
+      });
+    }
+
+    const signal = normalizeSignal(payload);
+    await saveSignal(signal);
+
+    return res.json({
+      ok: true,
+      signal
+    });
+  } catch (e) {
+    console.error("POST /webhook:", e);
+    return res.status(500).json({
+      ok: false,
+      error: e.message
+    });
   }
 });
 
 initDb()
-  .then(()=>app.listen(PORT,()=>console.log("PropTrader AI v6.1 rulează pe portul "+PORT)))
+  .then(()=>app.listen(PORT,()=>console.log("PropTrader AI v7.1 rulează pe portul "+PORT)))
   .catch(e=>{console.error("DB init failed:",e);process.exit(1)});
