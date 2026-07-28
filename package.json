@@ -1,6 +1,6 @@
 {
-  "name": "proptrader-ai-v11",
-  "version": "11.0.0",
+  "name": "proptrader-ai-v15",
+  "version": "15.0.0",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "express": "^4.21.2",
-    "pg": "^8.13.1"
+    "pg": "^8.13.1",
+    "dukascopy-node": "1.46.4"
   }
 }

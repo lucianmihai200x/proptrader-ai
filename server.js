@@ -1,6 +1,7 @@
 const express = require("express");
 const path = require("path");
 const { Pool } = require("pg");
+const { getHistoricalRates } = require("dukascopy-node");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -38,6 +39,8 @@ let memorySignals = [];
 let memoryNews = [];
 let memoryBars = [];
 let memoryPatterns = [];
+
+let historyDownloadJob = null;
 
 app.use(express.json({ limit: "25mb" }));
 app.use(express.text({ type: ["text/plain", "application/text"], limit: "25mb" }));
@@ -821,7 +824,7 @@ async function saveBacktestRun(run){
 }
 async function latestBacktest(){if(!pool)return global.lastMemoryBacktest||null;return (await pool.query(`SELECT * FROM backtest_runs ORDER BY created_at DESC LIMIT 1`)).rows[0]||null;}
 
-app.get("/health", (req,res)=>res.json({ok:true,version:"14.0.0",database:pool?"postgres":"memory",archiveAfterHours:ARCHIVE_AFTER_HOURS,adminKeyConfigured:Boolean(ADMIN_KEY),newsWebhookConfigured:Boolean(NEWS_WEBHOOK_KEY),fmpConfigured:Boolean(FMP_API_KEY),alphaVantageConfigured:Boolean(ALPHAVANTAGE_API_KEY),finnhubConfigured:Boolean(FINNHUB_API_KEY),autoTrackTrades:AUTO_TRACK_TRADES,lastNewsSync,lastNewsSyncError,patternMinSamples:PATTERN_MIN_SAMPLES,patternMinProbability:PATTERN_MIN_PROBABILITY,patternHorizonBars:PATTERN_HORIZON_BARS,liveMinAdaptiveScore:LIVE_MIN_ADAPTIVE_SCORE,learningMinSamples:LEARNING_MIN_SAMPLES,maxNewsRiskLive:MAX_NEWS_RISK_LIVE,maxConsecutiveLosses:MAX_CONSECUTIVE_LOSSES,time:new Date().toISOString()}));
+app.get("/health", (req,res)=>res.json({ok:true,version:"15.0.0",database:pool?"postgres":"memory",archiveAfterHours:ARCHIVE_AFTER_HOURS,adminKeyConfigured:Boolean(ADMIN_KEY),newsWebhookConfigured:Boolean(NEWS_WEBHOOK_KEY),fmpConfigured:Boolean(FMP_API_KEY),alphaVantageConfigured:Boolean(ALPHAVANTAGE_API_KEY),finnhubConfigured:Boolean(FINNHUB_API_KEY),autoTrackTrades:AUTO_TRACK_TRADES,lastNewsSync,lastNewsSyncError,patternMinSamples:PATTERN_MIN_SAMPLES,patternMinProbability:PATTERN_MIN_PROBABILITY,patternHorizonBars:PATTERN_HORIZON_BARS,liveMinAdaptiveScore:LIVE_MIN_ADAPTIVE_SCORE,learningMinSamples:LEARNING_MIN_SAMPLES,maxNewsRiskLive:MAX_NEWS_RISK_LIVE,maxConsecutiveLosses:MAX_CONSECUTIVE_LOSSES,time:new Date().toISOString()}));
 
 app.get("/api/signals", async(req,res)=>{ try { const mode=req.query.mode==="archive"?"archive":"active"; res.json({ok:true,mode,signals:await listSignals(mode,req.query),analytics:await analytics()}); } catch(e){ console.error(e); res.status(500).json({ok:false,error:e.message}); } });
 app.get("/api/analytics", async(req,res)=>{ try { res.json({ok:true,analytics:await analytics()}); } catch(e){res.status(500).json({ok:false,error:e.message});} });
@@ -876,6 +879,54 @@ app.get("/api/validation",async(req,res)=>{try{
   res.json({ok:true,validation:{ready,requiredTrades:VALIDATION_MIN_TRADES,all,train:t,test:v,maxDrawdownR:maxDD,brierScore:brier,closedTrades:closed.length,message:ready?"Există dovezi preliminare pe segmentul de validare. Continuă monitorizarea și controlul riscului.":"Date insuficiente sau validarea pe date nevăzute nu confirmă încă avantajul statistic."}});
 }catch(e){res.status(500).json({ok:false,error:e.message});}});
 
+
+
+const DUKASCOPY_INSTRUMENTS = {
+  US30: { instrument: "usa30idxusd", label: "US30 / USA 30 Index" },
+  XAUUSD: { instrument: "xauusd", label: "Gold / XAUUSD" },
+  NAS100: { instrument: "usatechidxusd", label: "NAS100 / US 100 Tech" }
+};
+const DUKASCOPY_TIMEFRAMES = {"1":"m1","5":"m5","15":"m15","30":"m30","60":"h1","240":"h4","1440":"d1"};
+function dateOnlyUtc(d){return new Date(Date.UTC(d.getUTCFullYear(),d.getUTCMonth(),d.getUTCDate()));}
+function addUtcDays(d,n){const x=new Date(d);x.setUTCDate(x.getUTCDate()+n);return x;}
+function historyJobPublic(){
+  if(!historyDownloadJob)return null;
+  const {id,status,symbol,timeframe,priceType,from,to,startedAt,finishedAt,currentFrom,currentTo,chunksDone,chunksTotal,downloaded,inserted,duplicates,error}=historyDownloadJob;
+  return {id,status,symbol,timeframe,priceType,from,to,startedAt,finishedAt,currentFrom,currentTo,chunksDone,chunksTotal,downloaded,inserted,duplicates,error,progress:chunksTotal?Math.round(chunksDone/chunksTotal*100):0};
+}
+async function runDukascopyDownload(job){
+  try{
+    const cfg=DUKASCOPY_INSTRUMENTS[job.symbol],tf=DUKASCOPY_TIMEFRAMES[job.timeframe];
+    let cursor=new Date(job.from), finalTo=new Date(job.to);
+    while(cursor<finalTo){
+      const chunkTo=new Date(Math.min(addUtcDays(cursor,90).getTime(),finalTo.getTime()));
+      job.currentFrom=cursor.toISOString();job.currentTo=chunkTo.toISOString();
+      const data=await getHistoricalRates({instrument:cfg.instrument,dates:{from:cursor,to:chunkTo},timeframe:tf,format:"json",priceType:job.priceType});
+      const rows=(Array.isArray(data)?data:[]).filter(x=>x&&Number.isFinite(Number(x.timestamp))&&Number.isFinite(Number(x.open))&&Number.isFinite(Number(x.high))&&Number.isFinite(Number(x.low))&&Number.isFinite(Number(x.close))).map(x=>({
+        external_id:`DUKA-${cfg.instrument}-${tf}-${job.priceType}-${Number(x.timestamp)}`,
+        bar_time:new Date(Number(x.timestamp)).toISOString(),symbol:job.symbol,timeframe:job.timeframe,
+        open:Number(x.open),high:Number(x.high),low:Number(x.low),close:Number(x.close),volume:Number(x.volume||0)
+      }));
+      const added=rows.length?await saveBarsBatch(rows):0;
+      job.downloaded+=rows.length;job.inserted+=added;job.duplicates+=Math.max(0,rows.length-added);job.chunksDone++;
+      cursor=chunkTo;
+    }
+    job.status="COMPLETED";job.finishedAt=new Date().toISOString();job.currentFrom=null;job.currentTo=null;
+  }catch(e){job.status="FAILED";job.error=e.message||String(e);job.finishedAt=new Date().toISOString();console.error("Dukascopy history download:",e);}
+}
+app.post("/api/history-download",async(req,res)=>{if(!requireAdmin(req,res))return;try{
+  if(historyDownloadJob&&historyDownloadJob.status==="RUNNING")throw new Error("Există deja o descărcare în curs. Așteaptă finalizarea ei.");
+  const symbol=clean(req.body.symbol||"US30",30).toUpperCase();if(!DUKASCOPY_INSTRUMENTS[symbol])throw new Error("Instrument neacceptat. Alege US30, XAUUSD sau NAS100.");
+  const timeframe=clean(req.body.timeframe||"5",10);if(!DUKASCOPY_TIMEFRAMES[timeframe])throw new Error("Timeframe neacceptat.");
+  const priceType=clean(req.body.priceType||"bid",10).toLowerCase()==="ask"?"ask":"bid";
+  const years=Math.max(1,Math.min(10,Math.floor(num(req.body.years,5))));
+  const to=dateOnlyUtc(new Date());const from=new Date(to);from.setUTCFullYear(from.getUTCFullYear()-years);
+  const chunksTotal=Math.ceil((to-from)/(90*86400000));
+  historyDownloadJob={id:`HIST-${Date.now()}`,status:"RUNNING",symbol,timeframe,priceType,from:from.toISOString(),to:to.toISOString(),startedAt:new Date().toISOString(),finishedAt:null,currentFrom:null,currentTo:null,chunksDone:0,chunksTotal,downloaded:0,inserted:0,duplicates:0,error:""};
+  setImmediate(()=>runDukascopyDownload(historyDownloadJob));
+  res.status(202).json({ok:true,job:historyJobPublic()});
+}catch(e){res.status(400).json({ok:false,error:e.message});}});
+app.get("/api/history-download/status",(req,res)=>res.json({ok:true,job:historyJobPublic(),instruments:DUKASCOPY_INSTRUMENTS,timeframes:DUKASCOPY_TIMEFRAMES}));
 
 app.post("/api/history-import",async(req,res)=>{if(!requireAdmin(req,res))return;try{
   const parsed=parseHistoricalCsv(req.body.csv,{symbol:req.body.symbol,timeframe:req.body.timeframe,timezoneOffsetMinutes:req.body.timezoneOffsetMinutes});
