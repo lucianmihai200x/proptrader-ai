@@ -15,6 +15,10 @@ const PATTERN_LOOKBACK_DAYS = Math.max(14, Number(process.env.PATTERN_LOOKBACK_D
 const PATTERN_HORIZON_BARS = Math.max(1, Math.min(12, Number(process.env.PATTERN_HORIZON_BARS || 3)));
 const PATTERN_COOLDOWN_MINUTES = Math.max(5, Number(process.env.PATTERN_COOLDOWN_MINUTES || 60));
 const FMP_API_KEY = process.env.FMP_API_KEY || "";
+const ALPHAVANTAGE_API_KEY = process.env.ALPHAVANTAGE_API_KEY || "";
+const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY || "";
+const NEWS_MAX_AGE_HOURS = Math.max(12, Number(process.env.NEWS_MAX_AGE_HOURS || 96));
+const NEWS_MIN_RELEVANCE = Math.max(0, Math.min(100, Number(process.env.NEWS_MIN_RELEVANCE || 35)));
 const NEWS_AUTO_SYNC_MINUTES = Math.max(15, Number(process.env.NEWS_AUTO_SYNC_MINUTES || 60));
 const AUTO_TRACK_TRADES = String(process.env.AUTO_TRACK_TRADES || "true").toLowerCase() !== "false";
 const NEWS_COUNTRIES = (process.env.NEWS_COUNTRIES || "US").split(",").map(x=>x.trim().toUpperCase()).filter(Boolean);
@@ -103,6 +107,9 @@ async function initDb() {
       raw JSONB
     )
   `);
+  for (const [name, type] of [["provider","TEXT"],["sentiment","NUMERIC"],["relevance","INTEGER DEFAULT 50"],["confidence","INTEGER DEFAULT 50"],["scheduled","BOOLEAN DEFAULT FALSE"]]) {
+    await pool.query(`ALTER TABLE news_events ADD COLUMN IF NOT EXISTS ${name} ${type}`);
+  }
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS news_external_id_unique ON news_events (external_id) WHERE external_id IS NOT NULL`);
   await pool.query(`CREATE INDEX IF NOT EXISTS news_published_idx ON news_events (published_at DESC)`);
 
@@ -312,8 +319,8 @@ function fmpImpact(importance){
   if(x.includes("high"))return 90;if(x.includes("medium"))return 60;if(x.includes("low"))return 30;return 45;
 }
 
-async function syncRealNews() {
-  if(!FMP_API_KEY) throw new Error("FMP_API_KEY nu este configurată în Render");
+async function syncFmpCalendar() {
+  if(!FMP_API_KEY) return {provider:"FMP",configured:false,received:0,accepted:0,saved:0};
   const now=new Date(), from=new Date(now.getTime()-24*3600000), to=new Date(now.getTime()+7*86400000);
   const iso=d=>d.toISOString().slice(0,10);
   const url=`https://financialmodelingprep.com/stable/economic-calendar?from=${iso(from)}&to=${iso(to)}&apikey=${encodeURIComponent(FMP_API_KEY)}`;
@@ -328,13 +335,68 @@ async function syncRealNews() {
     accepted++;
     const title=clean(item.event||item.name||item.title||"Eveniment economic",500);
     const summary=[item.actual!=null?`Actual: ${item.actual}`:"",item.estimate!=null?`Estimare: ${item.estimate}`:"",item.previous!=null?`Anterior: ${item.previous}`:""].filter(Boolean).join(" · ");
-    const n=normalizeNews({external_id:`FMP-${item.id||`${item.date}-${title}`}`,published_at:item.date||item.datetime||new Date().toISOString(),title,summary,source:"Financial Modeling Prep",impact:fmpImpact(item.impact||item.importance),category:"ECONOMIC_CALENDAR",raw:item});
-    const before=pool?null:memoryNews.length;
-    await saveNews(n);
-    if(!pool){if(memoryNews.length>before)saved++;}else saved++;
+    const n=normalizeNews({external_id:`FMP-${item.id||`${item.date}-${title}`}`,published_at:item.date||item.datetime||new Date().toISOString(),title,summary,source:"Financial Modeling Prep",provider:"FMP",impact:fmpImpact(item.impact||item.importance),category:"ECONOMIC_CALENDAR",scheduled:true,relevance:95,confidence:90,raw:item});
+    await saveNews(n); saved++;
   }
-  lastNewsSync=new Date().toISOString();lastNewsSyncError="";
-  return {received:items.length,accepted,saved,lastNewsSync};
+  return {provider:"FMP",configured:true,received:items.length,accepted,saved};
+}
+
+function avTime(v){
+  const m=String(v||"").match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})/);
+  return m ? new Date(`${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}Z`).toISOString() : new Date().toISOString();
+}
+
+async function syncAlphaVantageNews(){
+  if(!ALPHAVANTAGE_API_KEY) return {provider:"Alpha Vantage",configured:false,received:0,accepted:0,saved:0};
+  const topics="financial_markets,economy_monetary,economy_macro";
+  const url=`https://www.alphavantage.co/query?function=NEWS_SENTIMENT&topics=${encodeURIComponent(topics)}&sort=LATEST&limit=200&apikey=${encodeURIComponent(ALPHAVANTAGE_API_KEY)}`;
+  const response=await fetch(url,{headers:{accept:"application/json"}});
+  if(!response.ok) throw new Error(`Alpha Vantage a răspuns cu HTTP ${response.status}`);
+  const data=await response.json();
+  if(data.Note||data.Information) throw new Error(clean(data.Note||data.Information,500));
+  const items=Array.isArray(data.feed)?data.feed:[]; let accepted=0,saved=0;
+  for(const item of items){
+    const title=clean(item.title,500), summary=clean(item.summary,3000);
+    const rel=Math.max(...(item.ticker_sentiment||[]).map(x=>num(x.relevance_score)*100),35);
+    const inferred=newsSymbols(`${title} ${summary}`);
+    if(!inferred.length && rel<NEWS_MIN_RELEVANCE) continue;
+    accepted++;
+    const score=num(item.overall_sentiment_score,0);
+    const n=normalizeNews({external_id:`AV-${item.url||item.time_published||title}`,published_at:avTime(item.time_published),title,summary,source:item.source||"Alpha Vantage",provider:"ALPHA_VANTAGE",url:item.url,symbols:inferred,sentiment:score,bias:score>.12?"POSITIVE":score<-.12?"NEGATIVE":"NEUTRAL",relevance:rel,confidence:70,raw:item});
+    await saveNews(n); saved++;
+  }
+  return {provider:"Alpha Vantage",configured:true,received:items.length,accepted,saved};
+}
+
+async function syncFinnhubNews(){
+  if(!FINNHUB_API_KEY) return {provider:"Finnhub",configured:false,received:0,accepted:0,saved:0};
+  const url=`https://finnhub.io/api/v1/news?category=general&token=${encodeURIComponent(FINNHUB_API_KEY)}`;
+  const response=await fetch(url,{headers:{accept:"application/json"}});
+  if(!response.ok) throw new Error(`Finnhub a răspuns cu HTTP ${response.status}`);
+  const items=await response.json();
+  if(!Array.isArray(items)) throw new Error("Răspuns Finnhub neașteptat");
+  let accepted=0,saved=0;
+  for(const item of items){
+    const title=clean(item.headline,500), summary=clean(item.summary,3000);
+    const symbols=newsSymbols(`${title} ${summary}`);
+    if(!symbols.length) continue;
+    accepted++;
+    const n=normalizeNews({external_id:`FH-${item.id||item.url}`,published_at:item.datetime?new Date(item.datetime*1000).toISOString():new Date().toISOString(),title,summary,source:item.source||"Finnhub",provider:"FINNHUB",url:item.url,symbols,relevance:65,confidence:60,raw:item});
+    await saveNews(n); saved++;
+  }
+  return {provider:"Finnhub",configured:true,received:items.length,accepted,saved};
+}
+
+async function syncRealNews() {
+  if(!FMP_API_KEY && !ALPHAVANTAGE_API_KEY && !FINNHUB_API_KEY) throw new Error("Configurează cel puțin o cheie: FMP_API_KEY, ALPHAVANTAGE_API_KEY sau FINNHUB_API_KEY");
+  const results=[];
+  for(const fn of [syncFmpCalendar,syncAlphaVantageNews,syncFinnhubNews]){
+    try{results.push(await fn());}catch(e){results.push({provider:fn.name,configured:true,error:e.message,received:0,accepted:0,saved:0});}
+  }
+  const received=results.reduce((a,x)=>a+num(x.received),0), accepted=results.reduce((a,x)=>a+num(x.accepted),0), saved=results.reduce((a,x)=>a+num(x.saved),0);
+  lastNewsSync=new Date().toISOString();
+  lastNewsSyncError=results.filter(x=>x.error).map(x=>`${x.provider}: ${x.error}`).join(" | ");
+  return {received,accepted,saved,providers:results,lastNewsSync,lastNewsSyncError};
 }
 
 async function recentBars(symbol,timeframe,limit=20000) {
@@ -466,9 +528,9 @@ async function saveNews(n) {
     memoryNews = memoryNews.slice(0, 1000);
     return;
   }
-  await pool.query(`INSERT INTO news_events (external_id,published_at,title,summary,source,url,symbols,impact,bias,category,raw)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT DO NOTHING`,
-    [n.external_id,n.published_at,n.title,n.summary,n.source,n.url,n.symbols,n.impact,n.bias,n.category,JSON.stringify(n.raw)]);
+  await pool.query(`INSERT INTO news_events (external_id,published_at,title,summary,source,url,symbols,impact,bias,category,raw,provider,sentiment,relevance,confidence,scheduled)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) ON CONFLICT DO NOTHING`,
+    [n.external_id,n.published_at,n.title,n.summary,n.source,n.url,n.symbols,n.impact,n.bias,n.category,JSON.stringify(n.raw),n.provider,n.sentiment,n.relevance,n.confidence,n.scheduled]);
 }
 
 async function listSignals(mode = "active", filters = {}) {
@@ -560,7 +622,7 @@ function requireAdmin(req, res) {
   return true;
 }
 
-app.get("/health", (req,res)=>res.json({ok:true,version:"10.0.0",database:pool?"postgres":"memory",archiveAfterHours:ARCHIVE_AFTER_HOURS,adminKeyConfigured:Boolean(ADMIN_KEY),newsWebhookConfigured:Boolean(NEWS_WEBHOOK_KEY),fmpConfigured:Boolean(FMP_API_KEY),autoTrackTrades:AUTO_TRACK_TRADES,lastNewsSync,lastNewsSyncError,patternMinSamples:PATTERN_MIN_SAMPLES,patternMinProbability:PATTERN_MIN_PROBABILITY,patternHorizonBars:PATTERN_HORIZON_BARS,time:new Date().toISOString()}));
+app.get("/health", (req,res)=>res.json({ok:true,version:"11.0.0",database:pool?"postgres":"memory",archiveAfterHours:ARCHIVE_AFTER_HOURS,adminKeyConfigured:Boolean(ADMIN_KEY),newsWebhookConfigured:Boolean(NEWS_WEBHOOK_KEY),fmpConfigured:Boolean(FMP_API_KEY),alphaVantageConfigured:Boolean(ALPHAVANTAGE_API_KEY),finnhubConfigured:Boolean(FINNHUB_API_KEY),autoTrackTrades:AUTO_TRACK_TRADES,lastNewsSync,lastNewsSyncError,patternMinSamples:PATTERN_MIN_SAMPLES,patternMinProbability:PATTERN_MIN_PROBABILITY,patternHorizonBars:PATTERN_HORIZON_BARS,time:new Date().toISOString()}));
 
 app.get("/api/signals", async(req,res)=>{ try { const mode=req.query.mode==="archive"?"archive":"active"; res.json({ok:true,mode,signals:await listSignals(mode,req.query),analytics:await analytics()}); } catch(e){ console.error(e); res.status(500).json({ok:false,error:e.message}); } });
 app.get("/api/analytics", async(req,res)=>{ try { res.json({ok:true,analytics:await analytics()}); } catch(e){res.status(500).json({ok:false,error:e.message});} });
@@ -568,11 +630,11 @@ app.post("/api/archive-now", async(req,res)=>{ if(!requireAdmin(req,res))return;
 
 app.get("/api/news", async(req,res)=>{ try {
   const limit=Math.min(200,Math.max(1,num(req.query.limit,50))); let rows;
-  if(!pool) rows=memoryNews.slice(0,limit); else rows=(await pool.query("SELECT * FROM news_events ORDER BY published_at DESC LIMIT $1",[limit])).rows;
+  if(!pool) rows=memoryNews.slice(0,limit); else rows=(await pool.query("SELECT * FROM news_events WHERE published_at >= NOW() - ($2 * INTERVAL '1 hour') OR scheduled = TRUE ORDER BY published_at DESC LIMIT $1",[limit,NEWS_MAX_AGE_HOURS])).rows;
   res.json({ok:true,news:rows});
 } catch(e){res.status(500).json({ok:false,error:e.message});} });
 
-app.get("/api/news-status",(req,res)=>res.json({ok:true,fmpConfigured:Boolean(FMP_API_KEY),lastNewsSync,lastNewsSyncError,autoSyncMinutes:NEWS_AUTO_SYNC_MINUTES}));
+app.get("/api/news-status",(req,res)=>res.json({ok:true,fmpConfigured:Boolean(FMP_API_KEY),alphaVantageConfigured:Boolean(ALPHAVANTAGE_API_KEY),finnhubConfigured:Boolean(FINNHUB_API_KEY),lastNewsSync,lastNewsSyncError,autoSyncMinutes:NEWS_AUTO_SYNC_MINUTES,maxAgeHours:NEWS_MAX_AGE_HOURS,minRelevance:NEWS_MIN_RELEVANCE}));
 
 app.post("/api/news-sync",async(req,res)=>{if(!requireAdmin(req,res))return;try{res.json({ok:true,...await syncRealNews()});}catch(e){lastNewsSyncError=e.message;res.status(400).json({ok:false,error:e.message});}});
 
@@ -617,6 +679,6 @@ app.post("/webhook", async(req,res)=>{try{
 initDb().then(async()=>{
   await archiveOldSignals();
   setInterval(()=>archiveOldSignals().catch(e=>console.error("Auto-archive:",e)),15*60*1000).unref();
-  if(FMP_API_KEY){syncRealNews().catch(e=>{lastNewsSyncError=e.message;console.error("News sync:",e.message)});setInterval(()=>syncRealNews().catch(e=>{lastNewsSyncError=e.message;console.error("News sync:",e.message)}),NEWS_AUTO_SYNC_MINUTES*60000).unref();}
-  app.listen(PORT,()=>console.log(`PropTrader AI v10.0 rulează pe portul ${PORT}`));
+  if(FMP_API_KEY||ALPHAVANTAGE_API_KEY||FINNHUB_API_KEY){syncRealNews().catch(e=>{lastNewsSyncError=e.message;console.error("News sync:",e.message)});setInterval(()=>syncRealNews().catch(e=>{lastNewsSyncError=e.message;console.error("News sync:",e.message)}),NEWS_AUTO_SYNC_MINUTES*60000).unref();}
+  app.listen(PORT,()=>console.log(`PropTrader AI v11.0 rulează pe portul ${PORT}`));
 }).catch(e=>{console.error("DB init failed:",e);process.exit(1)});
