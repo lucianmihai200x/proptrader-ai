@@ -4,6 +4,8 @@ const { Pool } = require("pg");
 const { getHistoricalRates } = require("dukascopy-node");
 
 const app = express();
+let lastWebhookAt = null;
+let lastWebhookResult = "Niciun webhook primit după pornire";
 const PORT = process.env.PORT || 3000;
 const WEBHOOK_KEY = process.env.WEBHOOK_KEY || "";
 const ADMIN_KEY = process.env.ADMIN_KEY || "";
@@ -827,7 +829,7 @@ async function saveBacktestRun(run){
 }
 async function latestBacktest(){if(!pool)return global.lastMemoryBacktest||null;return (await pool.query(`SELECT * FROM backtest_runs ORDER BY created_at DESC LIMIT 1`)).rows[0]||null;}
 
-app.get("/health", (req,res)=>res.json({ok:true,version:"15.1.0",database:pool?"postgres":"memory",archiveAfterHours:ARCHIVE_AFTER_HOURS,adminKeyConfigured:Boolean(ADMIN_KEY),newsWebhookConfigured:Boolean(NEWS_WEBHOOK_KEY),fmpConfigured:Boolean(FMP_API_KEY),alphaVantageConfigured:Boolean(ALPHAVANTAGE_API_KEY),finnhubConfigured:Boolean(FINNHUB_API_KEY),autoTrackTrades:AUTO_TRACK_TRADES,lastNewsSync,lastNewsSyncError,patternMinSamples:PATTERN_MIN_SAMPLES,patternMinProbability:PATTERN_MIN_PROBABILITY,patternHorizonBars:PATTERN_HORIZON_BARS,liveMinAdaptiveScore:LIVE_MIN_ADAPTIVE_SCORE,learningMinSamples:LEARNING_MIN_SAMPLES,maxNewsRiskLive:MAX_NEWS_RISK_LIVE,maxConsecutiveLosses:MAX_CONSECUTIVE_LOSSES,time:new Date().toISOString()}));
+app.get("/health", (req,res)=>res.json({ok:true,version:"16.0.0",database:pool?"postgres":"memory",archiveAfterHours:ARCHIVE_AFTER_HOURS,adminKeyConfigured:Boolean(ADMIN_KEY),newsWebhookConfigured:Boolean(NEWS_WEBHOOK_KEY),fmpConfigured:Boolean(FMP_API_KEY),alphaVantageConfigured:Boolean(ALPHAVANTAGE_API_KEY),finnhubConfigured:Boolean(FINNHUB_API_KEY),autoTrackTrades:AUTO_TRACK_TRADES,lastNewsSync,lastNewsSyncError,patternMinSamples:PATTERN_MIN_SAMPLES,patternMinProbability:PATTERN_MIN_PROBABILITY,patternHorizonBars:PATTERN_HORIZON_BARS,liveMinAdaptiveScore:LIVE_MIN_ADAPTIVE_SCORE,learningMinSamples:LEARNING_MIN_SAMPLES,maxNewsRiskLive:MAX_NEWS_RISK_LIVE,maxConsecutiveLosses:MAX_CONSECUTIVE_LOSSES,lastWebhookAt,lastWebhookResult,time:new Date().toISOString()}));
 
 app.get("/api/signals", async(req,res)=>{ try { const mode=req.query.mode==="archive"?"archive":"active"; res.json({ok:true,mode,signals:await listSignals(mode,req.query),analytics:await analytics()}); } catch(e){ console.error(e); res.status(500).json({ok:false,error:e.message}); } });
 app.get("/api/analytics", async(req,res)=>{ try { res.json({ok:true,analytics:await analytics()}); } catch(e){res.status(500).json({ok:false,error:e.message});} });
@@ -975,19 +977,22 @@ app.get("/api/history-status",async(req,res)=>{try{let rows;if(!pool){const m=ne
 app.get("/api/export.csv",async(req,res)=>{try{const rows=await allSignalsForAnalytics();const cols=["received_at","archived_at","symbol","timeframe","signal","status","result","price","sl","tp1","tp2","tp3","score","adaptive_score","learning_adjustment","news_risk","news_bias","pnl_r","session_name","structure","reason"];const esc=v=>`"${String(v??"").replaceAll('"','""')}"`;const csv=[cols.join(','),...rows.map(r=>cols.map(c=>esc(r[c])).join(','))].join('\n');res.setHeader("content-type","text/csv; charset=utf-8");res.setHeader("content-disposition",'attachment; filename="proptrader-journal.csv"');res.send('\ufeff'+csv);}catch(e){res.status(500).send(e.message);}});
 
 app.post("/webhook", async(req,res)=>{try{
-  const key=req.query.key||req.get("x-webhook-key")||""; if(!WEBHOOK_KEY||key!==WEBHOOK_KEY)return res.status(401).json({ok:false,error:"WEBHOOK_KEY incorectă"});
+  lastWebhookAt = new Date().toISOString();
+  const key=req.query.key||req.get("x-webhook-key")||"";
+  if(!WEBHOOK_KEY||key!==WEBHOOK_KEY){ lastWebhookResult="RESPINS: WEBHOOK_KEY incorectă"; console.warn(`[WEBHOOK] ${lastWebhookResult}`); return res.status(401).json({ok:false,error:"WEBHOOK_KEY incorectă"}); }
   const payload=parseBody(req); const event=clean(payload.event||"SIGNAL",20).toUpperCase();
-  if(event==="CLOSE")return res.json({ok:true,closed:await closeSignal(payload)});
+  console.log(`[WEBHOOK] primit event=${event} symbol=${payload.symbol||payload.ticker||"N/A"} side=${payload.signal||payload.side||"N/A"} tf=${payload.timeframe||payload.interval||"N/A"}`);
+  if(event==="CLOSE"){const closed=await closeSignal(payload);lastWebhookResult=`ACCEPTAT CLOSE ${payload.external_id||payload.signal_id||""}`;return res.json({ok:true,closed});}
   if(event==="BAR"){
     const bar=normalizeBar(payload); await saveBar(bar); const closed=await trackSignalsWithBar(bar); const pattern=await analyzeTimePattern(bar); const created=pattern?await savePattern(pattern):false;
-    return res.json({ok:true,event:"BAR",bar,autoClosed:closed,pattern:created?pattern:null});
+    lastWebhookResult=`ACCEPTAT BAR ${bar.symbol} ${bar.timeframe}`; return res.json({ok:true,event:"BAR",bar,autoClosed:closed,pattern:created?pattern:null});
   }
-  const signal=normalizeSignal(payload);await saveSignal(signal);return res.json({ok:true,signal});
-}catch(e){console.error("POST /webhook:",e);return res.status(400).json({ok:false,error:e.message});}});
+  const signal=normalizeSignal(payload); if(!["BUY","SELL"].includes(signal.signal)) throw new Error("Semnalul trebuie să fie BUY sau SELL"); await saveSignal(signal); lastWebhookResult=`ACCEPTAT ${signal.signal} ${signal.symbol} ${signal.timeframe} la ${signal.price}`; console.log(`[WEBHOOK] ${lastWebhookResult}`); return res.json({ok:true,signal});
+}catch(e){lastWebhookResult=`RESPINS: ${e.message}`;console.error("POST /webhook:",e);return res.status(400).json({ok:false,error:e.message});}});
 
 initDb().then(async()=>{
   await archiveOldSignals();
   setInterval(()=>archiveOldSignals().catch(e=>console.error("Auto-archive:",e)),15*60*1000).unref();
   if(FMP_API_KEY||ALPHAVANTAGE_API_KEY||FINNHUB_API_KEY){syncRealNews().catch(e=>{lastNewsSyncError=e.message;console.error("News sync:",e.message)});setInterval(()=>syncRealNews().catch(e=>{lastNewsSyncError=e.message;console.error("News sync:",e.message)}),NEWS_AUTO_SYNC_MINUTES*60000).unref();}
-  app.listen(PORT,()=>console.log(`PropTrader AI v15.1 rulează pe portul ${PORT}`));
+  app.listen(PORT,()=>console.log(`PropTrader AI v16 rulează pe portul ${PORT}`));
 }).catch(e=>{console.error("DB init failed:",e);process.exit(1)});

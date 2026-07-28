@@ -1,0 +1,159 @@
+//@version=6
+indicator("PropTrader AI v16 — Analiză automată 30m", overlay=true, max_labels_count=300)
+
+// Analizează numai lumânări de 30 minute închise.
+// Nu forțează un semnal la fiecare 30 minute: trimite BUY/SELL doar când filtrul de calitate este valid.
+
+groupSignal = "Semnale 30m"
+minScore = input.int(72, "Scor minim pentru alertă", minval=55, maxval=95, group=groupSignal)
+cooldownBars = input.int(2, "Pauză între semnale (lumânări 30m)", minval=1, maxval=20, group=groupSignal)
+onlyConfirmed = input.bool(true, "Doar după închiderea lumânării", group=groupSignal)
+
+groupRisk = "SL / TP"
+atrLen = input.int(14, "ATR", minval=5, group=groupRisk)
+slATR = input.float(1.35, "Distanță SL în ATR", minval=0.5, step=0.05, group=groupRisk)
+tp1R = input.float(1.5, "TP1 în R", minval=1.0, step=0.25, group=groupRisk)
+tp2R = input.float(2.5, "TP2 în R", minval=1.5, step=0.25, group=groupRisk)
+tp3R = input.float(3.5, "TP3 în R", minval=2.0, step=0.25, group=groupRisk)
+
+groupTrend = "Trend și momentum"
+fastLen = input.int(20, "EMA rapidă", minval=5, group=groupTrend)
+slowLen = input.int(50, "EMA lentă", minval=20, group=groupTrend)
+higherTF = input.timeframe("120", "Confirmare trend superior", group=groupTrend)
+adxLen = input.int(14, "ADX", minval=5, group=groupTrend)
+minAdx = input.float(20.0, "ADX minim", minval=10, maxval=50, step=0.5, group=groupTrend)
+
+groupStructure = "Structură și volatilitate"
+structureLen = input.int(10, "Perioadă breakout structură", minval=3, maxval=40, group=groupStructure)
+minAtrPct = input.float(0.04, "ATR minim %", minval=0.01, step=0.01, group=groupStructure)
+maxAtrPct = input.float(1.20, "ATR maxim %", minval=0.20, step=0.05, group=groupStructure)
+requireBreakout = input.bool(false, "Necesită breakout confirmat", group=groupStructure)
+
+// Scriptul trebuie aplicat pe graficul 30m.
+is30m = timeframe.isminutes and timeframe.multiplier == 30
+barOK = (not onlyConfirmed or barstate.isconfirmed) and is30m
+
+emaFast = ta.ema(close, fastLen)
+emaSlow = ta.ema(close, slowLen)
+atr = ta.atr(atrLen)
+atrPct = close != 0 ? atr / close * 100 : 0.0
+rsi = ta.rsi(close, 14)
+vwapValue = ta.vwap(hlc3)
+[diPlus, diMinus, adx] = ta.dmi(adxLen, adxLen)
+
+htfFast = request.security(syminfo.tickerid, higherTF, ta.ema(close, fastLen), barmerge.gaps_off, barmerge.lookahead_off)
+htfSlow = request.security(syminfo.tickerid, higherTF, ta.ema(close, slowLen), barmerge.gaps_off, barmerge.lookahead_off)
+
+bullTrend = emaFast > emaSlow and close > emaFast and emaFast > emaFast[2]
+bearTrend = emaFast < emaSlow and close < emaFast and emaFast < emaFast[2]
+htfBull = htfFast > htfSlow
+htfBear = htfFast < htfSlow
+
+priorHigh = ta.highest(high[1], structureLen)
+priorLow = ta.lowest(low[1], structureLen)
+bullBreakout = close > priorHigh
+bearBreakout = close < priorLow
+bullStructure = bullBreakout or (low <= emaFast and close > emaFast and close > open)
+bearStructure = bearBreakout or (high >= emaFast and close < emaFast and close < open)
+
+bullMomentum = rsi >= 52 and rsi <= 75 and diPlus > diMinus and adx >= minAdx
+bearMomentum = rsi <= 48 and rsi >= 25 and diMinus > diPlus and adx >= minAdx
+volatilityOK = atrPct >= minAtrPct and atrPct <= maxAtrPct
+body = math.abs(close - open)
+strongBullCandle = close > open and body >= atr * 0.20
+strongBearCandle = close < open and body >= atr * 0.20
+
+int buyScore = 0
+buyScore += bullTrend ? 20 : 0
+buyScore += htfBull ? 18 : 0
+buyScore += close > vwapValue ? 12 : 0
+buyScore += bullStructure ? 16 : 0
+buyScore += bullMomentum ? 16 : 0
+buyScore += volatilityOK ? 10 : 0
+buyScore += strongBullCandle ? 8 : 0
+
+int sellScore = 0
+sellScore += bearTrend ? 20 : 0
+sellScore += htfBear ? 18 : 0
+sellScore += close < vwapValue ? 12 : 0
+sellScore += bearStructure ? 16 : 0
+sellScore += bearMomentum ? 16 : 0
+sellScore += volatilityOK ? 10 : 0
+sellScore += strongBearCandle ? 8 : 0
+
+buyProbability = math.min(90.0, 42.0 + buyScore * 0.50)
+sellProbability = math.min(90.0, 42.0 + sellScore * 0.50)
+
+var int lastSignalBar = na
+cooldownOK = na(lastSignalBar) or bar_index - lastSignalBar >= cooldownBars
+structureBuyOK = not requireBreakout or bullBreakout
+structureSellOK = not requireBreakout or bearBreakout
+
+buySignal = barOK and cooldownOK and volatilityOK and structureBuyOK and buyScore >= minScore and bullTrend and htfBull and bullMomentum
+sellSignal = barOK and cooldownOK and volatilityOK and structureSellOK and sellScore >= minScore and bearTrend and htfBear and bearMomentum
+
+buyEntry = close
+buySL = buyEntry - atr * slATR
+buyRisk = buyEntry - buySL
+buyTP1 = buyEntry + buyRisk * tp1R
+buyTP2 = buyEntry + buyRisk * tp2R
+buyTP3 = buyEntry + buyRisk * tp3R
+
+sellEntry = close
+sellSL = sellEntry + atr * slATR
+sellRisk = sellSL - sellEntry
+sellTP1 = sellEntry - sellRisk * tp1R
+sellTP2 = sellEntry - sellRisk * tp2R
+sellTP3 = sellEntry - sellRisk * tp3R
+
+f_num(float x) => str.tostring(x, format.mintick)
+f_bool(bool x) => x ? "true" : "false"
+
+f_payload(string side, float entry, float sl, float tp1, float tp2, float tp3, int score, float probability) =>
+    string payload = "{\"event\":\"SIGNAL\""
+    payload += ",\"external_id\":\"V16-" + syminfo.ticker + "-30-" + str.tostring(time) + "-" + side + "\""
+    payload += ",\"symbol\":\"" + syminfo.ticker + "\""
+    payload += ",\"timeframe\":\"30\""
+    payload += ",\"signal\":\"" + side + "\""
+    payload += ",\"price\":" + f_num(entry)
+    payload += ",\"sl\":" + f_num(sl)
+    payload += ",\"tp1\":" + f_num(tp1)
+    payload += ",\"tp2\":" + f_num(tp2)
+    payload += ",\"tp3\":" + f_num(tp3)
+    payload += ",\"score\":" + str.tostring(score)
+    payload += ",\"probability\":" + str.tostring(probability, "#.0")
+    payload += ",\"rsi\":" + str.tostring(rsi, "#.0")
+    payload += ",\"atr\":" + f_num(atr)
+    payload += ",\"rr\":" + str.tostring(tp3R, "#.00")
+    payload += ",\"trend\":\"" + (side == "BUY" ? "Bullish 30m + 2h" : "Bearish 30m + 2h") + "\""
+    payload += ",\"structure\":\"" + (side == "BUY" ? (bullBreakout ? "Bullish breakout" : "Bullish pullback") : (bearBreakout ? "Bearish breakout" : "Bearish pullback")) + "\""
+    payload += ",\"bos\":" + f_bool(side == "BUY" ? bullBreakout : bearBreakout)
+    payload += ",\"vwap_confirm\":" + f_bool(side == "BUY" ? close > vwapValue : close < vwapValue)
+    payload += ",\"mtf_confirm\":true"
+    payload += ",\"market_phase\":\"TREND\""
+    payload += ",\"reason\":\"Analiză 30m v16: trend, structură, ADX/DI, RSI, VWAP, volatilitate ATR și confirmare 2h.\"}"
+    payload
+
+if buySignal
+    alert(f_payload("BUY", buyEntry, buySL, buyTP1, buyTP2, buyTP3, buyScore, buyProbability), alert.freq_once_per_bar_close)
+    lastSignalBar := bar_index
+    label.new(bar_index, low, "BUY 30m\nScor " + str.tostring(buyScore) + "\nSL " + f_num(buySL) + "\nTP1 " + f_num(buyTP1), style=label.style_label_up, textcolor=color.white)
+
+if sellSignal
+    alert(f_payload("SELL", sellEntry, sellSL, sellTP1, sellTP2, sellTP3, sellScore, sellProbability), alert.freq_once_per_bar_close)
+    lastSignalBar := bar_index
+    label.new(bar_index, high, "SELL 30m\nScor " + str.tostring(sellScore) + "\nSL " + f_num(sellSL) + "\nTP1 " + f_num(sellTP1), style=label.style_label_down, textcolor=color.white)
+
+plot(emaFast, "EMA 20", linewidth=1)
+plot(emaSlow, "EMA 50", linewidth=2)
+plot(vwapValue, "VWAP", linewidth=1)
+plotshape(buySignal, title="BUY 30m", style=shape.triangleup, location=location.belowbar, size=size.small, text="BUY")
+plotshape(sellSignal, title="SELL 30m", style=shape.triangledown, location=location.abovebar, size=size.small, text="SELL")
+
+var table statusTable = table.new(position.top_right, 1, 2)
+if barstate.islast
+    table.cell(statusTable, 0, 0, is30m ? "Analiză 30m activă" : "Schimbă graficul pe 30m")
+    table.cell(statusTable, 0, 1, "BUY " + str.tostring(buyScore) + " | SELL " + str.tostring(sellScore))
+
+alertcondition(buySignal, title="PropTrader BUY v16 30m", message="Folosește opțiunea Any alert() function call")
+alertcondition(sellSignal, title="PropTrader SELL v16 30m", message="Folosește opțiunea Any alert() function call")
