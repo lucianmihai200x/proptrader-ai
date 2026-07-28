@@ -21,6 +21,11 @@ const NEWS_MAX_AGE_HOURS = Math.max(12, Number(process.env.NEWS_MAX_AGE_HOURS ||
 const NEWS_MIN_RELEVANCE = Math.max(0, Math.min(100, Number(process.env.NEWS_MIN_RELEVANCE || 35)));
 const NEWS_AUTO_SYNC_MINUTES = Math.max(15, Number(process.env.NEWS_AUTO_SYNC_MINUTES || 60));
 const AUTO_TRACK_TRADES = String(process.env.AUTO_TRACK_TRADES || "true").toLowerCase() !== "false";
+const LIVE_MIN_ADAPTIVE_SCORE = Math.max(50, Math.min(95, Number(process.env.LIVE_MIN_ADAPTIVE_SCORE || 72)));
+const LEARNING_MIN_SAMPLES = Math.max(10, Number(process.env.LEARNING_MIN_SAMPLES || 30));
+const VALIDATION_MIN_TRADES = Math.max(20, Number(process.env.VALIDATION_MIN_TRADES || 60));
+const MAX_NEWS_RISK_LIVE = Math.max(0, Math.min(100, Number(process.env.MAX_NEWS_RISK_LIVE || 75)));
+const MAX_CONSECUTIVE_LOSSES = Math.max(2, Number(process.env.MAX_CONSECUTIVE_LOSSES || 4));
 const NEWS_COUNTRIES = (process.env.NEWS_COUNTRIES || "US").split(",").map(x=>x.trim().toUpperCase()).filter(Boolean);
 let lastNewsSync = null;
 let lastNewsSyncError = "";
@@ -80,7 +85,9 @@ async function initDb() {
     ["kill_zone", "TEXT"], ["score_breakdown", "JSONB"], ["reason", "TEXT"],
     ["news_risk", "INTEGER DEFAULT 0"], ["news_bias", "TEXT DEFAULT 'NEUTRAL'"],
     ["news_summary", "TEXT"], ["setup_key", "TEXT"],
-    ["max_favorable_price", "NUMERIC"], ["max_adverse_price", "NUMERIC"], ["auto_closed", "BOOLEAN DEFAULT FALSE"]
+    ["max_favorable_price", "NUMERIC"], ["max_adverse_price", "NUMERIC"], ["auto_closed", "BOOLEAN DEFAULT FALSE"],
+    ["execution_mode", "TEXT DEFAULT 'WATCH'"], ["quality_score", "NUMERIC DEFAULT 0"],
+    ["confidence_lower", "NUMERIC DEFAULT 0"], ["decision_reason", "TEXT"], ["regime", "TEXT DEFAULT 'UNKNOWN'"]
   ];
   for (const [name, type] of columns) {
     await pool.query(`ALTER TABLE signals ADD COLUMN IF NOT EXISTS ${name} ${type}`);
@@ -474,30 +481,69 @@ async function archiveOldSignals() {
   return q.rowCount;
 }
 
-async function setupPerformance(key) {
-  if (!key) return { samples: 0, adjustment: 0, winRate: 0, avgR: 0 };
+
+function wilsonLowerBound(wins, total, z = 1.2816) {
+  if (!total) return 0;
+  const p = wins / total, z2 = z * z;
+  return (p + z2/(2*total) - z*Math.sqrt((p*(1-p)+z2/(4*total))/total)) / (1 + z2/total);
+}
+function recentWeightedStats(rows) {
+  if (!rows.length) return { weightedWinRate:0, weightedAvgR:0, effectiveSamples:0 };
+  let wSum=0, winSum=0, rSum=0;
+  rows.forEach((x,i)=>{const w=Math.pow(0.985,i);wSum+=w;rSum+=num(x.pnl_r)*w;if(num(x.pnl_r)>0)winSum+=w;});
+  return {weightedWinRate:winSum/wSum*100,weightedAvgR:rSum/wSum,effectiveSamples:wSum};
+}
+async function consecutiveLosses() {
   let rows;
-  if (!pool) rows = memorySignals.filter(x => x.setup_key === key && x.status === "CLOSED").slice(0, 200);
-  else rows = (await pool.query(`SELECT pnl_r FROM signals WHERE setup_key=$1 AND status='CLOSED' ORDER BY closed_at DESC LIMIT 200`, [key])).rows;
-  const samples = rows.length;
-  if (!samples) return { samples: 0, adjustment: 0, winRate: 0, avgR: 0 };
-  const totalR = rows.reduce((a, x) => a + num(x.pnl_r), 0);
-  const wins = rows.filter(x => num(x.pnl_r) > 0).length;
-  const winRate = wins / samples * 100;
-  const avgR = totalR / samples;
-  const confidence = Math.min(1, samples / 30);
-  const raw = (winRate - 50) * 0.18 + avgR * 4;
-  const adjustment = Math.max(-12, Math.min(12, raw * confidence));
-  return { samples, adjustment, winRate, avgR };
+  if(!pool) rows=memorySignals.filter(x=>x.status==="CLOSED").sort((a,b)=>new Date(b.closed_at)-new Date(a.closed_at)).slice(0,20);
+  else rows=(await pool.query(`SELECT pnl_r FROM signals WHERE status='CLOSED' ORDER BY closed_at DESC LIMIT 20`)).rows;
+  let n=0; for(const r of rows){if(num(r.pnl_r)<0)n++;else break;} return n;
+}
+function classifyRegimeFromSignal(s){
+  const phase=(s.market_phase||"").toUpperCase(), atrPct=s.price>0?s.atr/s.price*100:0;
+  if(phase.includes("RANGE")||phase.includes("CONSOL"))return "RANGE";
+  if(atrPct>0.35)return "HIGH_VOL";
+  if(s.mtf_confirm&&s.vwap_confirm&&(s.bos||s.choch))return "TREND";
+  return "MIXED";
+}
+
+async function setupPerformance(key) {
+  if (!key) return { samples:0,adjustment:0,winRate:0,avgR:0,lowerBound:0,weightedWinRate:0,weightedAvgR:0 };
+  let rows;
+  if (!pool) rows = memorySignals.filter(x => x.setup_key === key && x.status === "CLOSED").sort((a,b)=>new Date(b.closed_at)-new Date(a.closed_at)).slice(0, 300);
+  else rows = (await pool.query(`SELECT pnl_r,closed_at FROM signals WHERE setup_key=$1 AND status='CLOSED' ORDER BY closed_at DESC LIMIT 300`, [key])).rows;
+  const samples=rows.length;
+  if(!samples)return {samples:0,adjustment:0,winRate:0,avgR:0,lowerBound:0,weightedWinRate:0,weightedAvgR:0};
+  const wins=rows.filter(x=>num(x.pnl_r)>0).length,totalR=rows.reduce((a,x)=>a+num(x.pnl_r),0);
+  const winRate=wins/samples*100,avgR=totalR/samples,lowerBound=wilsonLowerBound(wins,samples)*100,weighted=recentWeightedStats(rows);
+  const confidence=Math.min(1,samples/LEARNING_MIN_SAMPLES);
+  const edge=((lowerBound-50)*0.22)+(weighted.weightedAvgR*5);
+  const adjustment=Math.max(-12,Math.min(12,edge*confidence));
+  return {samples,adjustment,winRate,avgR,lowerBound,weightedWinRate:weighted.weightedWinRate,weightedAvgR:weighted.weightedAvgR};
 }
 
 async function saveSignal(s) {
   const perf = await setupPerformance(s.setup_key);
   const news = await recentNewsRisk(s.symbol);
-  const newsPenalty = news.risk >= 80 ? -12 : news.risk >= 55 ? -6 : 0;
+  const lossStreak = await consecutiveLosses();
+  const newsPenalty = news.risk >= 80 ? -14 : news.risk >= 55 ? -7 : 0;
+  const samplePenalty = perf.samples > 0 && perf.samples < LEARNING_MIN_SAMPLES ? -3 : 0;
+  const streakPenalty = lossStreak >= MAX_CONSECUTIVE_LOSSES ? -10 : 0;
   s.learning_adjustment = Number(perf.adjustment.toFixed(2));
-  s.adaptive_score = Math.max(0, Math.min(100, Number((s.score + perf.adjustment + newsPenalty).toFixed(2))));
+  s.adaptive_score = Math.max(0, Math.min(100, Number((s.score + perf.adjustment + newsPenalty + samplePenalty + streakPenalty).toFixed(2))));
   s.news_risk = news.risk; s.news_bias = news.bias; s.news_summary = news.summary;
+  s.confidence_lower = Number(perf.lowerBound.toFixed(2));
+  s.regime = classifyRegimeFromSignal(s);
+  const proven = perf.samples >= LEARNING_MIN_SAMPLES && perf.lowerBound >= 50 && perf.weightedAvgR > 0;
+  const liveAllowed = s.adaptive_score >= LIVE_MIN_ADAPTIVE_SCORE && news.risk <= MAX_NEWS_RISK_LIVE && lossStreak < MAX_CONSECUTIVE_LOSSES;
+  s.execution_mode = liveAllowed && (proven || perf.samples===0) ? "LIVE" : "WATCH";
+  s.quality_score = Math.max(0,Math.min(100,Number((s.adaptive_score + (proven?5:0) - (s.regime==="RANGE"?5:0)).toFixed(2))));
+  const reasons=[];
+  if(s.adaptive_score<LIVE_MIN_ADAPTIVE_SCORE)reasons.push(`scor sub ${LIVE_MIN_ADAPTIVE_SCORE}`);
+  if(news.risk>MAX_NEWS_RISK_LIVE)reasons.push(`risc știri ${news.risk}/100`);
+  if(lossStreak>=MAX_CONSECUTIVE_LOSSES)reasons.push(`circuit breaker după ${lossStreak} pierderi consecutive`);
+  if(perf.samples>0&&!proven)reasons.push(`setup neconfirmat statistic: N=${perf.samples}, limită inferioară ${perf.lowerBound.toFixed(1)}%`);
+  s.decision_reason = reasons.length ? reasons.join("; ") : (perf.samples===0 ? "Mod inițial: fără istoric propriu; urmărește cu risc redus." : "Criteriile de calitate sunt îndeplinite.");
 
   if (!pool) {
     if (memorySignals.some(x => x.external_id === s.external_id)) return;
@@ -510,14 +556,14 @@ async function saveSignal(s) {
       adaptive_score,learning_adjustment,rsi,atr,rr,trend,structure,session_name,mtf_trend,vwap_side,
       order_block,bos,choch,fvg,liquidity_sweep,vwap_confirm,mtf_confirm,order_block_confirm,market_phase,
       equal_highs,equal_lows,premium_discount,fib_zone,fvg_state,ob_state,kill_zone,score_breakdown,reason,
-      news_risk,news_bias,news_summary,setup_key
-    ) VALUES (${Array.from({length:45},(_,i)=>`$${i+1}`).join(',')}) ON CONFLICT DO NOTHING
+      news_risk,news_bias,news_summary,setup_key,execution_mode,quality_score,confidence_lower,decision_reason,regime
+    ) VALUES (${Array.from({length:50},(_,i)=>`$${i+1}`).join(',')}) ON CONFLICT DO NOTHING
   `, [
     s.external_id,s.received_at,s.symbol,s.timeframe,s.signal,s.status,s.price,s.sl,s.tp1,s.tp2,s.tp3,s.score,s.probability,
     s.adaptive_score,s.learning_adjustment,s.rsi,s.atr,s.rr,s.trend,s.structure,s.session_name,s.mtf_trend,s.vwap_side,
     s.order_block,s.bos,s.choch,s.fvg,s.liquidity_sweep,s.vwap_confirm,s.mtf_confirm,s.order_block_confirm,s.market_phase,
     s.equal_highs,s.equal_lows,s.premium_discount,s.fib_zone,s.fvg_state,s.ob_state,s.kill_zone,JSON.stringify(s.score_breakdown),s.reason,
-    s.news_risk,s.news_bias,s.news_summary,s.setup_key
+    s.news_risk,s.news_bias,s.news_summary,s.setup_key,s.execution_mode,s.quality_score,s.confidence_lower,s.decision_reason,s.regime
   ]);
 }
 
@@ -622,7 +668,7 @@ function requireAdmin(req, res) {
   return true;
 }
 
-app.get("/health", (req,res)=>res.json({ok:true,version:"11.0.0",database:pool?"postgres":"memory",archiveAfterHours:ARCHIVE_AFTER_HOURS,adminKeyConfigured:Boolean(ADMIN_KEY),newsWebhookConfigured:Boolean(NEWS_WEBHOOK_KEY),fmpConfigured:Boolean(FMP_API_KEY),alphaVantageConfigured:Boolean(ALPHAVANTAGE_API_KEY),finnhubConfigured:Boolean(FINNHUB_API_KEY),autoTrackTrades:AUTO_TRACK_TRADES,lastNewsSync,lastNewsSyncError,patternMinSamples:PATTERN_MIN_SAMPLES,patternMinProbability:PATTERN_MIN_PROBABILITY,patternHorizonBars:PATTERN_HORIZON_BARS,time:new Date().toISOString()}));
+app.get("/health", (req,res)=>res.json({ok:true,version:"12.0.0",database:pool?"postgres":"memory",archiveAfterHours:ARCHIVE_AFTER_HOURS,adminKeyConfigured:Boolean(ADMIN_KEY),newsWebhookConfigured:Boolean(NEWS_WEBHOOK_KEY),fmpConfigured:Boolean(FMP_API_KEY),alphaVantageConfigured:Boolean(ALPHAVANTAGE_API_KEY),finnhubConfigured:Boolean(FINNHUB_API_KEY),autoTrackTrades:AUTO_TRACK_TRADES,lastNewsSync,lastNewsSyncError,patternMinSamples:PATTERN_MIN_SAMPLES,patternMinProbability:PATTERN_MIN_PROBABILITY,patternHorizonBars:PATTERN_HORIZON_BARS,liveMinAdaptiveScore:LIVE_MIN_ADAPTIVE_SCORE,learningMinSamples:LEARNING_MIN_SAMPLES,maxNewsRiskLive:MAX_NEWS_RISK_LIVE,maxConsecutiveLosses:MAX_CONSECUTIVE_LOSSES,time:new Date().toISOString()}));
 
 app.get("/api/signals", async(req,res)=>{ try { const mode=req.query.mode==="archive"?"archive":"active"; res.json({ok:true,mode,signals:await listSignals(mode,req.query),analytics:await analytics()}); } catch(e){ console.error(e); res.status(500).json({ok:false,error:e.message}); } });
 app.get("/api/analytics", async(req,res)=>{ try { res.json({ok:true,analytics:await analytics()}); } catch(e){res.status(500).json({ok:false,error:e.message});} });
@@ -663,6 +709,20 @@ app.post("/api/clear",async(req,res)=>{if(!requireAdmin(req,res))return;try{if(p
 
 app.get("/api/patterns",async(req,res)=>{try{res.json({ok:true,patterns:await listPatterns(Math.min(300,Math.max(1,num(req.query.limit,100)))),settings:{minSamples:PATTERN_MIN_SAMPLES,minProbability:PATTERN_MIN_PROBABILITY,lookbackDays:PATTERN_LOOKBACK_DAYS,horizonBars:PATTERN_HORIZON_BARS}});}catch(e){res.status(500).json({ok:false,error:e.message});}});
 
+
+app.get("/api/validation",async(req,res)=>{try{
+  const rows=await allSignalsForAnalytics();
+  const closed=rows.filter(x=>x.status==="CLOSED").sort((a,b)=>new Date(a.closed_at)-new Date(b.closed_at));
+  const split=Math.max(1,Math.floor(closed.length*0.8)),train=closed.slice(0,split),test=closed.slice(split);
+  const summarize=a=>{const wins=a.filter(x=>num(x.pnl_r)>0).length,total=a.length,totalR=a.reduce((z,x)=>z+num(x.pnl_r),0),grossWin=a.filter(x=>num(x.pnl_r)>0).reduce((z,x)=>z+num(x.pnl_r),0),grossLoss=Math.abs(a.filter(x=>num(x.pnl_r)<0).reduce((z,x)=>z+num(x.pnl_r),0));return {trades:total,winRate:total?wins/total*100:0,lowerBound:wilsonLowerBound(wins,total)*100,avgR:total?totalR/total:0,profitFactor:grossLoss?grossWin/grossLoss:grossWin?99:0,totalR};};
+  const t=summarize(train),v=summarize(test),all=summarize(closed);
+  let peak=0,eq=0,maxDD=0;for(const x of closed){eq+=num(x.pnl_r);peak=Math.max(peak,eq);maxDD=Math.max(maxDD,peak-eq);}
+  const calibrated=closed.filter(x=>Number.isFinite(num(x.probability,NaN)));
+  const brier=calibrated.length?calibrated.reduce((a,x)=>{const pr=num(x.probability)/100,y=num(x.pnl_r)>0?1:0;return a+(pr-y)**2},0)/calibrated.length:null;
+  const ready=closed.length>=VALIDATION_MIN_TRADES&&v.trades>=10&&v.avgR>0&&v.lowerBound>=45&&maxDD<=Math.max(6,all.totalR*0.8+4);
+  res.json({ok:true,validation:{ready,requiredTrades:VALIDATION_MIN_TRADES,all,train:t,test:v,maxDrawdownR:maxDD,brierScore:brier,closedTrades:closed.length,message:ready?"Există dovezi preliminare pe segmentul de validare. Continuă monitorizarea și controlul riscului.":"Date insuficiente sau validarea pe date nevăzute nu confirmă încă avantajul statistic."}});
+}catch(e){res.status(500).json({ok:false,error:e.message});}});
+
 app.get("/api/export.csv",async(req,res)=>{try{const rows=await allSignalsForAnalytics();const cols=["received_at","archived_at","symbol","timeframe","signal","status","result","price","sl","tp1","tp2","tp3","score","adaptive_score","learning_adjustment","news_risk","news_bias","pnl_r","session_name","structure","reason"];const esc=v=>`"${String(v??"").replaceAll('"','""')}"`;const csv=[cols.join(','),...rows.map(r=>cols.map(c=>esc(r[c])).join(','))].join('\n');res.setHeader("content-type","text/csv; charset=utf-8");res.setHeader("content-disposition",'attachment; filename="proptrader-journal.csv"');res.send('\ufeff'+csv);}catch(e){res.status(500).send(e.message);}});
 
 app.post("/webhook", async(req,res)=>{try{
@@ -680,5 +740,5 @@ initDb().then(async()=>{
   await archiveOldSignals();
   setInterval(()=>archiveOldSignals().catch(e=>console.error("Auto-archive:",e)),15*60*1000).unref();
   if(FMP_API_KEY||ALPHAVANTAGE_API_KEY||FINNHUB_API_KEY){syncRealNews().catch(e=>{lastNewsSyncError=e.message;console.error("News sync:",e.message)});setInterval(()=>syncRealNews().catch(e=>{lastNewsSyncError=e.message;console.error("News sync:",e.message)}),NEWS_AUTO_SYNC_MINUTES*60000).unref();}
-  app.listen(PORT,()=>console.log(`PropTrader AI v11.0 rulează pe portul ${PORT}`));
+  app.listen(PORT,()=>console.log(`PropTrader AI v12.0 rulează pe portul ${PORT}`));
 }).catch(e=>{console.error("DB init failed:",e);process.exit(1)});
