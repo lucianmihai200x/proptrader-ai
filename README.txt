@@ -1,38 +1,40 @@
-PROPTRADER AI v1 — RENDER
+PROPTRADER AI v2 — ACTUALIZARE
 
-Conținut:
-- dashboard online
-- webhook TradingView
-- salvare semnale în PostgreSQL
-- ștergere semnale cu ADMIN_KEY
+Înlocuiește în repository-ul GitHub fișierele:
+- package.json
+- server.js
+- render.yaml
+- folderul public
+
+Adaugă:
+- PropTrader_AI_v2_Signals.pine
+
+După Commit changes, Render va face automat un nou deploy.
+
+Funcții v2:
+- BOS și CHOCH
+- FVG
+- liquidity sweep
+- sesiuni London/New York
+- scor compozit
+- probabilitate estimată
+- TP1, TP2, TP3
+- filtre în dashboard
+- buton pentru semnal demonstrativ
 - Telegram opțional
-- indicator Pine Script
 
-Publicare:
-1. Creează un repository nou pe GitHub.
-2. Încarcă toate fișierele din această arhivă, inclusiv folderul public.
-3. În Render alege New + Blueprint.
-4. Conectează repository-ul.
-5. Render va detecta render.yaml și va crea aplicația și baza de date.
-6. După deploy, deschide Environment și copiază WEBHOOK_KEY.
-
-Webhook TradingView:
-https://ADRESA-TA.onrender.com/webhook?key=WEBHOOK_KEY
+Test:
+1. În Render > Environment copiază ADMIN_KEY.
+2. Deschide aplicația.
+3. Introdu ADMIN_KEY.
+4. Apasă „Creează semnal test”.
 
 TradingView:
-1. Pine Editor.
-2. Copiază codul din PropTrader_AI_v1_Signals.pine.
-3. Save și Add to chart.
-4. Creează alerta cu Any alert() function call.
-5. Introdu URL-ul webhook.
-6. Creează alerte separate pentru US30 și XAUUSD, pe timeframe-urile dorite.
+1. Copiază Pine Script-ul v2 în Pine Editor.
+2. Add to chart.
+3. Creează alerta cu Any alert() function call.
+4. Folosește webhook:
+https://ADRESA-TA.onrender.com/webhook?key=WEBHOOK_KEY
 
-Telegram opțional:
-Adaugă în Render Environment:
-- TELEGRAM_BOT_TOKEN
-- TELEGRAM_CHAT_ID
-
-Important:
-Strategia actuală este tehnică, nu AI propriu-zis.
-Scorul tehnic nu garantează profit.
-Testează mai întâi pe cont demo.
+Notă:
+Probabilitatea este o estimare euristică bazată pe confirmări tehnice, nu o garanție.

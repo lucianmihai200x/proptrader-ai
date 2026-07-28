@@ -1,41 +1,38 @@
-<!doctype html><html lang="ro"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>PropTrader AI v1</title>
+<!doctype html><html lang="ro"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>PropTrader AI v2</title>
 <style>
-:root{--bg:#07101d;--panel:#0f1b2d;--border:#273a55;--text:#edf4ff;--muted:#9db0c9;--green:#34d399;--red:#fb7185;--yellow:#fbbf24}
+:root{--bg:#07101d;--panel:#0f1b2d;--border:#273a55;--text:#edf4ff;--muted:#9db0c9;--green:#34d399;--red:#fb7185;--yellow:#fbbf24;--blue:#60a5fa}
 *{box-sizing:border-box}body{margin:0;font-family:Segoe UI,Arial;background:linear-gradient(#07101d,#0b1424);color:var(--text)}
 header{position:sticky;top:0;background:#08111ff5;border-bottom:1px solid var(--border);padding:14px 20px;display:flex;justify-content:space-between;align-items:center}
-main{max-width:1350px;margin:auto;padding:18px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:13px}
+main{max-width:1450px;margin:auto;padding:18px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:13px}
 .card{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:15px}.kpi{font-size:28px;font-weight:700;margin-top:6px}
 .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.right{margin-left:auto}.muted{color:var(--muted)}.small{font-size:12px}
 .badge{padding:5px 10px;border-radius:999px;font-size:12px;font-weight:700}.buy{background:#064e3b;color:var(--green)}.sell{background:#5f1725;color:var(--red)}.wait{background:#5a4508;color:var(--yellow)}
-button{background:#1d4ed8;border:1px solid #3b82f6;color:#fff;padding:9px 13px;border-radius:9px;cursor:pointer}
-input{padding:9px;border-radius:8px;border:1px solid var(--border);background:#091525;color:#fff}.signal{margin-top:12px}.status{width:10px;height:10px;border-radius:50%;background:var(--green);display:inline-block}
+button{background:#1d4ed8;border:1px solid #3b82f6;color:#fff;padding:9px 13px;border-radius:9px;cursor:pointer}input,select{padding:9px;border-radius:8px;border:1px solid var(--border);background:#091525;color:#fff}
+.signal{margin-top:12px}.status{width:10px;height:10px;border-radius:50%;background:var(--green);display:inline-block}.tags{display:flex;gap:6px;flex-wrap:wrap}.tag{font-size:11px;border:1px solid var(--border);padding:3px 7px;border-radius:999px}
 </style></head><body>
-<header><div><h1 style="margin:0;font-size:21px">PropTrader AI v1</h1><div class="muted small">US30 & XAUUSD • TradingView webhook • fără instalare</div></div><div class="row"><span class="status"></span><span id="statusText" class="muted small">Conectare...</span></div></header>
+<header><div><h1 style="margin:0;font-size:21px">PropTrader AI v2</h1><div class="muted small">US30 & XAUUSD • structură, FVG, liquidity sweep, sesiuni</div></div><div class="row"><span class="status"></span><span id="statusText" class="muted small">Conectare...</span></div></header>
 <main>
 <div class="grid">
 <div class="card"><div class="muted">Ultimul semnal</div><div class="kpi" id="last">WAIT</div></div>
 <div class="card"><div class="muted">Semnale astăzi</div><div class="kpi" id="today">0</div></div>
 <div class="card"><div class="muted">BUY</div><div class="kpi" id="buys">0</div></div>
 <div class="card"><div class="muted">SELL</div><div class="kpi" id="sells">0</div></div>
-<div class="card"><div class="muted">Scor mediu</div><div class="kpi" id="avg">0%</div></div>
+<div class="card"><div class="muted">Scor mediu</div><div class="kpi" id="avgScore">0%</div></div>
+<div class="card"><div class="muted">Probabilitate medie</div><div class="kpi" id="avgProb">0%</div></div>
 </div>
-<div class="card" style="margin-top:14px"><div class="row"><h2>Inbox semnale</h2><button class="right" onclick="loadSignals()">Actualizează</button></div><div id="signals"><p class="muted">Se încarcă...</p></div></div>
-<div class="card" style="margin-top:14px"><h2>Administrare</h2><div class="row"><input id="adminKey" type="password" placeholder="ADMIN_KEY"><button onclick="clearSignals()">Șterge toate semnalele</button></div></div>
+<div class="card" style="margin-top:14px"><div class="row"><h2>Filtre</h2>
+<select id="symbolFilter" onchange="render()"><option value="">Toate instrumentele</option><option>US30</option><option>XAUUSD</option></select>
+<select id="sideFilter" onchange="render()"><option value="">BUY + SELL</option><option>BUY</option><option>SELL</option></select>
+<button class="right" onclick="loadSignals()">Actualizează</button></div></div>
+<div class="card" style="margin-top:14px"><h2>Inbox semnale</h2><div id="signals"><p class="muted">Se încarcă...</p></div></div>
+<div class="card" style="margin-top:14px"><h2>Administrare</h2><div class="row"><input id="adminKey" type="password" placeholder="ADMIN_KEY"><button onclick="testSignal()">Creează semnal test</button><button onclick="clearSignals()">Șterge toate semnalele</button></div></div>
 </main>
 <script>
-const $=id=>document.getElementById(id),fmt=v=>Number(v||0).toLocaleString("ro-RO",{maximumFractionDigits:2});
-async function loadSignals(){
- try{
-  const d=await (await fetch("/api/signals",{cache:"no-store"})).json(),s=d.signals||[];
-  $("statusText").textContent="Actualizat "+new Date().toLocaleTimeString("ro-RO");
-  $("last").innerHTML=s[0]?`<span class="badge ${s[0].signal.toLowerCase()}">${s[0].signal}</span>`:"WAIT";
-  const today=new Date().toISOString().slice(0,10);
-  $("today").textContent=s.filter(x=>String(x.received_at).slice(0,10)===today).length;
-  $("buys").textContent=s.filter(x=>x.signal==="BUY").length;$("sells").textContent=s.filter(x=>x.signal==="SELL").length;
-  $("avg").textContent=(s.length?s.reduce((a,x)=>a+Number(x.score||0),0)/s.length:0).toFixed(1)+"%";
-  $("signals").innerHTML=s.length?s.map(x=>`<div class="card signal"><div class="row"><b>${x.symbol}</b><span class="badge ${x.signal.toLowerCase()}">${x.signal}</span><span class="muted small">${x.timeframe||""}</span><span class="right muted small">${new Date(x.received_at).toLocaleString("ro-RO")}</span></div><p>Entry: <b>${fmt(x.price)}</b> · SL: <b>${fmt(x.sl)}</b> · TP1: <b>${fmt(x.tp1)}</b>${Number(x.tp2)?` · TP2: <b>${fmt(x.tp2)}</b>`:""}</p><p>Scor: <b>${fmt(x.score)}%</b>${Number(x.rr)?` · RR: <b>1:${fmt(x.rr)}</b>`:""}</p><div class="muted small">${x.reason||""}</div></div>`).join(""):'<p class="muted">Nu există semnale. Creează alerta în TradingView.</p>';
- }catch(e){$("statusText").textContent="Eroare conexiune"}
-}
-async function clearSignals(){const r=await fetch("/api/clear",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({adminKey:$("adminKey").value})}),d=await r.json();if(!d.ok)return alert(d.error||"Eroare");loadSignals()}
+const $=id=>document.getElementById(id),fmt=v=>Number(v||0).toLocaleString('ro-RO',{maximumFractionDigits:2});let all=[];
+async function loadSignals(){try{const d=await(await fetch('/api/signals',{cache:'no-store'})).json();all=d.signals||[];$('statusText').textContent='Actualizat '+new Date().toLocaleTimeString('ro-RO');stats();render()}catch(e){$('statusText').textContent='Eroare conexiune'}}
+function stats(){const s=all;$('last').innerHTML=s[0]?`<span class="badge ${s[0].signal.toLowerCase()}">${s[0].signal}</span>`:'WAIT';const today=new Date().toISOString().slice(0,10);$('today').textContent=s.filter(x=>String(x.received_at).slice(0,10)===today).length;$('buys').textContent=s.filter(x=>x.signal==='BUY').length;$('sells').textContent=s.filter(x=>x.signal==='SELL').length;$('avgScore').textContent=(s.length?s.reduce((a,x)=>a+Number(x.score||0),0)/s.length:0).toFixed(1)+'%';$('avgProb').textContent=(s.length?s.reduce((a,x)=>a+Number(x.probability||0),0)/s.length:0).toFixed(1)+'%'}
+function render(){const sf=$('symbolFilter').value,df=$('sideFilter').value,s=all.filter(x=>(!sf||x.symbol.includes(sf))&&(!df||x.signal===df));$('signals').innerHTML=s.length?s.map(x=>{const tags=[x.bos?'BOS':'',x.choch?'CHOCH':'',x.fvg?'FVG':'',x.liquidity_sweep?'Liquidity Sweep':''].filter(Boolean).map(t=>`<span class="tag">${t}</span>`).join('');return `<div class="card signal"><div class="row"><b>${x.symbol}</b><span class="badge ${x.signal.toLowerCase()}">${x.signal}</span><span class="muted small">${x.timeframe||''}</span><span class="muted small">${x.session_name||''}</span><span class="right muted small">${new Date(x.received_at).toLocaleString('ro-RO')}</span></div><p>Entry: <b>${fmt(x.price)}</b> · SL: <b>${fmt(x.sl)}</b> · TP1: <b>${fmt(x.tp1)}</b>${Number(x.tp2)?` · TP2: <b>${fmt(x.tp2)}</b>`:''}${Number(x.tp3)?` · TP3: <b>${fmt(x.tp3)}</b>`:''}</p><p>Scor: <b>${fmt(x.score)}%</b> · Probabilitate estimată: <b>${fmt(x.probability)}%</b>${Number(x.rr)?` · RR: <b>1:${fmt(x.rr)}</b>`:''}</p><p class="small">Trend: <b>${x.trend||'-'}</b> · Structură: <b>${x.structure||'-'}</b></p><div class="tags">${tags}</div><div class="muted small" style="margin-top:8px">${x.reason||''}</div></div>`}).join(''):'<p class="muted">Nu există semnale pentru filtrele selectate.</p>'}
+async function testSignal(){const r=await fetch('/api/test-signal',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({adminKey:$('adminKey').value})}),d=await r.json();if(!d.ok)return alert(d.error||'Eroare');loadSignals()}
+async function clearSignals(){const r=await fetch('/api/clear',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({adminKey:$('adminKey').value})}),d=await r.json();if(!d.ok)return alert(d.error||'Eroare');loadSignals()}
 loadSignals();setInterval(loadSignals,15000);
 </script></body></html>
