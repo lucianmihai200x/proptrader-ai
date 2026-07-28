@@ -1,55 +1,26 @@
-PROPTRADER AI v4 — VERSIUNE FUNCȚIONALĂ
+PROPTRADER AI v5 — VALIDARE ȘI STATISTICI
 
-Flux:
-TradingView -> webhook Render -> PostgreSQL -> dashboard -> rezultate TP/SL -> statistici
+Actualizare GitHub:
+- înlocuiește package.json
+- înlocuiește server.js
+- înlocuiește public/index.html
+- păstrează render.yaml sau înlocuiește-l cu cel inclus
+- adaugă PropTrader_AI_v5_Engine.pine
 
-ACTUALIZARE
-1. Dezarhivează arhiva.
-2. În GitHub, înlocuiește:
-   package.json
-   server.js
-   render.yaml
-   public/index.html
-3. Adaugă PropTrader_AI_v4_Engine.pine.
-4. Commit changes.
-5. Așteaptă redeploy-ul Render.
+Funcții noi:
+- statistici pe instrument
+- statistici pe sesiune
+- statistici pe oră
+- curba rezultatelor în R
+- export CSV
+- jurnal și rezultate TP/SL
+- filtre după simbol, direcție, status și scor
 
-TEST DASHBOARD
-1. Render > serviciu > Environment.
-2. Copiază valoarea ADMIN_KEY.
-3. Deschide aplicația.
-4. Introdu ADMIN_KEY.
-5. Apasă Creează semnal test.
-6. Poți închide manual testul cu TP1/TP2/TP3/SL/BE.
+Test:
+1. După redeploy, introdu ADMIN_KEY.
+2. Creează mai multe semnale test.
+3. Închide-le manual cu TP1, TP2, TP3, SL sau BE.
+4. Verifică actualizarea statisticilor și a curbei.
+5. Descarcă CSV cu butonul Export CSV.
 
-TRADINGVIEW
-1. Deschide Pine Editor.
-2. Copiază PropTrader_AI_v4_Engine.pine.
-3. Save și Add to chart.
-4. Creează alerta cu Any alert() function call.
-5. Webhook URL:
-   https://ADRESA-TA.onrender.com/webhook?key=WEBHOOK_KEY
-6. Creează alerte separate:
-   US30 M5, HTF M15
-   XAUUSD M5, HTF M15
-
-REZULTATE AUTOMATE
-Scriptul trimite un eveniment SIGNAL la intrare.
-Când prețul atinge SL sau TP, trimite un eveniment CLOSE.
-Dashboard-ul calculează:
-- Win rate
-- Total R
-- Profit factor
-- semnale deschise/închise
-- scor și probabilitate medie
-
-TELEGRAM OPȚIONAL
-În Render Environment adaugă:
-TELEGRAM_BOT_TOKEN
-TELEGRAM_CHAT_ID
-
-LIMITARE IMPORTANTĂ
-TradingView urmărește rezultatul numai cât timp alerta este activă.
-Pe aceeași alertă/script este urmărit un singur semnal activ.
-Probabilitatea este euristică, nu predicție garantată și nu model ML validat.
-Testează minimum câteva săptămâni pe demo înainte de cont finanțat.
+Motorul Pine rămâne compatibil cu fluxul v4.
