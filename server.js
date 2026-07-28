@@ -825,11 +825,19 @@ async function getBarsForBacktest(symbol,timeframe,limit=250000){
 }
 async function saveBacktestRun(run){
   if(!pool){global.lastMemoryBacktest=run;return {id:"memory",...run};}
-  const q=await pool.query(`INSERT INTO backtest_runs(symbol,timeframe,bars,start_time,end_time,settings,summary,results) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,[run.symbol,run.timeframe,run.bars,run.start_time,run.end_time,run.settings,run.summary,run.results]);return q.rows[0];
+  const settingsJson=JSON.stringify(run.settings ?? {});
+  const summaryJson=JSON.stringify(run.summary ?? {});
+  const resultsJson=JSON.stringify(Array.isArray(run.results) ? run.results : []);
+  const q=await pool.query(
+    `INSERT INTO backtest_runs(symbol,timeframe,bars,start_time,end_time,settings,summary,results)
+     VALUES($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,$8::jsonb) RETURNING *`,
+    [run.symbol,run.timeframe,run.bars,run.start_time,run.end_time,settingsJson,summaryJson,resultsJson]
+  );
+  return q.rows[0];
 }
 async function latestBacktest(){if(!pool)return global.lastMemoryBacktest||null;return (await pool.query(`SELECT * FROM backtest_runs ORDER BY created_at DESC LIMIT 1`)).rows[0]||null;}
 
-app.get("/health", (req,res)=>res.json({ok:true,version:"16.0.0",database:pool?"postgres":"memory",archiveAfterHours:ARCHIVE_AFTER_HOURS,adminKeyConfigured:Boolean(ADMIN_KEY),newsWebhookConfigured:Boolean(NEWS_WEBHOOK_KEY),fmpConfigured:Boolean(FMP_API_KEY),alphaVantageConfigured:Boolean(ALPHAVANTAGE_API_KEY),finnhubConfigured:Boolean(FINNHUB_API_KEY),autoTrackTrades:AUTO_TRACK_TRADES,lastNewsSync,lastNewsSyncError,patternMinSamples:PATTERN_MIN_SAMPLES,patternMinProbability:PATTERN_MIN_PROBABILITY,patternHorizonBars:PATTERN_HORIZON_BARS,liveMinAdaptiveScore:LIVE_MIN_ADAPTIVE_SCORE,learningMinSamples:LEARNING_MIN_SAMPLES,maxNewsRiskLive:MAX_NEWS_RISK_LIVE,maxConsecutiveLosses:MAX_CONSECUTIVE_LOSSES,lastWebhookAt,lastWebhookResult,time:new Date().toISOString()}));
+app.get("/health", (req,res)=>res.json({ok:true,version:"16.1.0",database:pool?"postgres":"memory",archiveAfterHours:ARCHIVE_AFTER_HOURS,adminKeyConfigured:Boolean(ADMIN_KEY),newsWebhookConfigured:Boolean(NEWS_WEBHOOK_KEY),fmpConfigured:Boolean(FMP_API_KEY),alphaVantageConfigured:Boolean(ALPHAVANTAGE_API_KEY),finnhubConfigured:Boolean(FINNHUB_API_KEY),autoTrackTrades:AUTO_TRACK_TRADES,lastNewsSync,lastNewsSyncError,patternMinSamples:PATTERN_MIN_SAMPLES,patternMinProbability:PATTERN_MIN_PROBABILITY,patternHorizonBars:PATTERN_HORIZON_BARS,liveMinAdaptiveScore:LIVE_MIN_ADAPTIVE_SCORE,learningMinSamples:LEARNING_MIN_SAMPLES,maxNewsRiskLive:MAX_NEWS_RISK_LIVE,maxConsecutiveLosses:MAX_CONSECUTIVE_LOSSES,lastWebhookAt,lastWebhookResult,time:new Date().toISOString()}));
 
 app.get("/api/signals", async(req,res)=>{ try { const mode=req.query.mode==="archive"?"archive":"active"; res.json({ok:true,mode,signals:await listSignals(mode,req.query),analytics:await analytics()}); } catch(e){ console.error(e); res.status(500).json({ok:false,error:e.message}); } });
 app.get("/api/analytics", async(req,res)=>{ try { res.json({ok:true,analytics:await analytics()}); } catch(e){res.status(500).json({ok:false,error:e.message});} });
@@ -970,7 +978,7 @@ app.post("/api/backtest",async(req,res)=>{if(!requireAdmin(req,res))return;try{
   const symbol=clean(req.body.symbol||"US30",30).toUpperCase(),timeframe=clean(req.body.timeframe||"5",20),settings={horizonBars:Math.max(1,Math.min(24,num(req.body.horizonBars,3))),minSamples:Math.max(20,num(req.body.minSamples,40)),minProbability:Math.max(50,Math.min(90,num(req.body.minProbability,60))),costBps:Math.max(0,Math.min(50,num(req.body.costBps,1.5))),walkForwardFolds:Math.max(3,Math.min(10,num(req.body.walkForwardFolds,5)))};
   const barsRaw=await getBarsForBacktest(symbol,timeframe);const bars=Array.isArray(barsRaw)?barsRaw:(barsRaw&&Array.isArray(barsRaw.rows)?barsRaw.rows:[]);if(bars.length<settings.minSamples+settings.horizonBars+20)throw new Error(`Istoric insuficient: ${bars.length} lumânări. Importă mai multe date.`);
   const report=buildBacktest(bars,settings),run=await saveBacktestRun({symbol,timeframe,bars:bars.length,start_time:bars[0].bar_time,end_time:bars[bars.length-1].bar_time,settings,summary:report.summary,results:report.results});res.json({ok:true,run});
-}catch(e){res.status(400).json({ok:false,error:e.message});}});
+}catch(e){console.error("[BACKTEST] EROARE:",e);res.status(400).json({ok:false,error:e.message});}});
 app.get("/api/backtest/latest",async(req,res)=>{try{res.json({ok:true,run:await latestBacktest()});}catch(e){res.status(500).json({ok:false,error:e.message});}});
 app.get("/api/history-status",async(req,res)=>{try{let rows;if(!pool){const m=new Map();for(const b of memoryBars){const k=`${b.symbol}|${b.timeframe}`;if(!m.has(k))m.set(k,{symbol:b.symbol,timeframe:b.timeframe,bars:0,start_time:b.bar_time,end_time:b.bar_time});const x=m.get(k);x.bars++;if(b.bar_time<x.start_time)x.start_time=b.bar_time;if(b.bar_time>x.end_time)x.end_time=b.bar_time;}rows=[...m.values()];}else rows=(await pool.query(`SELECT symbol,timeframe,COUNT(*)::int bars,MIN(bar_time) start_time,MAX(bar_time) end_time FROM market_bars GROUP BY symbol,timeframe ORDER BY symbol,timeframe`)).rows;res.json({ok:true,datasets:rows});}catch(e){res.status(500).json({ok:false,error:e.message});}});
 
@@ -994,5 +1002,5 @@ initDb().then(async()=>{
   await archiveOldSignals();
   setInterval(()=>archiveOldSignals().catch(e=>console.error("Auto-archive:",e)),15*60*1000).unref();
   if(FMP_API_KEY||ALPHAVANTAGE_API_KEY||FINNHUB_API_KEY){syncRealNews().catch(e=>{lastNewsSyncError=e.message;console.error("News sync:",e.message)});setInterval(()=>syncRealNews().catch(e=>{lastNewsSyncError=e.message;console.error("News sync:",e.message)}),NEWS_AUTO_SYNC_MINUTES*60000).unref();}
-  app.listen(PORT,()=>console.log(`PropTrader AI v16 rulează pe portul ${PORT}`));
+  app.listen(PORT,()=>console.log(`PropTrader AI v16.1 rulează pe portul ${PORT}`));
 }).catch(e=>{console.error("DB init failed:",e);process.exit(1)});
