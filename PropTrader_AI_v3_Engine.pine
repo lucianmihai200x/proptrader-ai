@@ -1,0 +1,118 @@
+//@version=5
+indicator("PropTrader AI v3 Engine", overlay=true, max_labels_count=500, max_boxes_count=200)
+
+fastLen=input.int(20,"EMA rapidă")
+slowLen=input.int(50,"EMA lentă")
+rsiLen=input.int(14,"RSI")
+atrLen=input.int(14,"ATR")
+swingLen=input.int(5,"Swing length")
+minScore=input.int(80,"Scor minim",minval=60,maxval=95)
+useSession=input.bool(true,"Filtru sesiune")
+htf=input.timeframe("15","Timeframe superior")
+
+emaFast=ta.ema(close,fastLen)
+emaSlow=ta.ema(close,slowLen)
+rsiVal=ta.rsi(close,rsiLen)
+atrVal=ta.atr(atrLen)
+vwapVal=ta.vwap(hlc3)
+
+htfFast=request.security(syminfo.tickerid,htf,ta.ema(close,fastLen))
+htfSlow=request.security(syminfo.tickerid,htf,ta.ema(close,slowLen))
+mtfBull=htfFast>htfSlow
+mtfBear=htfFast<htfSlow
+
+ph=ta.pivothigh(high,swingLen,swingLen)
+pl=ta.pivotlow(low,swingLen,swingLen)
+var float lastHigh=na
+var float lastLow=na
+if not na(ph)
+    lastHigh:=ph
+if not na(pl)
+    lastLow:=pl
+
+bullBos=not na(lastHigh) and close>lastHigh
+bearBos=not na(lastLow) and close<lastLow
+bullChoch=bullBos and emaFast<emaSlow
+bearChoch=bearBos and emaFast>emaSlow
+
+bullFvg=low>high[2]
+bearFvg=high<low[2]
+
+bullSweep=low<ta.lowest(low,10)[1] and close>open and close>low[1]
+bearSweep=high>ta.highest(high,10)[1] and close<open and close<high[1]
+
+bullTrend=emaFast>emaSlow
+bearTrend=emaFast<emaSlow
+bullVWAP=close>vwapVal
+bearVWAP=close<vwapVal
+
+bullOB=close[1]<open[1] and close>high[1] and bullTrend
+bearOB=close[1]>open[1] and close<low[1] and bearTrend
+
+hourRO=hour(time,"Europe/Bucharest")
+london=hourRO>=10 and hourRO<13
+newYork=hourRO>=15 and hourRO<19
+sessionOk=not useSession or london or newYork
+sessionName=london?"London":newYork?"New York":"Outside session"
+
+buyScore=0
+buyScore+=bullTrend?15:0
+buyScore+=mtfBull?15:0
+buyScore+=bullVWAP?10:0
+buyScore+=rsiVal>52 and rsiVal<70?10:0
+buyScore+=bullBos?15:0
+buyScore+=bullChoch?5:0
+buyScore+=bullFvg?8:0
+buyScore+=bullSweep?10:0
+buyScore+=bullOB?7:0
+buyScore+=sessionOk?5:0
+
+sellScore=0
+sellScore+=bearTrend?15:0
+sellScore+=mtfBear?15:0
+sellScore+=bearVWAP?10:0
+sellScore+=rsiVal<48 and rsiVal>30?10:0
+sellScore+=bearBos?15:0
+sellScore+=bearChoch?5:0
+sellScore+=bearFvg?8:0
+sellScore+=bearSweep?10:0
+sellScore+=bearOB?7:0
+sellScore+=sessionOk?5:0
+
+buySignal=barstate.isconfirmed and sessionOk and buyScore>=minScore and bullTrend and mtfBull and bullVWAP and (bullBos or bullSweep or bullOB)
+sellSignal=barstate.isconfirmed and sessionOk and sellScore>=minScore and bearTrend and mtfBear and bearVWAP and (bearBos or bearSweep or bearOB)
+
+entry=close
+buySL=math.min(low,entry-atrVal*1.3)
+sellSL=math.max(high,entry+atrVal*1.3)
+buyRisk=entry-buySL
+sellRisk=sellSL-entry
+buyTP1=entry+buyRisk*2
+buyTP2=entry+buyRisk*3
+buyTP3=entry+buyRisk*4
+sellTP1=entry-sellRisk*2
+sellTP2=entry-sellRisk*3
+sellTP3=entry-sellRisk*4
+
+buyProb=math.min(90,50+buyScore*0.45)
+sellProb=math.min(90,50+sellScore*0.45)
+
+plot(emaFast,"EMA rapidă")
+plot(emaSlow,"EMA lentă")
+plot(vwapVal,"VWAP")
+plotshape(buySignal,title="BUY",text="BUY",style=shape.labelup,location=location.belowbar)
+plotshape(sellSignal,title="SELL",text="SELL",style=shape.labeldown,location=location.abovebar)
+
+if buySignal
+    structure=bullChoch?"CHOCH bullish":bullBos?"BOS bullish":"Bullish continuation"
+    obText=bullOB?"Bullish OB confirmation":"No OB"
+    reason="MTF bullish; peste VWAP; structură și momentum confirmate"
+    msg='{"symbol":"' + syminfo.ticker + '","timeframe":"' + timeframe.period + '","signal":"BUY","price":' + str.tostring(entry) + ',"sl":' + str.tostring(buySL) + ',"tp1":' + str.tostring(buyTP1) + ',"tp2":' + str.tostring(buyTP2) + ',"tp3":' + str.tostring(buyTP3) + ',"score":' + str.tostring(buyScore) + ',"probability":' + str.tostring(buyProb) + ',"rsi":' + str.tostring(rsiVal) + ',"atr":' + str.tostring(atrVal) + ',"rr":2,"trend":"Bullish","structure":"' + structure + '","session":"' + sessionName + '","mtf_trend":"' + htf + ' bullish","vwap_side":"Above VWAP","order_block":"' + obText + '","bos":' + str.tostring(bullBos) + ',"choch":' + str.tostring(bullChoch) + ',"fvg":' + str.tostring(bullFvg) + ',"liquidity_sweep":' + str.tostring(bullSweep) + ',"vwap_confirm":true,"mtf_confirm":true,"order_block_confirm":' + str.tostring(bullOB) + ',"reason":"' + reason + '"}'
+    alert(msg,alert.freq_once_per_bar_close)
+
+if sellSignal
+    structure=bearChoch?"CHOCH bearish":bearBos?"BOS bearish":"Bearish continuation"
+    obText=bearOB?"Bearish OB confirmation":"No OB"
+    reason="MTF bearish; sub VWAP; structură și momentum confirmate"
+    msg='{"symbol":"' + syminfo.ticker + '","timeframe":"' + timeframe.period + '","signal":"SELL","price":' + str.tostring(entry) + ',"sl":' + str.tostring(sellSL) + ',"tp1":' + str.tostring(sellTP1) + ',"tp2":' + str.tostring(sellTP2) + ',"tp3":' + str.tostring(sellTP3) + ',"score":' + str.tostring(sellScore) + ',"probability":' + str.tostring(sellProb) + ',"rsi":' + str.tostring(rsiVal) + ',"atr":' + str.tostring(atrVal) + ',"rr":2,"trend":"Bearish","structure":"' + structure + '","session":"' + sessionName + '","mtf_trend":"' + htf + ' bearish","vwap_side":"Below VWAP","order_block":"' + obText + '","bos":' + str.tostring(bearBos) + ',"choch":' + str.tostring(bearChoch) + ',"fvg":' + str.tostring(bearFvg) + ',"liquidity_sweep":' + str.tostring(bearSweep) + ',"vwap_confirm":true,"mtf_confirm":true,"order_block_confirm":' + str.tostring(bearOB) + ',"reason":"' + reason + '"}'
+    alert(msg,alert.freq_once_per_bar_close)
