@@ -1,6 +1,6 @@
 {
-  "name": "proptrader-ai-v16-2",
-  "version": "16.2.0",
+  "name": "proptrader-ai-v16-3",
+  "version": "16.3.0",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

@@ -1,0 +1,195 @@
+//@version=6
+indicator("PropTrader AI v16.3 — Motor selectiv M15", overlay=true, max_labels_count=200)
+
+// Motorul rulează numai pe M15 și numai după închiderea lumânării.
+// La fiecare închidere trimite un eveniment BAR pentru urmărire și învățare.
+// Un al doilea eveniment SIGNAL este trimis numai când filtrele selective sunt îndeplinite.
+
+groupSignal = "Semnale M15"
+minScore = input.int(86, "Scor minim pentru alertă", minval=70, maxval=95, group=groupSignal)
+cooldownBars = input.int(4, "Pauză între semnale (lumânări M15)", minval=1, maxval=24, group=groupSignal)
+onlyConfirmed = input.bool(true, "Doar după închiderea lumânării", group=groupSignal)
+
+groupRisk = "SL / TP"
+atrLen = input.int(14, "ATR", minval=5, group=groupRisk)
+slATR = input.float(1.25, "Distanță SL în ATR", minval=0.5, step=0.05, group=groupRisk)
+tp1R = input.float(1.5, "TP1 în R", minval=1.0, step=0.25, group=groupRisk)
+tp2R = input.float(2.5, "TP2 în R", minval=1.5, step=0.25, group=groupRisk)
+tp3R = input.float(3.5, "TP3 în R", minval=2.0, step=0.25, group=groupRisk)
+
+groupTrend = "Trend M15 / H1 / H4"
+fastLen = input.int(20, "EMA rapidă", minval=5, group=groupTrend)
+slowLen = input.int(50, "EMA lentă", minval=20, group=groupTrend)
+adxLen = input.int(14, "ADX", minval=5, group=groupTrend)
+minAdx = input.float(20.0, "ADX minim", minval=10, maxval=50, step=0.5, group=groupTrend)
+
+groupStructure = "Structură și SMC"
+structureLen = input.int(12, "Perioadă structură", minval=5, maxval=50, group=groupStructure)
+sweepLen = input.int(10, "Perioadă liquidity sweep", minval=5, maxval=40, group=groupStructure)
+minAtrPct = input.float(0.03, "ATR minim %", minval=0.01, step=0.01, group=groupStructure)
+maxAtrPct = input.float(0.90, "ATR maxim %", minval=0.20, step=0.05, group=groupStructure)
+requireSmcConfirmation = input.bool(false, "Necesită sweep sau FVG", group=groupStructure)
+
+isM15 = timeframe.isminutes and timeframe.multiplier == 15
+barOK = (not onlyConfirmed or barstate.isconfirmed) and isM15
+
+emaFast = ta.ema(close, fastLen)
+emaSlow = ta.ema(close, slowLen)
+atr = ta.atr(atrLen)
+atrPct = close != 0 ? atr / close * 100 : 0.0
+rsi = ta.rsi(close, 14)
+vwapValue = ta.vwap(hlc3)
+[diPlus, diMinus, adx] = ta.dmi(adxLen, adxLen)
+
+h1Fast = request.security(syminfo.tickerid, "60", ta.ema(close, fastLen), barmerge.gaps_off, barmerge.lookahead_off)
+h1Slow = request.security(syminfo.tickerid, "60", ta.ema(close, slowLen), barmerge.gaps_off, barmerge.lookahead_off)
+h4Fast = request.security(syminfo.tickerid, "240", ta.ema(close, fastLen), barmerge.gaps_off, barmerge.lookahead_off)
+h4Slow = request.security(syminfo.tickerid, "240", ta.ema(close, slowLen), barmerge.gaps_off, barmerge.lookahead_off)
+
+bullTrend = emaFast > emaSlow and close > emaFast and emaFast > emaFast[2]
+bearTrend = emaFast < emaSlow and close < emaFast and emaFast < emaFast[2]
+h1Bull = h1Fast > h1Slow
+h1Bear = h1Fast < h1Slow
+h4Bull = h4Fast > h4Slow
+h4Bear = h4Fast < h4Slow
+
+priorHigh = ta.highest(high[1], structureLen)
+priorLow = ta.lowest(low[1], structureLen)
+sweepHigh = ta.highest(high[1], sweepLen)
+sweepLow = ta.lowest(low[1], sweepLen)
+
+bullBos = close > priorHigh
+bearBos = close < priorLow
+bullPullback = low <= emaFast and close > emaFast and close > open
+bearPullback = high >= emaFast and close < emaFast and close < open
+bullLiquiditySweep = low < sweepLow and close > sweepLow and close > open
+bearLiquiditySweep = high > sweepHigh and close < sweepHigh and close < open
+bullFvg = low > high[2]
+bearFvg = high < low[2]
+
+bullStructure = bullBos or bullPullback or bullLiquiditySweep
+bearStructure = bearBos or bearPullback or bearLiquiditySweep
+bullSmc = bullLiquiditySweep or bullFvg
+bearSmc = bearLiquiditySweep or bearFvg
+
+bullMomentum = rsi >= 52 and rsi <= 74 and diPlus > diMinus and adx >= minAdx
+bearMomentum = rsi <= 48 and rsi >= 26 and diMinus > diPlus and adx >= minAdx
+volatilityOK = atrPct >= minAtrPct and atrPct <= maxAtrPct
+body = math.abs(close - open)
+strongBullCandle = close > open and body >= atr * 0.18
+strongBearCandle = close < open and body >= atr * 0.18
+
+int buyScore = 0
+buyScore += bullTrend ? 16 : 0
+buyScore += h1Bull ? 12 : 0
+buyScore += h4Bull ? 12 : 0
+buyScore += close > vwapValue ? 10 : 0
+buyScore += bullStructure ? 14 : 0
+buyScore += bullMomentum ? 12 : 0
+buyScore += volatilityOK ? 8 : 0
+buyScore += strongBullCandle ? 6 : 0
+buyScore += bullSmc ? 10 : 0
+
+int sellScore = 0
+sellScore += bearTrend ? 16 : 0
+sellScore += h1Bear ? 12 : 0
+sellScore += h4Bear ? 12 : 0
+sellScore += close < vwapValue ? 10 : 0
+sellScore += bearStructure ? 14 : 0
+sellScore += bearMomentum ? 12 : 0
+sellScore += volatilityOK ? 8 : 0
+sellScore += strongBearCandle ? 6 : 0
+sellScore += bearSmc ? 10 : 0
+
+buyProbability = math.min(92.0, 45.0 + buyScore * 0.48)
+sellProbability = math.min(92.0, 45.0 + sellScore * 0.48)
+
+var int lastSignalBar = na
+cooldownOK = na(lastSignalBar) or bar_index - lastSignalBar >= cooldownBars
+smcBuyOK = not requireSmcConfirmation or bullSmc
+smcSellOK = not requireSmcConfirmation or bearSmc
+
+buySignal = barOK and cooldownOK and volatilityOK and smcBuyOK and buyScore >= minScore and bullTrend and h1Bull and h4Bull and bullMomentum
+sellSignal = barOK and cooldownOK and volatilityOK and smcSellOK and sellScore >= minScore and bearTrend and h1Bear and h4Bear and bearMomentum
+
+buyEntry = close
+buySL = buyEntry - atr * slATR
+buyRisk = buyEntry - buySL
+buyTP1 = buyEntry + buyRisk * tp1R
+buyTP2 = buyEntry + buyRisk * tp2R
+buyTP3 = buyEntry + buyRisk * tp3R
+
+sellEntry = close
+sellSL = sellEntry + atr * slATR
+sellRisk = sellSL - sellEntry
+sellTP1 = sellEntry - sellRisk * tp1R
+sellTP2 = sellEntry - sellRisk * tp2R
+sellTP3 = sellEntry - sellRisk * tp3R
+
+f_num(float x) => str.tostring(x, format.mintick)
+f_bool(bool x) => x ? "true" : "false"
+
+f_bar_payload() =>
+    string payload = "{\"event\":\"BAR\""
+    payload += ",\"external_id\":\"BAR-" + syminfo.ticker + "-15-" + str.tostring(time) + "\""
+    payload += ",\"symbol\":\"" + syminfo.ticker + "\""
+    payload += ",\"timeframe\":\"15\""
+    payload += ",\"bar_time\":" + str.tostring(time)
+    payload += ",\"open\":" + f_num(open)
+    payload += ",\"high\":" + f_num(high)
+    payload += ",\"low\":" + f_num(low)
+    payload += ",\"close\":" + f_num(close)
+    payload += ",\"volume\":" + str.tostring(volume)
+    payload += "}"
+    payload
+
+f_signal_payload(string side, float entry, float sl, float tp1, float tp2, float tp3, int score, float probability) =>
+    bool isBuy = side == "BUY"
+    string structureText = isBuy ? (bullBos ? "Bullish BOS" : bullLiquiditySweep ? "Bullish liquidity sweep" : "Bullish pullback") : (bearBos ? "Bearish BOS" : bearLiquiditySweep ? "Bearish liquidity sweep" : "Bearish pullback")
+    string payload = "{\"event\":\"SIGNAL\""
+    payload += ",\"external_id\":\"V163-" + syminfo.ticker + "-15-" + str.tostring(time) + "-" + side + "\""
+    payload += ",\"symbol\":\"" + syminfo.ticker + "\""
+    payload += ",\"timeframe\":\"15\""
+    payload += ",\"signal\":\"" + side + "\""
+    payload += ",\"price\":" + f_num(entry)
+    payload += ",\"sl\":" + f_num(sl)
+    payload += ",\"tp1\":" + f_num(tp1)
+    payload += ",\"tp2\":" + f_num(tp2)
+    payload += ",\"tp3\":" + f_num(tp3)
+    payload += ",\"score\":" + str.tostring(score)
+    payload += ",\"probability\":" + str.tostring(probability, "#.0")
+    payload += ",\"rsi\":" + str.tostring(rsi, "#.0")
+    payload += ",\"atr\":" + f_num(atr)
+    payload += ",\"rr\":" + str.tostring(tp3R, "#.00")
+    payload += ",\"trend\":\"" + (isBuy ? "Bullish M15 + H1 + H4" : "Bearish M15 + H1 + H4") + "\""
+    payload += ",\"structure\":\"" + structureText + "\""
+    payload += ",\"bos\":" + f_bool(isBuy ? bullBos : bearBos)
+    payload += ",\"choch\":false"
+    payload += ",\"fvg\":" + f_bool(isBuy ? bullFvg : bearFvg)
+    payload += ",\"liquidity_sweep\":" + f_bool(isBuy ? bullLiquiditySweep : bearLiquiditySweep)
+    payload += ",\"vwap_confirm\":" + f_bool(isBuy ? close > vwapValue : close < vwapValue)
+    payload += ",\"mtf_confirm\":true"
+    payload += ",\"market_phase\":\"TREND\""
+    payload += ",\"reason\":\"Analiză M15 v16.3: trend M15/H1/H4, structură, lichiditate/FVG, ADX/DI, RSI, VWAP și volatilitate ATR. Probabilitatea din Pine este un scor euristic; validarea statistică este realizată de server.\"}"
+    payload
+
+if barOK
+    alert(f_bar_payload(), alert.freq_all)
+
+if buySignal
+    alert(f_signal_payload("BUY", buyEntry, buySL, buyTP1, buyTP2, buyTP3, buyScore, buyProbability), alert.freq_all)
+    lastSignalBar := bar_index
+    label.new(bar_index, low, "BUY M15\nEntry " + f_num(buyEntry) + "\nSL " + f_num(buySL) + "\nTP1 " + f_num(buyTP1) + "\nScor " + str.tostring(buyScore), style=label.style_label_up, textcolor=color.white, color=color.new(color.green, 10))
+
+if sellSignal
+    alert(f_signal_payload("SELL", sellEntry, sellSL, sellTP1, sellTP2, sellTP3, sellScore, sellProbability), alert.freq_all)
+    lastSignalBar := bar_index
+    label.new(bar_index, high, "SELL M15\nEntry " + f_num(sellEntry) + "\nSL " + f_num(sellSL) + "\nTP1 " + f_num(sellTP1) + "\nScor " + str.tostring(sellScore), style=label.style_label_down, textcolor=color.white, color=color.new(color.red, 10))
+
+// Valorile sunt ascunse. Pe grafic rămân numai etichetele semnalelor.
+plot(emaFast, "EMA 20 internă", display=display.none)
+plot(emaSlow, "EMA 50 internă", display=display.none)
+plot(vwapValue, "VWAP intern", display=display.none)
+
+alertcondition(buySignal, title="PropTrader BUY v16.3 M15", message="Folosește Any alert() function call")
+alertcondition(sellSignal, title="PropTrader SELL v16.3 M15", message="Folosește Any alert() function call")

@@ -3,6 +3,13 @@ const path = require("path");
 const { Pool } = require("pg");
 const { getHistoricalRates } = require("dukascopy-node");
 const telegram = require("./telegram");
+const { buildBacktest, auditBars, aggregateBars } = require("./backtest");
+
+function cleanTimeframeEnv(value) {
+  const raw = String(value ?? "15").trim().toUpperCase();
+  const aliases = { M1:"1", M5:"5", M15:"15", M30:"30", H1:"60", H4:"240", D1:"1440" };
+  return aliases[raw] || raw.replace(/[^0-9]/g, "") || "15";
+}
 
 const app = express();
 let lastWebhookAt = null;
@@ -20,6 +27,7 @@ const PATTERN_MIN_PROBABILITY = Math.max(50, Math.min(95, Number(process.env.PAT
 const PATTERN_LOOKBACK_DAYS = Math.max(14, Number(process.env.PATTERN_LOOKBACK_DAYS || 180));
 const PATTERN_HORIZON_BARS = Math.max(1, Math.min(12, Number(process.env.PATTERN_HORIZON_BARS || 3)));
 const PATTERN_COOLDOWN_MINUTES = Math.max(5, Number(process.env.PATTERN_COOLDOWN_MINUTES || 60));
+const ANALYSIS_TIMEFRAME = cleanTimeframeEnv(process.env.ANALYSIS_TIMEFRAME || "15");
 const FMP_API_KEY = process.env.FMP_API_KEY || "";
 const ALPHAVANTAGE_API_KEY = process.env.ALPHAVANTAGE_API_KEY || "";
 const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY || "";
@@ -671,7 +679,7 @@ async function analytics() {
   return { summary: {
       total:data.length, active:data.filter(x=>!x.archived_at).length, archived:data.filter(x=>x.archived_at).length,
       open:data.filter(x=>x.status==="OPEN").length, closed:closed.length, wins:wins.length, losses:losses.length,
-      winRate:closed.length?wins.length/closed.length*100:0, totalR, profitFactor:grossLoss?grossWin/grossLoss:grossWin?99:0,
+      winRate:closed.length?wins.length/closed.length*100:0, totalR, profitFactor:grossLoss?grossWin/grossLoss:(grossWin>0?null:0),
       avgScore:data.length?data.reduce((a,x)=>a+num(x.score),0)/data.length:0,
       avgAdaptiveScore:data.length?data.reduce((a,x)=>a+num(x.adaptive_score,x.score),0)/data.length:0
     }, bySymbol:groupStats(data,x=>x.symbol), bySession:groupStats(data,x=>x.session_name),
@@ -761,81 +769,12 @@ function parseHistoricalCsv(csv,{symbol,timeframe,timezoneOffsetMinutes=0}={}){
 async function saveBarsBatch(bars){
   if(!pool){for(const b of bars)await saveBar(b);return bars.length;}
   let inserted=0;
-  for(let i=0;i<bars.length;i+=500){
-    const chunk=bars.slice(i,i+500), values=[], params=[]; let n=1;
+  for(let i=0;i<bars.length;i+=2000){
+    const chunk=bars.slice(i,i+2000), values=[], params=[]; let n=1;
     for(const b of chunk){values.push(`($${n++},$${n++},$${n++},$${n++},$${n++},$${n++},$${n++},$${n++},$${n++})`);params.push(b.external_id,b.bar_time,b.symbol,b.timeframe,b.open,b.high,b.low,b.close,b.volume);}
     const q=await pool.query(`INSERT INTO market_bars(external_id,bar_time,symbol,timeframe,open,high,low,close,volume) VALUES ${values.join(",")} ON CONFLICT DO NOTHING`,params);inserted+=q.rowCount;
   }
   return inserted;
-}
-function wilsonLower(wins,n,z=1.96){if(!n)return 0;const p=wins/n,z2=z*z;return ((p+z2/(2*n))-z*Math.sqrt((p*(1-p)+z2/(4*n))/n))/(1+z2/n)*100;}
-function performanceStats(returns){
-  const n=returns.length,wins=returns.filter(x=>x>0),losses=returns.filter(x=>x<0),sum=returns.reduce((a,x)=>a+x,0),grossWin=wins.reduce((a,x)=>a+x,0),grossLoss=Math.abs(losses.reduce((a,x)=>a+x,0));
-  let equity=0,peak=0,maxDD=0;for(const r of returns){equity+=r;peak=Math.max(peak,equity);maxDD=Math.max(maxDD,peak-equity);}
-  return {trades:n,wins:wins.length,winRate:n?wins.length/n*100:0,lowerBound:wilsonLower(wins.length,n),avgReturnPct:n?sum/n:0,totalReturnPct:sum,profitFactor:grossLoss?grossWin/grossLoss:(grossWin>0?99:0),maxDrawdownPct:maxDD};
-}
-function emaSeries(values, period){
-  const out=new Array(values.length).fill(null); if(!values.length)return out;
-  const k=2/(period+1); let ema=values[0]; out[0]=ema;
-  for(let i=1;i<values.length;i++){ema=values[i]*k+ema*(1-k);out[i]=ema;} return out;
-}
-function rsiSeries(values, period=14){
-  const out=new Array(values.length).fill(null); if(values.length<=period)return out;
-  let gain=0,loss=0; for(let i=1;i<=period;i++){const d=values[i]-values[i-1];gain+=Math.max(0,d);loss+=Math.max(0,-d);} gain/=period;loss/=period;
-  out[period]=loss===0?100:100-(100/(1+gain/loss));
-  for(let i=period+1;i<values.length;i++){const d=values[i]-values[i-1];gain=(gain*(period-1)+Math.max(0,d))/period;loss=(loss*(period-1)+Math.max(0,-d))/period;out[i]=loss===0?100:100-(100/(1+gain/loss));}return out;
-}
-function atrSeries(bars, period=14){
-  const tr=bars.map((b,i)=>i===0?num(b.high)-num(b.low):Math.max(num(b.high)-num(b.low),Math.abs(num(b.high)-num(bars[i-1].close)),Math.abs(num(b.low)-num(bars[i-1].close))));
-  return emaSeries(tr,period);
-}
-function enrichBars(bars){
-  const closes=bars.map(b=>num(b.close)),ema20=emaSeries(closes,20),ema50=emaSeries(closes,50),rsi14=rsiSeries(closes,14),atr14=atrSeries(bars,14);
-  return bars.map((b,i)=>({...b,ema20:ema20[i],ema50:ema50[i],rsi14:rsi14[i],atr14:atr14[i]}));
-}
-function candidateKey(name,weekday,bucket,side){return `${name}|${weekday}|${bucket}|${side}`;}
-function buildObservations(bars,{horizonBars=3,costBps=1.5}={}){
-  const e=enrichBars(bars), out=[];
-  for(let i=55;i<e.length-horizonBars;i++){
-    const b=e[i], prev=e[i-1], end=e[i+horizonBars], close=num(b.close), atr=Math.max(1e-9,num(b.atr14)), bucket=bucketFor(b.bar_time,b.timeframe), weekday=new Date(b.bar_time).getUTCDay();
-    const raw=(num(end.close)-close)/close*100, cost=Number(costBps)/100, range20=e.slice(i-20,i), hh=Math.max(...range20.map(x=>num(x.high))),ll=Math.min(...range20.map(x=>num(x.low)));
-    const candidates=[];
-    candidates.push(['TIME',raw>=0?'BUY':'SELL']);
-    if(b.ema20!=null&&b.ema50!=null){if(close>b.ema20&&b.ema20>b.ema50)candidates.push(['TREND','BUY']);if(close<b.ema20&&b.ema20<b.ema50)candidates.push(['TREND','SELL']);}
-    if(prev.ema20!=null&&b.ema20!=null){if(num(prev.close)<=prev.ema20&&close>b.ema20&&b.ema20>b.ema50&&b.rsi14>=50)candidates.push(['PULLBACK','BUY']);if(num(prev.close)>=prev.ema20&&close<b.ema20&&b.ema20<b.ema50&&b.rsi14<=50)candidates.push(['PULLBACK','SELL']);}
-    if(close>hh-0.05*atr)candidates.push(['BREAKOUT','BUY']); if(close<ll+0.05*atr)candidates.push(['BREAKOUT','SELL']);
-    for(const [strategy,side] of candidates){const signed=(side==='BUY'?raw:-raw)-cost;out.push({time:b.bar_time,weekday,bucket,strategy,side,returnPct:signed,rawMovePct:raw,atrPct:atr/close*100});}
-  }
-  return out;
-}
-function walkForwardStats(obs, folds=5){
-  const sorted=[...obs].sort((a,b)=>new Date(a.time)-new Date(b.time)); const foldResults=[];
-  const minTrain=Math.max(20,Math.floor(sorted.length*.5));
-  for(let f=0;f<folds;f++){
-    const testStart=minTrain+Math.floor((sorted.length-minTrain)*f/folds),testEnd=minTrain+Math.floor((sorted.length-minTrain)*(f+1)/folds);
-    const test=sorted.slice(testStart,testEnd); if(test.length<3)continue;
-    foldResults.push(performanceStats(test.map(x=>x.returnPct)));
-  }
-  const all=performanceStats(sorted.slice(minTrain).map(x=>x.returnPct));
-  const positiveFolds=foldResults.filter(x=>x.avgReturnPct>0&&x.profitFactor>1).length;
-  return {all,folds:foldResults,positiveFolds,totalFolds:foldResults.length,stability:foldResults.length?positiveFolds/foldResults.length*100:0};
-}
-function buildBacktest(bars,{horizonBars=3,minSamples=40,minProbability=60,costBps=1.5,walkForwardFolds=5}={}){
-  const observations=buildObservations(bars,{horizonBars,costBps}), groups=new Map();
-  for(const o of observations){const k=candidateKey(o.strategy,o.weekday,o.bucket,o.side);if(!groups.has(k))groups.set(k,[]);groups.get(k).push(o);}
-  const results=[];
-  for(const [key,obs] of groups){
-    if(obs.length<minSamples)continue;obs.sort((a,b)=>new Date(a.time)-new Date(b.time));const cut=Math.max(1,Math.floor(obs.length*.8)),train=obs.slice(0,cut),test=obs.slice(cut);if(test.length<8)continue;
-    const trainStats=performanceStats(train.map(x=>x.returnPct)),testStats=performanceStats(test.map(x=>x.returnPct));
-    if(trainStats.winRate<minProbability)continue;
-    const wf=walkForwardStats(obs,walkForwardFolds),[strategy,weekday,bucket,side]=key.split('|');
-    const robust=testStats.avgReturnPct>0&&testStats.profitFactor>=1.15&&testStats.lowerBound>=45&&wf.stability>=60&&wf.all.avgReturnPct>0;
-    const score=Math.max(0,Math.min(100,0.35*testStats.winRate+15*Math.min(3,testStats.profitFactor)+0.25*wf.stability+10*Math.min(1,Math.max(0,testStats.avgReturnPct/(Math.max(0.001,obs.reduce((a,x)=>a+x.atrPct,0)/obs.length))))));
-    results.push({strategy,weekday:Number(weekday),timeBucket:bucket,side,samples:obs.length,train:trainStats,test:testStats,walkForward:wf,trainProbability:trainStats.winRate,robust,score,costBps});
-  }
-  results.sort((a,b)=>(Number(b.robust)-Number(a.robust))||(b.score-a.score)||(b.test.avgReturnPct-a.test.avgReturnPct));
-  const robust=results.filter(x=>x.robust);
-  return {summary:{patternsTested:results.length,robustPatterns:robust.length,best:robust[0]||results[0]||null,costBps,walkForwardFolds,warning:'Rezultatele istorice nu garantează performanță viitoare. Costurile, slippage-ul și schimbarea regimului pot elimina avantajul.'},results:results.slice(0,500)};
 }
 async function getBarsForBacktest(symbol,timeframe,limit=250000){
   if(!pool)return memoryBars.filter(x=>x.symbol===symbol&&x.timeframe===timeframe).sort((a,b)=>new Date(a.bar_time)-new Date(b.bar_time)).slice(-limit);
@@ -880,7 +819,7 @@ async function notifyTelegramSignal(signal) {
   }
 }
 
-app.get("/health", (req,res)=>res.json({ok:true,version:"16.2.0",database:pool?"postgres":"memory",archiveAfterHours:ARCHIVE_AFTER_HOURS,adminKeyConfigured:Boolean(ADMIN_KEY),newsWebhookConfigured:Boolean(NEWS_WEBHOOK_KEY),fmpConfigured:Boolean(FMP_API_KEY),alphaVantageConfigured:Boolean(ALPHAVANTAGE_API_KEY),finnhubConfigured:Boolean(FINNHUB_API_KEY),autoTrackTrades:AUTO_TRACK_TRADES,lastNewsSync,lastNewsSyncError,patternMinSamples:PATTERN_MIN_SAMPLES,patternMinProbability:PATTERN_MIN_PROBABILITY,patternHorizonBars:PATTERN_HORIZON_BARS,liveMinAdaptiveScore:LIVE_MIN_ADAPTIVE_SCORE,learningMinSamples:LEARNING_MIN_SAMPLES,maxNewsRiskLive:MAX_NEWS_RISK_LIVE,maxConsecutiveLosses:MAX_CONSECUTIVE_LOSSES,telegram:telegram.status(),lastTelegramAt,lastTelegramResult,lastWebhookAt,lastWebhookResult,time:new Date().toISOString()}));
+app.get("/health", (req,res)=>res.json({ok:true,version:"16.3.0",database:pool?"postgres":"memory",archiveAfterHours:ARCHIVE_AFTER_HOURS,adminKeyConfigured:Boolean(ADMIN_KEY),newsWebhookConfigured:Boolean(NEWS_WEBHOOK_KEY),fmpConfigured:Boolean(FMP_API_KEY),alphaVantageConfigured:Boolean(ALPHAVANTAGE_API_KEY),finnhubConfigured:Boolean(FINNHUB_API_KEY),autoTrackTrades:AUTO_TRACK_TRADES,lastNewsSync,lastNewsSyncError,patternMinSamples:PATTERN_MIN_SAMPLES,patternMinProbability:PATTERN_MIN_PROBABILITY,patternHorizonBars:PATTERN_HORIZON_BARS,analysisTimeframe:ANALYSIS_TIMEFRAME,liveMinAdaptiveScore:LIVE_MIN_ADAPTIVE_SCORE,learningMinSamples:LEARNING_MIN_SAMPLES,maxNewsRiskLive:MAX_NEWS_RISK_LIVE,maxConsecutiveLosses:MAX_CONSECUTIVE_LOSSES,telegram:telegram.status(),lastTelegramAt,lastTelegramResult,lastWebhookAt,lastWebhookResult,time:new Date().toISOString()}));
 
 app.get("/api/signals", async(req,res)=>{ try { const mode=req.query.mode==="archive"?"archive":"active"; res.json({ok:true,mode,signals:await listSignals(mode,req.query),analytics:await analytics()}); } catch(e){ console.error(e); res.status(500).json({ok:false,error:e.message}); } });
 app.get("/api/analytics", async(req,res)=>{ try { res.json({ok:true,analytics:await analytics()}); } catch(e){res.status(500).json({ok:false,error:e.message});} });
@@ -911,9 +850,9 @@ app.post("/api/test-signal",async(req,res)=>{ if(!requireAdmin(req,res))return; 
   const price=num(req.body.price,NaN); if(!Number.isFinite(price)||price<=0)throw new Error("Introdu un preț curent valid pentru test");
   const atr=Math.max(price*0.0015,num(req.body.atr,0)); const risk=atr*1.1;
   const side=clean(req.body.side||"BUY",10).toUpperCase()==="SELL"?"SELL":"BUY";
-  const s=normalizeSignal({external_id:`TEST-${Date.now()}`,symbol:clean(req.body.symbol||"US30",30),timeframe:"5",signal:side,price,
+  const s=normalizeSignal({external_id:`TEST-${Date.now()}`,symbol:clean(req.body.symbol||"US30",30),timeframe:ANALYSIS_TIMEFRAME,signal:side,price,
     sl:side==="BUY"?price-risk:price+risk,tp1:side==="BUY"?price+risk*1.5:price-risk*1.5,tp2:side==="BUY"?price+risk*2.5:price-risk*2.5,tp3:side==="BUY"?price+risk*3.5:price-risk*3.5,
-    score:88,probability:79,rsi:58.4,atr,rr:3.5,trend:side==="BUY"?"Bullish":"Bearish",structure:`${side} test`,session:"New York",bos:true,fvg:true,liquidity_sweep:true,vwap_confirm:true,mtf_confirm:true,market_phase:"Expansion",premium_discount:side==="BUY"?"Discount":"Premium",reason:"Semnal demonstrativ v9.1 la preț introdus manual."});
+    score:88,probability:79,rsi:58.4,atr,rr:3.5,trend:side==="BUY"?"Bullish":"Bearish",structure:`${side} test`,session:"New York",bos:true,fvg:true,liquidity_sweep:true,vwap_confirm:true,mtf_confirm:true,market_phase:"Expansion",premium_discount:side==="BUY"?"Discount":"Premium",reason:"Semnal demonstrativ v16.3 M15 la preț introdus manual."});
   await saveSignal(s);res.json({ok:true,signal:s});
 }catch(e){res.status(400).json({ok:false,error:e.message});} });
 
@@ -929,7 +868,7 @@ app.get("/api/validation",async(req,res)=>{try{
   const rows=await allSignalsForAnalytics();
   const closed=rows.filter(x=>x.status==="CLOSED").sort((a,b)=>new Date(a.closed_at)-new Date(b.closed_at));
   const split=Math.max(1,Math.floor(closed.length*0.8)),train=closed.slice(0,split),test=closed.slice(split);
-  const summarize=a=>{const wins=a.filter(x=>num(x.pnl_r)>0).length,total=a.length,totalR=a.reduce((z,x)=>z+num(x.pnl_r),0),grossWin=a.filter(x=>num(x.pnl_r)>0).reduce((z,x)=>z+num(x.pnl_r),0),grossLoss=Math.abs(a.filter(x=>num(x.pnl_r)<0).reduce((z,x)=>z+num(x.pnl_r),0));return {trades:total,winRate:total?wins/total*100:0,lowerBound:wilsonLowerBound(wins,total)*100,avgR:total?totalR/total:0,profitFactor:grossLoss?grossWin/grossLoss:grossWin?99:0,totalR};};
+  const summarize=a=>{const wins=a.filter(x=>num(x.pnl_r)>0).length,total=a.length,totalR=a.reduce((z,x)=>z+num(x.pnl_r),0),grossWin=a.filter(x=>num(x.pnl_r)>0).reduce((z,x)=>z+num(x.pnl_r),0),grossLoss=Math.abs(a.filter(x=>num(x.pnl_r)<0).reduce((z,x)=>z+num(x.pnl_r),0));return {trades:total,winRate:total?wins/total*100:0,lowerBound:wilsonLowerBound(wins,total)*100,avgR:total?totalR/total:0,profitFactor:grossLoss?grossWin/grossLoss:(grossWin>0?null:0),totalR};};
   const t=summarize(train),v=summarize(test),all=summarize(closed);
   let peak=0,eq=0,maxDD=0;for(const x of closed){eq+=num(x.pnl_r);peak=Math.max(peak,eq);maxDD=Math.max(maxDD,peak-eq);}
   const calibrated=closed.filter(x=>Number.isFinite(num(x.probability,NaN)));
@@ -1020,13 +959,56 @@ app.post("/api/history-import",async(req,res)=>{if(!requireAdmin(req,res))return
   res.json({ok:true,parsed:parsed.bars.length,inserted,rejected:parsed.rejected,first:first.bar_time,last:last.bar_time,symbol:first.symbol,timeframe:first.timeframe});
 }catch(e){res.status(400).json({ok:false,error:e.message});}});
 
+app.post("/api/history-aggregate",async(req,res)=>{if(!requireAdmin(req,res))return;try{
+  const symbol=clean(req.body.symbol||"US30",30).toUpperCase();
+  const sourceTimeframe=clean(req.body.sourceTimeframe||"5",20);
+  const targetTimeframe=clean(req.body.targetTimeframe||ANALYSIS_TIMEFRAME,20);
+  const sourceRaw=await getBarsForBacktest(symbol,sourceTimeframe,500000);
+  const sourceBars=Array.isArray(sourceRaw)?sourceRaw:(sourceRaw&&Array.isArray(sourceRaw.rows)?sourceRaw.rows:[]);
+  if(!sourceBars.length)throw new Error(`Nu există date ${symbol} M${sourceTimeframe} pentru agregare.`);
+  const aggregated=aggregateBars(sourceBars,sourceTimeframe,targetTimeframe,{requireComplete:true});
+  if(!aggregated.length)throw new Error("Nu s-au putut construi lumânări complete pentru timeframe-ul țintă.");
+  const inserted=await saveBarsBatch(aggregated);
+  res.json({ok:true,symbol,sourceTimeframe,targetTimeframe,generated:aggregated.length,inserted,duplicates:aggregated.length-inserted,first:aggregated[0].bar_time,last:aggregated[aggregated.length-1].bar_time});
+}catch(e){res.status(400).json({ok:false,error:e.message});}});
+
 app.post("/api/backtest",async(req,res)=>{if(!requireAdmin(req,res))return;try{
-  const symbol=clean(req.body.symbol||"US30",30).toUpperCase(),timeframe=clean(req.body.timeframe||"5",20),settings={horizonBars:Math.max(1,Math.min(24,num(req.body.horizonBars,3))),minSamples:Math.max(20,num(req.body.minSamples,40)),minProbability:Math.max(50,Math.min(90,num(req.body.minProbability,60))),costBps:Math.max(0,Math.min(50,num(req.body.costBps,1.5))),walkForwardFolds:Math.max(3,Math.min(10,num(req.body.walkForwardFolds,5)))};
-  const barsRaw=await getBarsForBacktest(symbol,timeframe);const bars=Array.isArray(barsRaw)?barsRaw:(barsRaw&&Array.isArray(barsRaw.rows)?barsRaw.rows:[]);if(bars.length<settings.minSamples+settings.horizonBars+20)throw new Error(`Istoric insuficient: ${bars.length} lumânări. Importă mai multe date.`);
-  const report=buildBacktest(bars,settings),run=await saveBacktestRun({symbol,timeframe,bars:bars.length,start_time:bars[0].bar_time,end_time:bars[bars.length-1].bar_time,settings,summary:report.summary,results:report.results});res.json({ok:true,run});
+  const symbol=clean(req.body.symbol||"US30",30).toUpperCase();
+  const timeframe=clean(req.body.timeframe||ANALYSIS_TIMEFRAME,20);
+  const settings={
+    horizonBars:Math.max(1,Math.min(24,num(req.body.horizonBars,3))),
+    minSamples:Math.max(30,num(req.body.minSamples,60)),
+    minProbability:Math.max(40,Math.min(90,num(req.body.minProbability,55))),
+    costBps:Math.max(0,Math.min(50,num(req.body.costBps,2))),
+    slippageBps:Math.max(0,Math.min(25,num(req.body.slippageBps,0.5))),
+    walkForwardFolds:Math.max(3,Math.min(10,num(req.body.walkForwardFolds,5))),
+    stopAtr:Math.max(0.5,Math.min(4,num(req.body.stopAtr,1.2))),
+    targetR:Math.max(0.75,Math.min(5,num(req.body.targetR,1.5)))
+  };
+  const barsRaw=await getBarsForBacktest(symbol,timeframe);
+  const normalized=Array.isArray(barsRaw)?barsRaw:(barsRaw&&Array.isArray(barsRaw.rows)?barsRaw.rows:[]);
+  const audited=auditBars(normalized,timeframe);
+  const bars=audited.bars;
+  if(bars.length<settings.minSamples+settings.horizonBars+60)throw new Error(`Istoric insuficient: ${bars.length} lumânări valide. Importă sau generează mai multe date.`);
+  const report=buildBacktest(bars,settings);
+  report.summary.dataAudit=audited.audit;
+  const run=await saveBacktestRun({symbol,timeframe,bars:bars.length,start_time:bars[0].bar_time,end_time:bars[bars.length-1].bar_time,settings,summary:report.summary,results:report.results});
+  res.json({ok:true,run});
 }catch(e){console.error("[BACKTEST] EROARE:",e);res.status(400).json({ok:false,error:e.message});}});
 app.get("/api/backtest/latest",async(req,res)=>{try{res.json({ok:true,run:await latestBacktest()});}catch(e){res.status(500).json({ok:false,error:e.message});}});
-app.get("/api/history-status",async(req,res)=>{try{let rows;if(!pool){const m=new Map();for(const b of memoryBars){const k=`${b.symbol}|${b.timeframe}`;if(!m.has(k))m.set(k,{symbol:b.symbol,timeframe:b.timeframe,bars:0,start_time:b.bar_time,end_time:b.bar_time});const x=m.get(k);x.bars++;if(b.bar_time<x.start_time)x.start_time=b.bar_time;if(b.bar_time>x.end_time)x.end_time=b.bar_time;}rows=[...m.values()];}else rows=(await pool.query(`SELECT symbol,timeframe,COUNT(*)::int bars,MIN(bar_time) start_time,MAX(bar_time) end_time FROM market_bars GROUP BY symbol,timeframe ORDER BY symbol,timeframe`)).rows;res.json({ok:true,datasets:rows});}catch(e){res.status(500).json({ok:false,error:e.message});}});
+app.get("/api/history-status",async(req,res)=>{try{
+  let rows;
+  if(!pool){
+    const m=new Map();
+    for(const b of memoryBars){const k=`${b.symbol}|${b.timeframe}`;if(!m.has(k))m.set(k,{symbol:b.symbol,timeframe:b.timeframe,bars:0,start_time:b.bar_time,end_time:b.bar_time});const x=m.get(k);x.bars++;if(b.bar_time<x.start_time)x.start_time=b.bar_time;if(b.bar_time>x.end_time)x.end_time=b.bar_time;}
+    rows=[...m.values()];
+  }else{
+    const queryResult=await pool.query(`SELECT symbol,timeframe,COUNT(*)::int bars,MIN(bar_time) start_time,MAX(bar_time) end_time FROM market_bars GROUP BY symbol,timeframe ORDER BY symbol,timeframe`);
+    rows=Array.isArray(queryResult?.rows)?queryResult.rows:[];
+  }
+  const datasets=Array.isArray(rows)?rows:[];
+  res.json({ok:true,datasets});
+}catch(e){res.status(500).json({ok:false,error:e.message,datasets:[]});}});
 
 app.get("/api/export.csv",async(req,res)=>{try{const rows=await allSignalsForAnalytics();const cols=["received_at","archived_at","symbol","timeframe","signal","status","result","price","sl","tp1","tp2","tp3","score","adaptive_score","learning_adjustment","news_risk","news_bias","pnl_r","session_name","structure","reason"];const esc=v=>`"${String(v??"").replaceAll('"','""')}"`;const csv=[cols.join(','),...rows.map(r=>cols.map(c=>esc(r[c])).join(','))].join('\n');res.setHeader("content-type","text/csv; charset=utf-8");res.setHeader("content-disposition",'attachment; filename="proptrader-journal.csv"');res.send('\ufeff'+csv);}catch(e){res.status(500).send(e.message);}});
 
@@ -1038,8 +1020,16 @@ app.post("/webhook", async(req,res)=>{try{
   console.log(`[WEBHOOK] primit event=${event} symbol=${payload.symbol||payload.ticker||"N/A"} side=${payload.signal||payload.side||"N/A"} tf=${payload.timeframe||payload.interval||"N/A"}`);
   if(event==="CLOSE"){const closed=await closeSignal(payload);lastWebhookResult=`ACCEPTAT CLOSE ${payload.external_id||payload.signal_id||""}`;return res.json({ok:true,closed});}
   if(event==="BAR"){
-    const bar=normalizeBar(payload); await saveBar(bar); const closed=await trackSignalsWithBar(bar); const pattern=await analyzeTimePattern(bar); const created=pattern?await savePattern(pattern):false;
-    lastWebhookResult=`ACCEPTAT BAR ${bar.symbol} ${bar.timeframe}`; return res.json({ok:true,event:"BAR",bar,autoClosed:closed,pattern:created?pattern:null});
+    const bar=normalizeBar(payload);
+    await saveBar(bar);
+    const closed=await trackSignalsWithBar(bar);
+    let pattern=null,created=false;
+    if(String(bar.timeframe)===String(ANALYSIS_TIMEFRAME)){
+      pattern=await analyzeTimePattern(bar);
+      created=pattern?await savePattern(pattern):false;
+    }
+    lastWebhookResult=`ACCEPTAT BAR ${bar.symbol} ${bar.timeframe}${String(bar.timeframe)===String(ANALYSIS_TIMEFRAME)?" · analiză M15":" · doar colectare"}`;
+    return res.json({ok:true,event:"BAR",bar,analysisTimeframe:ANALYSIS_TIMEFRAME,autoClosed:closed,pattern:created?pattern:null});
   }
   const signal=normalizeSignal(payload); if(!["BUY","SELL"].includes(signal.signal)) throw new Error("Semnalul trebuie să fie BUY sau SELL"); const inserted=await saveSignal(signal); if(inserted) notifyTelegramSignal(signal).catch(e=>console.error("[TELEGRAM]",e.message)); lastWebhookResult=`ACCEPTAT ${signal.signal} ${signal.symbol} ${signal.timeframe} la ${signal.price}`; console.log(`[WEBHOOK] ${lastWebhookResult}`); return res.json({ok:true,signal});
 }catch(e){lastWebhookResult=`RESPINS: ${e.message}`;console.error("POST /webhook:",e);return res.status(400).json({ok:false,error:e.message});}});
@@ -1048,5 +1038,5 @@ initDb().then(async()=>{
   await archiveOldSignals();
   setInterval(()=>archiveOldSignals().catch(e=>console.error("Auto-archive:",e)),15*60*1000).unref();
   if(FMP_API_KEY||ALPHAVANTAGE_API_KEY||FINNHUB_API_KEY){syncRealNews().catch(e=>{lastNewsSyncError=e.message;console.error("News sync:",e.message)});setInterval(()=>syncRealNews().catch(e=>{lastNewsSyncError=e.message;console.error("News sync:",e.message)}),NEWS_AUTO_SYNC_MINUTES*60000).unref();}
-  app.listen(PORT,()=>console.log(`PropTrader AI v16.2 rulează pe portul ${PORT}`));
+  app.listen(PORT,()=>console.log(`PropTrader AI v16.3 rulează pe portul ${PORT}`));
 }).catch(e=>{console.error("DB init failed:",e);process.exit(1)});

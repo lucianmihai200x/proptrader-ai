@@ -49,7 +49,7 @@ function signalMessage(s) {
     s.tp3 ? `🎯 TP3: <b>${fmt(s.tp3)}</b>` : "",
     "",
     `📊 Scor adaptiv: <b>${fmt(score)}%</b>`,
-    `🧠 Probabilitate: <b>${fmt(s.probability ?? s.score)}%</b>`,
+    `🧠 Estimare Pine: <b>${fmt(s.probability ?? s.score)}%</b>`,
     s.session_name ? `🕒 Sesiune: <b>${esc(s.session_name)}</b>` : "",
     s.structure ? `📈 Structură: <b>${esc(s.structure)}</b>` : "",
     reason ? "" : "",
