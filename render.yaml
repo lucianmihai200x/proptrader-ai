@@ -16,6 +16,16 @@ services:
         fromDatabase:
           name: proptrader-db
           property: connectionString
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: TELEGRAM_ENABLED
+        value: true
+      - key: TELEGRAM_MIN_SCORE
+        value: 85
+      - key: TELEGRAM_MAX_RETRIES
+        value: 2
 
 databases:
   - name: proptrader-db
