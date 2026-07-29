@@ -40,9 +40,23 @@ const LEARNING_MIN_SAMPLES = Math.max(10, Number(process.env.LEARNING_MIN_SAMPLE
 const VALIDATION_MIN_TRADES = Math.max(20, Number(process.env.VALIDATION_MIN_TRADES || 60));
 const MAX_NEWS_RISK_LIVE = Math.max(0, Math.min(100, Number(process.env.MAX_NEWS_RISK_LIVE || 75)));
 const MAX_CONSECUTIVE_LOSSES = Math.max(2, Number(process.env.MAX_CONSECUTIVE_LOSSES || 4));
+const AUTO_PATTERN_SIGNALS = String(process.env.AUTO_PATTERN_SIGNALS || "true").toLowerCase() !== "false";
+const PATTERN_SIGNAL_MIN_SAMPLES = Math.max(PATTERN_MIN_SAMPLES, Number(process.env.PATTERN_SIGNAL_MIN_SAMPLES || 50));
+const PATTERN_SIGNAL_MIN_PROBABILITY = Math.max(PATTERN_MIN_PROBABILITY, Math.min(95, Number(process.env.PATTERN_SIGNAL_MIN_PROBABILITY || 75)));
+const PATTERN_SIGNAL_MIN_SCORE = Math.max(50, Math.min(95, Number(process.env.PATTERN_SIGNAL_MIN_SCORE || 85)));
+const WEBHOOK_STALE_MINUTES = Math.max(20, Number(process.env.WEBHOOK_STALE_MINUTES || 35));
+const SYSTEM_MONITOR_INTERVAL_MINUTES = Math.max(5, Number(process.env.SYSTEM_MONITOR_INTERVAL_MINUTES || 5));
+const TELEGRAM_SYSTEM_ALERTS = String(process.env.TELEGRAM_SYSTEM_ALERTS || "true").toLowerCase() !== "false";
+const NEWS_UNAVAILABLE_RISK = Math.max(0, Math.min(100, Number(process.env.NEWS_UNAVAILABLE_RISK || 55)));
 const NEWS_COUNTRIES = (process.env.NEWS_COUNTRIES || "US").split(",").map(x=>x.trim().toUpperCase()).filter(Boolean);
 let lastNewsSync = null;
+let lastSuccessfulNewsSync = null;
 let lastNewsSyncError = "";
+let lastSystemAlertKey = "";
+let lastSystemAlertAt = null;
+let lastDbCheckAt = null;
+let lastDbCheckOk = null;
+let lastDbCheckError = "";
 
 const pool = DATABASE_URL
   ? new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } })
@@ -73,6 +87,116 @@ const hoursAgoIso = h => new Date(Date.now() - h * 3600000).toISOString();
 function safeJson(v, fallback = {}) {
   if (v && typeof v === "object" && !Array.isArray(v)) return v;
   try { return JSON.parse(v); } catch { return fallback; }
+}
+
+function minutesSince(value) {
+  if (!value) return null;
+  const ms = Date.now() - new Date(value).getTime();
+  return Number.isFinite(ms) ? Math.max(0, ms / 60000) : null;
+}
+
+function marketExpectedOpen(now = new Date()) {
+  const day = now.getUTCDay();
+  const hour = now.getUTCHours();
+  if (day === 6) return false;
+  if (day === 0 && hour < 22) return false;
+  if (day === 5 && hour >= 22) return false;
+  return true;
+}
+
+function newsCoverageStatus() {
+  const ageMinutes = minutesSince(lastSuccessfulNewsSync);
+  const healthy = ageMinutes !== null && ageMinutes <= NEWS_MAX_AGE_HOURS * 60;
+  return {
+    healthy,
+    lastSuccessfulNewsSync,
+    ageMinutes: ageMinutes === null ? null : Number(ageMinutes.toFixed(1)),
+    unavailableRisk: NEWS_UNAVAILABLE_RISK,
+    error: lastNewsSyncError || ""
+  };
+}
+
+async function checkDatabase() {
+  lastDbCheckAt = new Date().toISOString();
+  if (!pool) {
+    lastDbCheckOk = true;
+    lastDbCheckError = "";
+    return { ok: true, mode: "memory", checkedAt: lastDbCheckAt };
+  }
+  try {
+    await pool.query("SELECT 1");
+    lastDbCheckOk = true;
+    lastDbCheckError = "";
+  } catch (error) {
+    lastDbCheckOk = false;
+    lastDbCheckError = error.message;
+  }
+  return { ok: lastDbCheckOk, mode: "postgres", checkedAt: lastDbCheckAt, error: lastDbCheckError || undefined };
+}
+
+function systemWarnings() {
+  const warnings = [];
+  const webhookAge = minutesSince(lastWebhookAt);
+  if (!lastWebhookAt) {
+    warnings.push({ code: "WEBHOOK_WAITING", severity: "info", message: "Se așteaptă primul webhook după pornire." });
+  } else if (marketExpectedOpen() && webhookAge > WEBHOOK_STALE_MINUTES) {
+    warnings.push({ code: "WEBHOOK_STALE", severity: "critical", message: `Nu s-a primit nicio lumânare de ${Math.round(webhookAge)} minute.` });
+  }
+  if (lastDbCheckOk === false) warnings.push({ code: "DATABASE_DOWN", severity: "critical", message: `Baza de date nu răspunde: ${lastDbCheckError}` });
+  if (!telegram.status().configured) warnings.push({ code: "TELEGRAM_OFF", severity: "warning", message: "Telegram nu este configurat complet." });
+  const news = newsCoverageStatus();
+  if (!news.healthy) warnings.push({ code: "NEWS_COVERAGE", severity: "warning", message: lastNewsSyncError ? `Filtrul de știri este degradat: ${lastNewsSyncError}` : "Nu există o sincronizare recentă și reușită a știrilor." });
+  if (telegram.MIN_SCORE > LIVE_MIN_ADAPTIVE_SCORE) warnings.push({ code: "THRESHOLD_GAP", severity: "info", message: `Semnalele LIVE între ${LIVE_MIN_ADAPTIVE_SCORE} și ${telegram.MIN_SCORE - 1} rămân în aplicație, fără notificare Telegram.` });
+  return warnings;
+}
+
+async function buildSystemStatus() {
+  const database = await checkDatabase();
+  const webhookAge = minutesSince(lastWebhookAt);
+  return {
+    ok: database.ok,
+    version: "16.4.0",
+    database,
+    webhook: {
+      lastAt: lastWebhookAt,
+      lastResult: lastWebhookResult,
+      ageMinutes: webhookAge === null ? null : Number(webhookAge.toFixed(1)),
+      staleAfterMinutes: WEBHOOK_STALE_MINUTES,
+      marketExpectedOpen: marketExpectedOpen()
+    },
+    telegram: { ...telegram.status(), lastAt: lastTelegramAt, lastResult: lastTelegramResult },
+    news: newsCoverageStatus(),
+    autoPatternSignals: {
+      enabled: AUTO_PATTERN_SIGNALS,
+      minSamples: PATTERN_SIGNAL_MIN_SAMPLES,
+      minProbability: PATTERN_SIGNAL_MIN_PROBABILITY,
+      minScore: PATTERN_SIGNAL_MIN_SCORE
+    },
+    warnings: systemWarnings(),
+    checkedAt: new Date().toISOString()
+  };
+}
+
+async function monitorSystem() {
+  const status = await buildSystemStatus();
+  const critical = status.warnings.filter(item => item.severity === "critical");
+  const key = critical.map(item => item.code).sort().join("|");
+  if (!TELEGRAM_SYSTEM_ALERTS || !telegram.status().configured) {
+    lastSystemAlertKey = key;
+    return status;
+  }
+  if (key && key !== lastSystemAlertKey) {
+    const message = critical.map(item => `• ${item.message}`).join("\n");
+    const result = await telegram.sendSystemAlert(`⚠️ <b>PropTrader AI — problemă sistem</b>\n\n${message}`);
+    lastSystemAlertAt = new Date().toISOString();
+    await logTelegram({ status: "SYSTEM_ALERT", messageId: result.message_id, details: message });
+  } else if (!key && lastSystemAlertKey) {
+    const result = await telegram.sendSystemAlert("✅ <b>PropTrader AI — sistem restabilit</b>\n\nWebhook-ul și baza de date funcționează din nou.");
+    lastSystemAlertAt = new Date().toISOString();
+    await logTelegram({ status: "SYSTEM_RECOVERY", messageId: result.message_id, details: "Sistem restabilit" });
+  }
+  lastSystemAlertKey = key;
+  return status;
 }
 
 async function initDb() {
@@ -213,6 +337,8 @@ async function initDb() {
     )
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS telegram_logs_created_idx ON telegram_logs(created_at DESC)`);
+  const newsState = await pool.query(`SELECT MAX(received_at) AS last_received FROM news_events`);
+  if (newsState.rows[0]?.last_received) lastSuccessfulNewsSync = new Date(newsState.rows[0].last_received).toISOString();
 }
 
 function setupKey(p) {
@@ -303,7 +429,11 @@ async function recentNewsRisk(symbol, at = new Date()) {
     rows = (await pool.query(`SELECT * FROM news_events WHERE published_at BETWEEN $1 AND $2 ORDER BY impact DESC, published_at DESC LIMIT 20`, [from, to])).rows;
   }
   const relevant = rows.filter(n => !n.symbols?.length || n.symbols.includes(symbol) || (symbol.includes("XAU") && n.symbols.includes("XAUUSD")));
-  if (!relevant.length) return { risk: 0, bias: "NEUTRAL", summary: "Fără știri relevante în fereastra ±3h." };
+  if (!relevant.length) {
+    const coverage = newsCoverageStatus();
+    if (!coverage.healthy) return { risk: NEWS_UNAVAILABLE_RISK, bias: "NEUTRAL", summary: `Filtrul de știri nu are acoperire recentă; risc de siguranță ${NEWS_UNAVAILABLE_RISK}/100.` };
+    return { risk: 0, bias: "NEUTRAL", summary: "Fără știri relevante în fereastra ±3h." };
+  }
   const max = relevant.reduce((a, n) => Number(n.impact) > Number(a.impact) ? n : a, relevant[0]);
   return { risk: Number(max.impact || 0), bias: max.bias || "NEUTRAL", summary: relevant.slice(0, 3).map(n => n.title).join(" • ").slice(0, 1200) };
 }
@@ -451,6 +581,7 @@ async function syncRealNews() {
   }
   const received=results.reduce((a,x)=>a+num(x.received),0), accepted=results.reduce((a,x)=>a+num(x.accepted),0), saved=results.reduce((a,x)=>a+num(x.saved),0);
   lastNewsSync=new Date().toISOString();
+  if (results.some(x => x.configured && !x.error)) lastSuccessfulNewsSync = lastNewsSync;
   lastNewsSyncError=results.filter(x=>x.error).map(x=>`${x.provider}: ${x.error}`).join(" | ");
   return {received,accepted,saved,providers:results,lastNewsSync,lastNewsSyncError};
 }
@@ -504,6 +635,51 @@ async function analyzeTimePattern(bar) {
   const bucketMs=PATTERN_COOLDOWN_MINUTES*60000;
   const ext=`PATTERN-${bar.symbol}-${bar.timeframe}-${side}-${Math.floor(new Date(bar.bar_time).getTime()/bucketMs)}`;
   return {external_id:ext,created_at:new Date().toISOString(),symbol:bar.symbol,timeframe:bar.timeframe,side,entry,sl,tp1,tp2,tp3,samples:selected.length,probability:Number(probability.toFixed(2)),avg_move_pct:Number(avgMove.toFixed(4)),median_move_pct:Number(medMove.toFixed(4)),time_bucket:targetBucket,weekday,horizon_bars:PATTERN_HORIZON_BARS,trend_confirmed:trendConfirmed,news_risk:news.risk,status:'CANDIDATE',reason:`Model orar: ${side} a apărut în ${probability.toFixed(1)}% din ${selected.length} cazuri; mișcare medie ${avgMove.toFixed(3)}% în următoarele ${PATTERN_HORIZON_BARS} lumânări. Confirmare EMA20/EMA50 și risc știri ${news.risk}/100.`};
+}
+
+function patternQualifiesForSignal(pattern) {
+  return Boolean(
+    AUTO_PATTERN_SIGNALS && pattern && pattern.trend_confirmed &&
+    num(pattern.samples) >= PATTERN_SIGNAL_MIN_SAMPLES &&
+    num(pattern.probability) >= PATTERN_SIGNAL_MIN_PROBABILITY &&
+    num(pattern.news_risk) <= MAX_NEWS_RISK_LIVE
+  );
+}
+
+function patternToSignal(pattern) {
+  const sampleBonus = Math.min(8, Math.max(0, Math.log2(Math.max(1, num(pattern.samples) / PATTERN_SIGNAL_MIN_SAMPLES) + 1) * 4));
+  const newsPenalty = num(pattern.news_risk) * 0.05;
+  const calculatedScore = Math.min(95, num(pattern.probability) + 6 + sampleBonus - newsPenalty);
+  const safetyBuffer = num(pattern.news_risk) >= 55 ? 7 : 0;
+  const score = Number(Math.max(PATTERN_SIGNAL_MIN_SCORE + safetyBuffer, calculatedScore).toFixed(2));
+  return normalizeSignal({
+    event: "SIGNAL",
+    external_id: `AUTO-${pattern.external_id}`,
+    symbol: pattern.symbol,
+    timeframe: pattern.timeframe,
+    signal: pattern.side,
+    price: pattern.entry,
+    sl: pattern.sl,
+    tp1: pattern.tp1,
+    tp2: pattern.tp2,
+    tp3: pattern.tp3,
+    score,
+    probability: pattern.probability,
+    rr: 3.5,
+    trend: pattern.side === "BUY" ? "Bullish" : "Bearish",
+    structure: "Model orar validat + trend EMA20/EMA50",
+    session: pattern.time_bucket,
+    mtf_confirm: true,
+    market_phase: "Historical edge",
+    reason: `Semnal generat automat de server din modelul istoric M15. ${pattern.reason}`,
+    score_breakdown: {
+      historicalProbability: pattern.probability,
+      samples: pattern.samples,
+      trendConfirmation: 6,
+      sampleBonus: Number(sampleBonus.toFixed(2)),
+      newsPenalty: Number(newsPenalty.toFixed(2))
+    }
+  });
 }
 
 async function savePattern(p) {
@@ -819,7 +995,8 @@ async function notifyTelegramSignal(signal) {
   }
 }
 
-app.get("/health", (req,res)=>res.json({ok:true,version:"16.3.0",database:pool?"postgres":"memory",archiveAfterHours:ARCHIVE_AFTER_HOURS,adminKeyConfigured:Boolean(ADMIN_KEY),newsWebhookConfigured:Boolean(NEWS_WEBHOOK_KEY),fmpConfigured:Boolean(FMP_API_KEY),alphaVantageConfigured:Boolean(ALPHAVANTAGE_API_KEY),finnhubConfigured:Boolean(FINNHUB_API_KEY),autoTrackTrades:AUTO_TRACK_TRADES,lastNewsSync,lastNewsSyncError,patternMinSamples:PATTERN_MIN_SAMPLES,patternMinProbability:PATTERN_MIN_PROBABILITY,patternHorizonBars:PATTERN_HORIZON_BARS,analysisTimeframe:ANALYSIS_TIMEFRAME,liveMinAdaptiveScore:LIVE_MIN_ADAPTIVE_SCORE,learningMinSamples:LEARNING_MIN_SAMPLES,maxNewsRiskLive:MAX_NEWS_RISK_LIVE,maxConsecutiveLosses:MAX_CONSECUTIVE_LOSSES,telegram:telegram.status(),lastTelegramAt,lastTelegramResult,lastWebhookAt,lastWebhookResult,time:new Date().toISOString()}));
+app.get("/health", (req,res)=>res.json({ok:true,version:"16.4.0",database:pool?"postgres":"memory",archiveAfterHours:ARCHIVE_AFTER_HOURS,adminKeyConfigured:Boolean(ADMIN_KEY),newsWebhookConfigured:Boolean(NEWS_WEBHOOK_KEY),fmpConfigured:Boolean(FMP_API_KEY),alphaVantageConfigured:Boolean(ALPHAVANTAGE_API_KEY),finnhubConfigured:Boolean(FINNHUB_API_KEY),autoTrackTrades:AUTO_TRACK_TRADES,lastNewsSync,lastSuccessfulNewsSync,lastNewsSyncError,newsCoverage:newsCoverageStatus(),patternMinSamples:PATTERN_MIN_SAMPLES,patternMinProbability:PATTERN_MIN_PROBABILITY,patternHorizonBars:PATTERN_HORIZON_BARS,analysisTimeframe:ANALYSIS_TIMEFRAME,autoPatternSignals:AUTO_PATTERN_SIGNALS,patternSignalMinSamples:PATTERN_SIGNAL_MIN_SAMPLES,patternSignalMinProbability:PATTERN_SIGNAL_MIN_PROBABILITY,patternSignalMinScore:PATTERN_SIGNAL_MIN_SCORE,liveMinAdaptiveScore:LIVE_MIN_ADAPTIVE_SCORE,learningMinSamples:LEARNING_MIN_SAMPLES,maxNewsRiskLive:MAX_NEWS_RISK_LIVE,maxConsecutiveLosses:MAX_CONSECUTIVE_LOSSES,webhookStaleMinutes:WEBHOOK_STALE_MINUTES,telegramSystemAlerts:TELEGRAM_SYSTEM_ALERTS,telegram:telegram.status(),lastTelegramAt,lastTelegramResult,lastSystemAlertAt,lastWebhookAt,lastWebhookResult,warnings:systemWarnings(),time:new Date().toISOString()}));
+app.get("/api/system-status", async(req,res)=>{try{res.json(await buildSystemStatus());}catch(e){res.status(500).json({ok:false,error:e.message});}});
 
 app.get("/api/signals", async(req,res)=>{ try { const mode=req.query.mode==="archive"?"archive":"active"; res.json({ok:true,mode,signals:await listSignals(mode,req.query),analytics:await analytics()}); } catch(e){ console.error(e); res.status(500).json({ok:false,error:e.message}); } });
 app.get("/api/analytics", async(req,res)=>{ try { res.json({ok:true,analytics:await analytics()}); } catch(e){res.status(500).json({ok:false,error:e.message});} });
@@ -831,20 +1008,27 @@ app.get("/api/news", async(req,res)=>{ try {
   res.json({ok:true,news:rows});
 } catch(e){res.status(500).json({ok:false,error:e.message});} });
 
-app.get("/api/news-status",(req,res)=>res.json({ok:true,fmpConfigured:Boolean(FMP_API_KEY),alphaVantageConfigured:Boolean(ALPHAVANTAGE_API_KEY),finnhubConfigured:Boolean(FINNHUB_API_KEY),lastNewsSync,lastNewsSyncError,autoSyncMinutes:NEWS_AUTO_SYNC_MINUTES,maxAgeHours:NEWS_MAX_AGE_HOURS,minRelevance:NEWS_MIN_RELEVANCE}));
+app.get("/api/news-status",(req,res)=>res.json({ok:true,fmpConfigured:Boolean(FMP_API_KEY),alphaVantageConfigured:Boolean(ALPHAVANTAGE_API_KEY),finnhubConfigured:Boolean(FINNHUB_API_KEY),lastNewsSync,lastSuccessfulNewsSync,lastNewsSyncError,coverage:newsCoverageStatus(),autoSyncMinutes:NEWS_AUTO_SYNC_MINUTES,maxAgeHours:NEWS_MAX_AGE_HOURS,minRelevance:NEWS_MIN_RELEVANCE}));
 
 app.post("/api/news-sync",async(req,res)=>{if(!requireAdmin(req,res))return;try{res.json({ok:true,...await syncRealNews()});}catch(e){lastNewsSyncError=e.message;res.status(400).json({ok:false,error:e.message});}});
 
-app.post("/api/news", async(req,res)=>{ if(!requireAdmin(req,res))return; try{ const list=Array.isArray(req.body.items)?req.body.items:[req.body]; const saved=[]; for(const p of list){const n=normalizeNews(p);await saveNews(n);saved.push(n);}res.json({ok:true,saved}); }catch(e){res.status(400).json({ok:false,error:e.message});} });
+app.post("/api/news", async(req,res)=>{ if(!requireAdmin(req,res))return; try{ const list=Array.isArray(req.body.items)?req.body.items:[req.body]; const saved=[]; for(const p of list){const n=normalizeNews(p);await saveNews(n);saved.push(n);}lastSuccessfulNewsSync=new Date().toISOString();res.json({ok:true,saved}); }catch(e){res.status(400).json({ok:false,error:e.message});} });
 
 app.post("/news-webhook", async(req,res)=>{ try{
   const key=req.query.key||req.get("x-news-key")||""; if(!NEWS_WEBHOOK_KEY||key!==NEWS_WEBHOOK_KEY)return res.status(401).json({ok:false,error:"NEWS_WEBHOOK_KEY incorectă"});
   const payload=parseBody(req); const list=Array.isArray(payload)?payload:(Array.isArray(payload.items)?payload.items:[payload]); const saved=[];
-  for(const p of list){const n=normalizeNews(p);await saveNews(n);saved.push(n);} res.json({ok:true,count:saved.length,saved});
+  for(const p of list){const n=normalizeNews(p);await saveNews(n);saved.push(n);} lastSuccessfulNewsSync=new Date().toISOString(); res.json({ok:true,count:saved.length,saved});
 }catch(e){res.status(400).json({ok:false,error:e.message});} });
 
 app.get("/api/telegram/status", async(req,res)=>{try{let logs;if(!pool)logs=(global.memoryTelegramLogs||[]).slice(0,20);else logs=(await pool.query(`SELECT * FROM telegram_logs ORDER BY created_at DESC LIMIT 20`)).rows;res.json({ok:true,telegram:telegram.status(),lastTelegramAt,lastTelegramResult,logs});}catch(e){res.status(500).json({ok:false,error:e.message});}});
 app.post("/api/telegram/test", async(req,res)=>{if(!requireAdmin(req,res))return;try{const result=await telegram.sendTest();lastTelegramAt=new Date().toISOString();lastTelegramResult=`TEST TRIMIS, mesaj ${result.message_id}`;await logTelegram({status:"TEST",messageId:result.message_id,details:lastTelegramResult});res.json({ok:true,messageId:result.message_id});}catch(e){lastTelegramAt=new Date().toISOString();lastTelegramResult=`EROARE TEST: ${e.message}`;await logTelegram({status:"ERROR",details:e.message}).catch(()=>{});res.status(400).json({ok:false,error:e.message});}});
+app.post("/api/telegram/test-signal", async(req,res)=>{if(!requireAdmin(req,res))return;try{
+  const price=num(req.body.price,NaN);if(!Number.isFinite(price)||price<=0)throw new Error("Introdu un preț valid");
+  const side=clean(req.body.side||"BUY",10).toUpperCase()==="SELL"?"SELL":"BUY";
+  const risk=Math.max(price*0.0015,num(req.body.atr,0))*1.1;
+  const signal={external_id:`TELEGRAM-TEST-${Date.now()}`,symbol:clean(req.body.symbol||"US30",30),timeframe:ANALYSIS_TIMEFRAME,signal:side,price,sl:side==="BUY"?price-risk:price+risk,tp1:side==="BUY"?price+risk*1.5:price-risk*1.5,tp2:side==="BUY"?price+risk*2.5:price-risk*2.5,tp3:side==="BUY"?price+risk*3.5:price-risk*3.5,score:92,adaptive_score:92,probability:86,execution_mode:"LIVE",session_name:"TEST",structure:"Test traseu complet",decision_reason:"Mesaj demonstrativ; nu reprezintă o recomandare de tranzacționare."};
+  const result=await telegram.sendSignal(signal);lastTelegramAt=new Date().toISOString();lastTelegramResult=`TEST SIGNAL TRIMIS ${side} ${signal.symbol}, mesaj ${result.message_id}`;await logTelegram({signal,status:"TEST_SIGNAL",messageId:result.message_id,details:lastTelegramResult});res.json({ok:true,messageId:result.message_id,signal});
+}catch(e){lastTelegramAt=new Date().toISOString();lastTelegramResult=`EROARE TEST SIGNAL: ${e.message}`;await logTelegram({status:"ERROR",details:e.message}).catch(()=>{});res.status(400).json({ok:false,error:e.message});}});
 
 app.post("/api/test-signal",async(req,res)=>{ if(!requireAdmin(req,res))return; try{
   const price=num(req.body.price,NaN); if(!Number.isFinite(price)||price<=0)throw new Error("Introdu un preț curent valid pentru test");
@@ -1024,12 +1208,18 @@ app.post("/webhook", async(req,res)=>{try{
     await saveBar(bar);
     const closed=await trackSignalsWithBar(bar);
     let pattern=null,created=false;
+    let generatedSignal=null,signalInserted=false;
     if(String(bar.timeframe)===String(ANALYSIS_TIMEFRAME)){
       pattern=await analyzeTimePattern(bar);
       created=pattern?await savePattern(pattern):false;
+      if(created && patternQualifiesForSignal(pattern)){
+        generatedSignal=patternToSignal(pattern);
+        signalInserted=await saveSignal(generatedSignal);
+        if(signalInserted) notifyTelegramSignal(generatedSignal).catch(e=>console.error("[TELEGRAM AUTO PATTERN]",e.message));
+      }
     }
-    lastWebhookResult=`ACCEPTAT BAR ${bar.symbol} ${bar.timeframe}${String(bar.timeframe)===String(ANALYSIS_TIMEFRAME)?" · analiză M15":" · doar colectare"}`;
-    return res.json({ok:true,event:"BAR",bar,analysisTimeframe:ANALYSIS_TIMEFRAME,autoClosed:closed,pattern:created?pattern:null});
+    lastWebhookResult=`ACCEPTAT BAR ${bar.symbol} ${bar.timeframe}${String(bar.timeframe)===String(ANALYSIS_TIMEFRAME)?" · analiză M15":" · doar colectare"}${signalInserted?" · semnal automat generat":""}`;
+    return res.json({ok:true,event:"BAR",bar,analysisTimeframe:ANALYSIS_TIMEFRAME,autoClosed:closed,pattern:created?pattern:null,generatedSignal:signalInserted?generatedSignal:null});
   }
   const signal=normalizeSignal(payload); if(!["BUY","SELL"].includes(signal.signal)) throw new Error("Semnalul trebuie să fie BUY sau SELL"); const inserted=await saveSignal(signal); if(inserted) notifyTelegramSignal(signal).catch(e=>console.error("[TELEGRAM]",e.message)); lastWebhookResult=`ACCEPTAT ${signal.signal} ${signal.symbol} ${signal.timeframe} la ${signal.price}`; console.log(`[WEBHOOK] ${lastWebhookResult}`); return res.json({ok:true,signal});
 }catch(e){lastWebhookResult=`RESPINS: ${e.message}`;console.error("POST /webhook:",e);return res.status(400).json({ok:false,error:e.message});}});
@@ -1038,5 +1228,7 @@ initDb().then(async()=>{
   await archiveOldSignals();
   setInterval(()=>archiveOldSignals().catch(e=>console.error("Auto-archive:",e)),15*60*1000).unref();
   if(FMP_API_KEY||ALPHAVANTAGE_API_KEY||FINNHUB_API_KEY){syncRealNews().catch(e=>{lastNewsSyncError=e.message;console.error("News sync:",e.message)});setInterval(()=>syncRealNews().catch(e=>{lastNewsSyncError=e.message;console.error("News sync:",e.message)}),NEWS_AUTO_SYNC_MINUTES*60000).unref();}
-  app.listen(PORT,()=>console.log(`PropTrader AI v16.3 rulează pe portul ${PORT}`));
+  setTimeout(()=>monitorSystem().catch(e=>console.error("System monitor:",e.message)),15000).unref();
+  setInterval(()=>monitorSystem().catch(e=>console.error("System monitor:",e.message)),SYSTEM_MONITOR_INTERVAL_MINUTES*60000).unref();
+  app.listen(PORT,()=>console.log(`PropTrader AI v16.4 rulează pe portul ${PORT}`));
 }).catch(e=>{console.error("DB init failed:",e);process.exit(1)});

@@ -109,5 +109,6 @@ async function send(text) {
 
 async function sendTest() { return send(testMessage()); }
 async function sendSignal(signal) { return send(signalMessage(signal)); }
+async function sendSystemAlert(html) { return send(String(html || "")); }
 
-module.exports = { status, sendTest, sendSignal, signalMessage, MIN_SCORE };
+module.exports = { status, sendTest, sendSignal, sendSystemAlert, signalMessage, MIN_SCORE };

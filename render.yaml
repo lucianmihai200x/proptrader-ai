@@ -28,6 +28,22 @@ services:
         value: 85
       - key: TELEGRAM_MAX_RETRIES
         value: 2
+      - key: AUTO_PATTERN_SIGNALS
+        value: true
+      - key: PATTERN_SIGNAL_MIN_SAMPLES
+        value: 50
+      - key: PATTERN_SIGNAL_MIN_PROBABILITY
+        value: 75
+      - key: PATTERN_SIGNAL_MIN_SCORE
+        value: 85
+      - key: WEBHOOK_STALE_MINUTES
+        value: 35
+      - key: SYSTEM_MONITOR_INTERVAL_MINUTES
+        value: 5
+      - key: TELEGRAM_SYSTEM_ALERTS
+        value: true
+      - key: NEWS_UNAVAILABLE_RISK
+        value: 55
 
 databases:
   - name: proptrader-db

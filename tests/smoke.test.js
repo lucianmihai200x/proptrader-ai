@@ -3,23 +3,28 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 
-test('server includes v16.3 M15, Telegram, aggregation and integrity backtest', () => {
+test('server includes v16.4 auto signals, monitoring, Telegram, aggregation and integrity backtest', () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
-  assert.match(source, /version:"16\.3\.0"/);
+  assert.match(source, /version:"16\.4\.0"/);
   assert.match(source, /ANALYSIS_TIMEFRAME/);
   assert.match(source, /api\/history-aggregate/);
   assert.match(source, /auditBars/);
   assert.match(source, /notifyTelegramSignal/);
   assert.match(source, /api\/telegram\/test/);
+  assert.match(source, /AUTO_PATTERN_SIGNALS/);
+  assert.match(source, /patternToSignal/);
+  assert.match(source, /api\/system-status/);
+  assert.match(source, /monitorSystem/);
 });
 
 test('frontend contains defensive array handling and M15 controls', () => {
   const html = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8');
-  assert.match(html, /PropTrader AI v16\.3/);
+  assert.match(html, /PropTrader AI v16\.4/);
   assert.match(html, /asArray/);
   assert.match(html, /aggregateM15/);
-  assert.match(html, /Backtest Integrity v16\.3/);
-  assert.match(html, /Test Telegram/);
+  assert.match(html, /Backtest Integrity v16\.4/);
+  assert.match(html, /Test semnal complet/);
+  assert.match(html, /Stare sistem/);
 });
 
 test('Pine engine is M15 and sends BAR plus selective SIGNAL events', () => {
