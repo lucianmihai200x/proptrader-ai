@@ -42,6 +42,7 @@ function signalMessage(s) {
   const sl = Number(s.sl);
   const risk = Math.abs(entry - sl);
   const targetR = value => risk > 0 ? Math.abs(Number(value) - entry) / risk : 0;
+  const probability = Number(s.probability);
   return [
     `<b>🚨 PropTrader AI</b>`,
     "",
@@ -55,11 +56,45 @@ function signalMessage(s) {
     `🎯 TP3: <b>${fmt(s.tp3)}</b> (${fmt(targetR(s.tp3))}R)`,
     "",
     `📊 Scor adaptiv: <b>${fmt(score)}%</b>`,
-    `🧠 Estimare Pine: <b>${fmt(s.probability ?? s.score)}%</b>`,
+    probability > 0 ? `🧠 Probabilitate istorică: <b>${fmt(probability)}%</b>` : "🧠 Probabilitate istorică: <b>NEVALIDATĂ</b>",
     s.session_name ? `🕒 Sesiune: <b>${esc(s.session_name)}</b>` : "",
     s.structure ? `📈 Structură: <b>${esc(s.structure)}</b>` : "",
     reason ? "" : "",
     reason ? `<b>Explicație:</b>\n${esc(reason).slice(0, 1200)}` : "",
+    "",
+    `<i>${new Date().toLocaleString("ro-RO", { timeZone: "Europe/Bucharest" })}</i>`
+  ].filter(Boolean).join("\n");
+}
+
+function pendingSetupMessage(s) {
+  const side = String(s.side || s.signal || "").toUpperCase();
+  const icon = side === "BUY" ? "🟢" : "🔴";
+  const risk = Math.abs(Number(s.entry) - Number(s.sl));
+  const targetR = value => risk > 0 ? Math.abs(Number(value) - Number(s.entry)) / risk : 0;
+  const probability = Number(s.historical_probability);
+  return [
+    "<b>🗺️ PLAN SMC — INTRARE ÎN AȘTEPTARE</b>",
+    "",
+    `<b>${icon} ${esc(side)} ${esc(s.symbol || "US30")}</b> · ${esc(timeframeLabel(s.timeframe || "15"))}`,
+    "⚠️ <b>NU intra la prețul curent.</b> Așteaptă retragerea în order block.",
+    "",
+    `Preț la analiză: <b>${fmt(s.current_price)}</b>`,
+    `Zonă order block: <b>${fmt(s.zone_low)} – ${fmt(s.zone_high)}</b>`,
+    `Intrare planificată: <b>${fmt(s.entry)}</b>`,
+    `SL: <b>${fmt(s.sl)}</b>`,
+    `TP1: <b>${fmt(s.tp1)}</b> (${fmt(targetR(s.tp1))}R)`,
+    `TP2: <b>${fmt(s.tp2)}</b> (${fmt(targetR(s.tp2))}R)`,
+    `TP3: <b>${fmt(s.tp3)}</b> (${fmt(targetR(s.tp3))}R)`,
+    "",
+    `Bias: <b>D1 ${esc(s.d1_bias)} · H4 ${esc(s.h4_bias)}</b>`,
+    `Structură: <b>${esc(s.structure_event)}</b>${s.fvg ? " · FVG" : ""}${s.liquidity_sweep ? " · sweep lichiditate" : ""}`,
+    `Scor SMC adaptiv: <b>${fmt(s.adaptive_score)}%</b>`,
+    probability > 0
+      ? `Rezultate model: <b>N=${fmt(s.learning_samples)} · ${fmt(probability)}% win ponderat</b>`
+      : `Rezultate model: <b>NEVALIDAT (N=${fmt(s.learning_samples)})</b>`,
+    "",
+    "Serverul va trimite separat semnalul LIVE numai dacă prețul atinge zona și apare confirmarea M5.",
+    s.reason ? `<i>${esc(s.reason).slice(0, 900)}</i>` : "",
     "",
     `<i>${new Date().toLocaleString("ro-RO", { timeZone: "Europe/Bucharest" })}</i>`
   ].filter(Boolean).join("\n");
@@ -115,6 +150,7 @@ async function send(text) {
 
 async function sendTest() { return send(testMessage()); }
 async function sendSignal(signal) { return send(signalMessage(signal)); }
+async function sendPendingSetup(setup) { return send(pendingSetupMessage(setup)); }
 async function sendSystemAlert(html) { return send(String(html || "")); }
 
-module.exports = { status, sendTest, sendSignal, sendSystemAlert, signalMessage, MIN_SCORE };
+module.exports = { status, sendTest, sendSignal, sendPendingSetup, sendSystemAlert, signalMessage, pendingSetupMessage, MIN_SCORE };

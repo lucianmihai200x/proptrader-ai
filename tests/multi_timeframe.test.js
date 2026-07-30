@@ -9,7 +9,7 @@ const {
   profileFor,
   completedHigherTimeframes
 } = require("../timeframes");
-const { signalMessage } = require("../telegram");
+const { signalMessage, pendingSetupMessage } = require("../telegram");
 
 test("timeframe aliases normalize to the five supported analysis intervals", () => {
   assert.equal(normalizeTimeframe("M5"), "5");
@@ -17,6 +17,7 @@ test("timeframe aliases normalize to the five supported analysis intervals", () 
   assert.equal(normalizeTimeframe("30m"), "30");
   assert.equal(normalizeTimeframe("1H"), "60");
   assert.equal(normalizeTimeframe("H4"), "240");
+  assert.equal(normalizeTimeframe("D1"), "1440");
   assert.deepEqual(parseAnalysisTimeframes("H4, M5, 30, 60, M15"), SUPPORTED_ANALYSIS_TIMEFRAMES);
 });
 
@@ -24,6 +25,15 @@ test("timeframe labels do not show H1 and H4 as minutes", () => {
   assert.equal(timeframeLabel("5"), "M5");
   assert.equal(timeframeLabel("60"), "H1");
   assert.equal(timeframeLabel("240"), "H4");
+  assert.equal(timeframeLabel("1440"), "D1");
+});
+
+test("D1 can be aggregated as context without becoming a signal timeframe", () => {
+  assert.deepEqual(
+    completedHigherTimeframes("2026-07-30T23:55:00.000Z", "5", ["15","30","60","240","1440"]),
+    ["15","30","60","240","1440"]
+  );
+  assert.equal(SUPPORTED_ANALYSIS_TIMEFRAMES.includes("1440"), false);
 });
 
 test("a closing M5 candle identifies each higher timeframe completed at that instant", () => {
@@ -61,5 +71,20 @@ test("Telegram signal contains interval, entry, SL and TP1-TP3", () => {
   assert.match(message, /SL/);
   assert.match(message, /TP1/);
   assert.match(message, /TP2/);
+  assert.match(message, /TP3/);
+});
+
+test("Telegram pending SMC plan clearly says not to enter immediately", () => {
+  const message = pendingSetupMessage({
+    side: "SELL", symbol: "US30", timeframe: "60", current_price: 1000,
+    zone_low: 1030, zone_high: 1040, entry: 1035, sl: 1045,
+    tp1: 1020, tp2: 1010, tp3: 995, adaptive_score: 84,
+    historical_probability: null, learning_samples: 0,
+    d1_bias: "BEARISH", h4_bias: "BEARISH", structure_event: "BOS",
+    fvg: true, liquidity_sweep: true
+  });
+  assert.match(message, /PLAN SMC/);
+  assert.match(message, /NU intra la prețul curent/);
+  assert.match(message, /Order block/i);
   assert.match(message, /TP3/);
 });

@@ -20,6 +20,18 @@ services:
         value: 15
       - key: ANALYSIS_TIMEFRAMES
         value: 5,15,30,60,240
+      - key: SMC_ENABLED
+        value: true
+      - key: SMC_MIN_SCORE
+        value: 68
+      - key: SMC_NOTIFY_PENDING_SCORE
+        value: 78
+      - key: SMC_REQUIRE_M5_CONFIRMATION
+        value: true
+      - key: SMC_MAX_PENDING_PER_SYMBOL
+        value: 15
+      - key: SMC_MIN_BLOCK_SAMPLES
+        value: 8
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_CHAT_ID

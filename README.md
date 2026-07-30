@@ -1,59 +1,78 @@
-# PropTrader AI v17.1 — M5 până la H4
+# PropTrader AI v18.1 — SMC predictiv M5–H4 și niveluri pe TradingView
 
-Aplicația primește lumânări M5 închise din TradingView, construiește automat M15, M30, H1 și H4, analizează separat toate cele cinci intervale și trimite pe Telegram numai semnalele LIVE validate.
+Aplicația primește lumânări M5 închise din TradingView, construiește automat M15, M30, H1, H4 și contextul D1 și caută intrări SMC pe toate intervalele M5–H4. O intrare nu este mutată artificial la prețul curent.
 
-Notificarea Telegram conține:
+Motorul separă două momente:
 
-- BUY sau SELL și instrumentul;
-- intervalul care a produs semnalul;
-- prețul de intrare;
-- Stop Loss;
-- TP1, TP2 și TP3, inclusiv distanța în R;
-- scorul adaptiv, probabilitatea istorică și explicația deciziei.
+1. **PLAN SMC / PENDING** — este identificat un order block și sunt calculate Entry, SL, TP1, TP2 și TP3. Mesajul spune explicit să nu intri la prețul curent.
+2. **SEMNAL LIVE** — este trimis separat numai dacă prețul revine la intrarea planificată fără să invalideze SL și o lumânare M5 respinge zona în direcția planului.
 
-## Ce s-a schimbat în v17.1
+## Reguli SMC implementate
 
-1. `ANALYSIS_TIMEFRAMES=5,15,30,60,240` activează M5, M15, M30, H1 și H4.
-2. O singură alertă TradingView pe M5 alimentează toate intervalele.
-3. Serverul agregă automat fiecare lumânare M5 nouă în intervalele superioare exact la închiderea lor.
-4. Istoricul M5 poate fi transformat dintr-un singur click în M15, M30, H1 și H4.
-5. Fiecare interval are propriul orizont, cooldown și prag minim.
-6. Confirmarea EMA20/EMA50 de pe intervalul superior este folosită când există suficiente date.
-7. Nivelurile Entry, SL și TP1–TP3 sunt validate înainte ca semnalul să poată fi salvat sau notificat.
-8. Scorul nu mai este ridicat artificial până la pragul Telegram.
-9. Mesajele Telegram afișează corect M5/M15/M30/H1/H4 și toate cele trei ținte.
-10. FMP este oprit implicit, astfel încât o cheie fără acces la calendar nu mai produce eroarea HTTP 402.
-11. Titlurile sunt sincronizate fără chei API din fluxurile oficiale Federal Reserve și BLS.
-12. Colectorul TradingView folosește o condiție dedicată care poate fi configurată numai cu Webhook URL, fără popup, aplicație, e-mail sau sunet.
+SMC nu are o specificație tehnică universală. În v18.1 regulile sunt explicite și testabile:
 
-## Profilurile implicite
+- swing high/low este confirmat numai după două lumânări în dreapta;
+- structura bullish cere HH + HL, iar structura bearish LH + LL; EMA20/EMA50 este doar fallback;
+- BOS/CHOCH cere închidere dincolo de un swing deja confirmat;
+- lumânarea de rupere trebuie să aibă displacement măsurat în ATR;
+- order block este ultima lumânare opusă înainte de displacement;
+- setup-ul cere FVG sau sweep de lichiditate;
+- SELL este favorizat în premium, BUY în discount;
+- zonele invalidate sau testate de prea multe ori sunt eliminate;
+- D1 și H4 dau biasul de context, iar M5/M15/M30/H1/H4 pot produce planul;
+- intrarea este mijlocul corpului order block-ului, SL trece de wick cu buffer ATR;
+- TP1, TP2 și TP3 pornesc de la minimum 1,5R, 2,5R și 4R și pot folosi pool-uri de lichiditate valide.
 
-| Interval | Observații minime | Probabilitate minimă | Scor minim | Orizont | Cooldown |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| M5 | 80 | 78% | 88 | 6 lumânări | 30 minute |
-| M15 | 60 | 76% | 86 | 4 lumânări | 60 minute |
-| M30 | 50 | 75% | 85 | 3 lumânări | 90 minute |
-| H1 | 50 | 75% | 85 | 3 lumânări | 180 minute |
-| H4 | 50 | 75% | 85 | 2 lumânări | 480 minute |
+Motorul nu forțează un setup dacă aceste condiții nu există.
 
-Pragurile globale existente rămân active și pot doar să facă filtrarea mai strictă.
+## Căutarea pe intervale mai mari
+
+`ANALYSIS_TIMEFRAMES=5,15,30,60,240` activează independent M5, M15, M30, H1 și H4. Dacă M5 nu oferă structură validă, analiza continuă pe intervalele superioare. D1 (`1440`) este context, nu interval de semnal.
+
+Dintr-o singură alertă M5, serverul produce lumânările superioare numai la închiderea completă a intervalului. Nu este nevoie de cinci alerte TradingView.
+
+## Învățare din rezultate
+
+Fiecare plan salvează configurația care l-a produs: instrument, direcție, interval, BOS/CHOCH, FVG, sweep și bias D1/H4. După activare:
+
+- aplicația urmărește SL și cele trei ținte din lumânările M5;
+- câte o treime din poziție este contabilizată la TP1, TP2 și TP3;
+- după TP1, restul este protejat la break-even;
+- rezultatul în R intră în jurnalul modelului;
+- observațiile recente au pondere mai mare;
+- scorul viitoarelor planuri similare este ajustat cu maximum ±12 puncte;
+- după minimum 8 rezultate, un model cu limită statistică slabă sau medie ponderată negativă este blocat.
+
+Primele rezultate sunt tratate ca perioadă de învățare, nu ca dovadă de validare. Învățarea adaptează scorurile; nu modifică singură regulile structurale și nu garantează profit.
+
+## Notificări Telegram
+
+Există două tipuri de mesaje:
+
+- `🗺️ PLAN SMC — INTRARE ÎN AȘTEPTARE`, implicit pentru scor adaptiv ≥ 78;
+- `🚨 PropTrader AI BUY/SELL`, după retest și confirmare M5.
+
+Ambele includ intervalul, Entry, SL, TP1–TP3, biasul și starea validării istorice. Pentru SMC, pragul specializat de notificare este `SMC_NOTIFY_PENDING_SCORE`; celelalte semnale folosesc `TELEGRAM_MIN_SCORE`.
 
 ## Actualizare pe Render
 
 1. Înlocuiește în GitHub fișierele proiectului cu cele din această arhivă.
-2. Fă un commit.
-3. În Render alege **Manual Deploy → Deploy latest commit**.
-4. Verifică adresa `/health`. Câmpul `version` trebuie să fie `17.1.0`, iar `analysisTimeframes` trebuie să conțină `5, 15, 30, 60, 240`.
+2. Fă un commit și alege în Render **Manual Deploy → Deploy latest commit**.
+3. Verifică `/health`: `version` trebuie să fie `18.1.0`.
+4. În pagina **Istoric & Backtest**, după ce există date M5, apasă **Construiește M15 · M30 · H1 · H4 · D1 din M5**.
 
-Variabile importante:
+Variabile recomandate:
 
 ```text
 ANALYSIS_TIMEFRAME=15
 ANALYSIS_TIMEFRAMES=5,15,30,60,240
-AUTO_PATTERN_SIGNALS=true
-PATTERN_SIGNAL_MIN_SAMPLES=50
-PATTERN_SIGNAL_MIN_PROBABILITY=75
-PATTERN_SIGNAL_MIN_SCORE=85
+SMC_ENABLED=true
+SMC_MIN_SCORE=68
+SMC_NOTIFY_PENDING_SCORE=78
+SMC_REQUIRE_M5_CONFIRMATION=true
+SMC_MAX_PENDING_PER_SYMBOL=15
+SMC_MIN_BLOCK_SAMPLES=8
+AUTO_TRACK_TRADES=true
 LIVE_MIN_ADAPTIVE_SCORE=72
 TELEGRAM_ENABLED=true
 TELEGRAM_MIN_SCORE=85
@@ -62,63 +81,69 @@ FMP_ENABLED=false
 NEWS_CALENDAR_UNAVAILABLE_RISK=35
 ```
 
-Păstrează în Render valorile deja configurate pentru `WEBHOOK_KEY`, `ADMIN_KEY`, `DATABASE_URL`, `TELEGRAM_BOT_TOKEN` și `TELEGRAM_CHAT_ID`. Nu pune cheile în GitHub.
+Păstrează valorile existente pentru `WEBHOOK_KEY`, `ADMIN_KEY`, `DATABASE_URL`, `TELEGRAM_BOT_TOKEN` și `TELEGRAM_CHAT_ID`. Nu publica secretele în GitHub.
 
-## Configurarea TradingView
+Migrarea bazei de date este automată la pornire: sunt create tabela `smc_setups` și câmpurile pentru atingerea TP1/TP2/TP3.
 
-TradingView salvează în alertă o copie a scriptului și a setărilor din momentul creării. De aceea alerta veche trebuie ștearsă și recreată după instalarea scriptului v17.1.
+## TradingView — colector și indicator vizual
 
-1. Deschide graficul instrumentului dorit pe **5 minute**.
-2. Adaugă în Pine Editor fișierul `PropTrader_AI_v17_M5_H4_Collector.pine`.
-3. Apasă **Add to chart**.
-4. Șterge alerta veche care folosește **Any alert() function call**.
-5. Creează o alertă nouă și alege condiția **Colector M5 — webhook fără notificări**.
-6. Alege frecvența **Once Per Bar Close**.
-7. La notificări păstrează bifat numai **Webhook URL**. Debifează notificarea în aplicație, popup/toast, e-mail și sunet.
-8. La Webhook URL introdu:
+Arhiva conține două scripturi Pine cu roluri separate:
+
+1. `PropTrader_AI_v17_M5_H4_Collector.pine` trimite lumânările M5 către server. Dacă alerta existentă funcționează numai prin Webhook URL, nu trebuie recreată.
+2. `PropTrader_AI_v18_1_SMC_Visual.pine` analizează local datele TradingView și desenează pe grafic:
+   - zona order block pentru intrare;
+   - linia Entry;
+   - SL;
+   - TP1, TP2 și TP3;
+   - direcția BUY/SELL, intervalul, BOS/CHOCH, starea PENDING/LIVE și scorul SMC;
+   - biasul D1 și H4 într-un panou.
+
+Indicatorul vizual verifică M5, M15, M30, H1 și H4 și, implicit, afișează planul activ cu scorul cel mai mare. Din setări poți forța afișarea unui singur interval.
+
+### Instalarea indicatorului vizual
+
+1. Deschide același instrument pe graficul de **5 minute**.
+2. În Pine Editor creează un indicator nou.
+3. Copiază integral conținutul fișierului `PropTrader_AI_v18_1_SMC_Visual.pine`.
+4. Apasă **Save**, apoi **Add to chart**.
+5. Lasă `Interval afișat = AUTO — cel mai bun`.
+6. Nu crea alertă pentru acest indicator. El nu conține `alertcondition()` și este numai pentru desenarea nivelurilor.
+
+Zona verde indică un plan BUY, iar zona roșie un plan SELL. Nivelurile sunt extinse spre dreapta și dispar când planul este invalidat, expiră sau TP3 este atins. Eticheta LIVE apare numai după atingerea Entry și o respingere confirmată pe M5.
+
+### Limită tehnică importantă
+
+Webhook-ul TradingView este un flux într-un singur sens: TradingView trimite lumânările către server, dar Pine nu poate citi direct răspunsul aplicației. Din acest motiv, indicatorul vizual reproduce local regulile structurale SMC, însă nu poate importa scorul adaptiv, filtrul de știri și rezultatele învățate de server.
+
+Pot exista mici diferențe între nivelurile desenate și mesajul Telegram din cauza feed-ului de preț, momentului de închidere și filtrelor adaptive. Pentru intrarea efectivă, mesajul Telegram al serverului rămâne reperul principal.
+
+### Alerta colectorului
+
+Pe graficul de 5 minute:
+
+- condiția alertei rămâne **Colector M5 — webhook fără notificări**;
+- frecvența rămâne **Once Per Bar Close**;
+- la notificări păstrează bifat numai **Webhook URL**;
+- debifează notificarea în aplicație, popup/toast, e-mail și sunet.
+
+Webhook:
 
 ```text
 https://ADRESA-TA-RENDER/webhook?key=WEBHOOK_KEY
 ```
 
-9. Lasă alerta activă. Indicatorul trimite numai lumânări M5 închise; serverul produce intervalele superioare.
+TradingView va înregistra tehnic un webhook la fiecare lumânare M5 deoarece acesta este fluxul de date. Nu trebuie să afișeze notificări utilizatorului pentru acele lumânări. Indicatorul vizual doar desenează; Telegram primește numai planurile și activările care trec filtrele serverului.
 
-Jurnalul tehnic al alertei va înregistra în continuare câte un webhook la închiderea fiecărei lumânări M5, deoarece serverul are nevoie de aceste date. Nu vei mai primi însă notificări vizibile TradingView. Numai setup-urile LIVE BUY/SELL validate sunt trimise pe Telegram, cu Entry, SL și TP1–TP3.
+## Știri
 
-Pentru mai multe instrumente, creează câte o alertă M5 pe fiecare grafic. Instrumentele acceptate de descărcarea Dukascopy sunt US30, XAUUSD și NAS100.
+FMP este oprit implicit. Astfel, cheia FMP fără acces la calendar nu mai produce repetat HTTP 402. Titlurile Federal Reserve și BLS funcționează fără chei; dacă nu există calendar anticipat, motorul aplică risc de siguranță în loc de risc zero.
 
-## Știri și calendar economic
-
-Implicit, aplicația folosește fluxurile oficiale Federal Reserve și U.S. Bureau of Labor Statistics, fără chei API. Acestea oferă titluri publicate, nu un calendar economic complet cu evenimente viitoare.
-
-De aceea, când titlurile sunt recente dar calendarul anticipat lipsește, motorul aplică `NEWS_CALENDAR_UNAVAILABLE_RISK=35` în loc să presupună risc zero. Pentru un calendar anticipat poți activa FMP numai dacă abonamentul tău permite endpoint-ul:
+Activează FMP numai dacă planul tău include endpoint-ul calendarului economic:
 
 ```text
 FMP_ENABLED=true
 FMP_API_KEY=cheia-ta
 ```
-
-Dacă planul nu include calendarul, lasă `FMP_ENABLED=false`; cheia poate rămâne în Render și nu va fi apelată.
-
-## Pregătirea istoricului multi-timeframe
-
-În pagina **Istoric & Backtest**:
-
-1. selectează instrumentul;
-2. descarcă istoricul M5;
-3. apasă **Construiește M15 · M30 · H1 · H4 din M5**;
-4. verifică seturile de date;
-5. rulează separat backtestul pentru fiecare interval.
-
-Semnalele statistice au nevoie de suficiente observații. Fără istoric, serverul colectează corect datele LIVE, dar nu forțează semnale premature.
-
-## Test Telegram
-
-În **Administrare** introdu `ADMIN_KEY`, instrumentul, prețul și intervalul, apoi:
-
-- **Test conexiune** verifică botul;
-- **Test semnal complet** trimite un mesaj demonstrativ cu Entry, SL și TP1–TP3;
-- testul complet nu este introdus în jurnalul real.
 
 ## Verificare locală
 
@@ -128,8 +153,4 @@ npm test
 npm start
 ```
 
-Aplicația folosește Node.js 20 sau mai nou.
-
-## Important
-
-Semnalele sunt estimări statistice, nu certitudini și nu garantează profit. Folosește paper trading până când fiecare instrument și fiecare interval are un backtest pozitiv pe date nevăzute și rezultate LIVE suficiente.
+Aplicația folosește Node.js 20 sau mai nou. Rulează întâi în paper trading și validează separat fiecare instrument și interval pe date nevăzute și rezultate live suficiente.

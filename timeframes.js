@@ -1,6 +1,15 @@
 "use strict";
 
 const SUPPORTED_ANALYSIS_TIMEFRAMES = Object.freeze(["5", "15", "30", "60", "240"]);
+const CONTEXT_TIMEFRAMES = Object.freeze(["240", "1440"]);
+const TIMEFRAME_LABELS = Object.freeze({
+  "5": "M5",
+  "15": "M15",
+  "30": "M30",
+  "60": "H1",
+  "240": "H4",
+  "1440": "D1"
+});
 
 const TIMEFRAME_PROFILES = Object.freeze({
   "5": Object.freeze({
@@ -59,7 +68,9 @@ function normalizeTimeframe(value, fallback = "") {
     H1: "60",
     "1H": "60",
     H4: "240",
-    "4H": "240"
+    "4H": "240",
+    D1: "1440",
+    "1D": "1440"
   };
   const normalized = aliases[raw] || raw.replace(/[^0-9]/g, "");
   return normalized || fallback;
@@ -76,7 +87,7 @@ function parseAnalysisTimeframes(value) {
 
 function timeframeLabel(value) {
   const normalized = normalizeTimeframe(value);
-  return TIMEFRAME_PROFILES[normalized]?.label || (normalized ? `M${normalized}` : "N/A");
+  return TIMEFRAME_LABELS[normalized] || (normalized ? `M${normalized}` : "N/A");
 }
 
 function profileFor(value, overrides = {}) {
@@ -114,6 +125,8 @@ function completedHigherTimeframes(barTime, sourceTimeframe = "5", targets = SUP
 
 module.exports = {
   SUPPORTED_ANALYSIS_TIMEFRAMES,
+  CONTEXT_TIMEFRAMES,
+  TIMEFRAME_LABELS,
   TIMEFRAME_PROFILES,
   normalizeTimeframe,
   parseAnalysisTimeframes,

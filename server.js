@@ -5,8 +5,11 @@ const { getHistoricalRates } = require("dukascopy-node");
 const telegram = require("./telegram");
 const { buildBacktest, auditBars, aggregateBars } = require("./backtest");
 const { fetchOfficialNews } = require("./news_feeds");
+const { findSmcSetups, evaluatePendingSetup } = require("./smc");
+const { outcomeR } = require("./trade_management");
 const {
   SUPPORTED_ANALYSIS_TIMEFRAMES,
+  CONTEXT_TIMEFRAMES,
   normalizeTimeframe,
   parseAnalysisTimeframes,
   timeframeLabel,
@@ -63,6 +66,12 @@ const TELEGRAM_SYSTEM_ALERTS = String(process.env.TELEGRAM_SYSTEM_ALERTS || "tru
 const NEWS_UNAVAILABLE_RISK = Math.max(0, Math.min(100, Number(process.env.NEWS_UNAVAILABLE_RISK || 55)));
 const NEWS_CALENDAR_UNAVAILABLE_RISK = Math.max(0, Math.min(100, Number(process.env.NEWS_CALENDAR_UNAVAILABLE_RISK || 35)));
 const NEWS_COUNTRIES = (process.env.NEWS_COUNTRIES || "US").split(",").map(x=>x.trim().toUpperCase()).filter(Boolean);
+const SMC_ENABLED = String(process.env.SMC_ENABLED || "true").toLowerCase() !== "false";
+const SMC_MIN_SCORE = Math.max(50, Math.min(95, Number(process.env.SMC_MIN_SCORE || 68)));
+const SMC_NOTIFY_PENDING_SCORE = Math.max(SMC_MIN_SCORE, Math.min(95, Number(process.env.SMC_NOTIFY_PENDING_SCORE || 78)));
+const SMC_REQUIRE_M5_CONFIRMATION = String(process.env.SMC_REQUIRE_M5_CONFIRMATION || "true").toLowerCase() !== "false";
+const SMC_MAX_PENDING_PER_SYMBOL = Math.max(3, Math.min(50, Number(process.env.SMC_MAX_PENDING_PER_SYMBOL || 15)));
+const SMC_MIN_BLOCK_SAMPLES = Math.max(5, Number(process.env.SMC_MIN_BLOCK_SAMPLES || 8));
 let lastNewsSync = null;
 let lastSuccessfulNewsSync = null;
 let lastNewsSyncError = "";
@@ -83,6 +92,7 @@ let memorySignals = [];
 let memoryNews = [];
 let memoryBars = [];
 let memoryPatterns = [];
+let memorySmcSetups = [];
 
 let historyDownloadJob = null;
 const HISTORY_CHUNK_DAYS = Math.max(7, Math.min(90, Number(process.env.HISTORY_CHUNK_DAYS || 30)));
@@ -206,7 +216,7 @@ async function buildSystemStatus() {
   const webhookAge = minutesSince(lastWebhookAt);
   return {
     ok: database.ok,
-    version: "17.1.0",
+    version: "18.1.0",
     database,
     webhook: {
       lastAt: lastWebhookAt,
@@ -224,6 +234,13 @@ async function buildSystemStatus() {
       minScore: PATTERN_SIGNAL_MIN_SCORE,
       analysisTimeframes: ANALYSIS_TIMEFRAMES,
       profiles: analysisProfilesPublic()
+    },
+    smc: {
+      enabled: SMC_ENABLED,
+      minScore: SMC_MIN_SCORE,
+      pendingNotificationScore: SMC_NOTIFY_PENDING_SCORE,
+      requireM5Confirmation: SMC_REQUIRE_M5_CONFIRMATION,
+      contextTimeframes: CONTEXT_TIMEFRAMES
     },
     lastBarAtByTimeframe: { ...lastBarAtByTimeframe },
     warnings: systemWarnings(),
@@ -284,7 +301,9 @@ async function initDb() {
     ["news_summary", "TEXT"], ["setup_key", "TEXT"],
     ["max_favorable_price", "NUMERIC"], ["max_adverse_price", "NUMERIC"], ["auto_closed", "BOOLEAN DEFAULT FALSE"],
     ["execution_mode", "TEXT DEFAULT 'WATCH'"], ["quality_score", "NUMERIC DEFAULT 0"],
-    ["confidence_lower", "NUMERIC DEFAULT 0"], ["decision_reason", "TEXT"], ["regime", "TEXT DEFAULT 'UNKNOWN'"]
+    ["confidence_lower", "NUMERIC DEFAULT 0"], ["decision_reason", "TEXT"], ["regime", "TEXT DEFAULT 'UNKNOWN'"],
+    ["tp1_hit_at", "TIMESTAMPTZ"], ["tp2_hit_at", "TIMESTAMPTZ"], ["tp3_hit_at", "TIMESTAMPTZ"],
+    ["best_target", "TEXT"], ["managed_stop", "NUMERIC"]
   ];
   for (const [name, type] of columns) {
     await pool.query(`ALTER TABLE signals ADD COLUMN IF NOT EXISTS ${name} ${type}`);
@@ -363,6 +382,63 @@ async function initDb() {
   await pool.query(`CREATE INDEX IF NOT EXISTS pattern_signals_created_idx ON pattern_signals(created_at DESC)`);
 
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS smc_setups (
+      id BIGSERIAL PRIMARY KEY,
+      external_id TEXT UNIQUE NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      expires_at TIMESTAMPTZ,
+      triggered_at TIMESTAMPTZ,
+      closed_at TIMESTAMPTZ,
+      symbol TEXT NOT NULL,
+      timeframe TEXT NOT NULL,
+      side TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'PENDING',
+      entry NUMERIC NOT NULL,
+      zone_low NUMERIC NOT NULL,
+      zone_high NUMERIC NOT NULL,
+      sl NUMERIC NOT NULL,
+      tp1 NUMERIC NOT NULL,
+      tp2 NUMERIC NOT NULL,
+      tp3 NUMERIC NOT NULL,
+      current_price NUMERIC,
+      score NUMERIC NOT NULL,
+      adaptive_score NUMERIC NOT NULL,
+      historical_probability NUMERIC,
+      learning_samples INTEGER DEFAULT 0,
+      news_risk INTEGER DEFAULT 0,
+      d1_bias TEXT,
+      h4_bias TEXT,
+      local_bias TEXT,
+      structure_event TEXT,
+      broken_level NUMERIC,
+      order_block_time TIMESTAMPTZ,
+      displacement BOOLEAN DEFAULT FALSE,
+      fvg BOOLEAN DEFAULT FALSE,
+      fvg_low NUMERIC,
+      fvg_high NUMERIC,
+      liquidity_sweep BOOLEAN DEFAULT FALSE,
+      sweep_level NUMERIC,
+      premium_discount TEXT,
+      mitigations INTEGER DEFAULT 0,
+      touch_count INTEGER DEFAULT 0,
+      volume_confirmed BOOLEAN DEFAULT FALSE,
+      model_key TEXT,
+      score_breakdown JSONB,
+      features JSONB,
+      reason TEXT,
+      pending_notified BOOLEAN DEFAULT FALSE,
+      signal_external_id TEXT,
+      terminal_reason TEXT
+    )
+  `);
+  for (const [name, type] of [["result", "TEXT"], ["pnl_r", "NUMERIC"]]) {
+    await pool.query(`ALTER TABLE smc_setups ADD COLUMN IF NOT EXISTS ${name} ${type}`);
+  }
+  await pool.query(`CREATE INDEX IF NOT EXISTS smc_setups_pending_idx ON smc_setups(symbol,status,expires_at)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS smc_setups_created_idx ON smc_setups(created_at DESC)`);
+
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS backtest_runs (
       id BIGSERIAL PRIMARY KEY,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -398,6 +474,8 @@ async function initDb() {
 }
 
 function setupKey(p) {
+  const explicit = clean(p.setup_key || p.model_key, 300);
+  if (explicit) return explicit;
   return [
     clean(p.symbol || "N/A", 30).toUpperCase(), clean(p.signal || p.side || "WAIT", 10).toUpperCase(),
     normalizeTimeframe(p.timeframe || p.interval, "N/A"),
@@ -569,19 +647,29 @@ async function trackSignalsWithBar(bar) {
     const favorable=side==="BUY"?hi:lo, adverse=side==="BUY"?lo:hi;
     let result=null, exitPrice=0;
     const slHit=sl>0 && (side==="BUY"?lo<=sl:hi>=sl);
+    const beHit=side==="BUY"?lo<=entry:hi>=entry;
     const tp3Hit=tp3>0 && (side==="BUY"?hi>=tp3:lo<=tp3);
     const tp2Hit=tp2>0 && (side==="BUY"?hi>=tp2:lo<=tp2);
     const tp1Hit=tp1>0 && (side==="BUY"?hi>=tp1:lo<=tp1);
-    // Conservator: dacă aceeași lumânare atinge și SL, și TP, se consideră SL deoarece ordinea intrabar nu este cunoscută.
-    if(slHit){result="SL";exitPrice=sl;}
+    const hadTp1=Boolean(s.tp1_hit_at), hadTp2=Boolean(s.tp2_hit_at);
+    const hitAt=new Date().toISOString();
+    const targetUpdates={};
+    if(tp1Hit&&!hadTp1){targetUpdates.tp1_hit_at=hitAt;targetUpdates.best_target="TP1";targetUpdates.managed_stop=entry;}
+    if(tp2Hit&&!hadTp2){targetUpdates.tp1_hit_at=targetUpdates.tp1_hit_at||s.tp1_hit_at||hitAt;targetUpdates.tp2_hit_at=hitAt;targetUpdates.best_target="TP2";targetUpdates.managed_stop=entry;}
+    if(tp3Hit){targetUpdates.tp1_hit_at=targetUpdates.tp1_hit_at||s.tp1_hit_at||hitAt;targetUpdates.tp2_hit_at=targetUpdates.tp2_hit_at||s.tp2_hit_at||hitAt;targetUpdates.tp3_hit_at=hitAt;targetUpdates.best_target="TP3";targetUpdates.managed_stop=entry;}
+    // Conservator: înainte de primul target, dacă aceeași lumânare atinge și SL și TP, ordinea este necunoscută și se consideră SL.
+    if(slHit&&!hadTp1){result="SL";exitPrice=sl;}
     else if(tp3Hit){result="TP3";exitPrice=tp3;}
-    else if(tp2Hit){result="TP2";exitPrice=tp2;}
-    else if(tp1Hit){result="TP1";exitPrice=tp1;}
+    else if(hadTp2&&beHit){result="TP2_BE";exitPrice=entry;}
+    else if(hadTp1&&beHit){result="TP1_BE";exitPrice=entry;}
     if(!pool){
       const item=memorySignals.find(x=>x.external_id===s.external_id);
-      if(item){item.max_favorable_price=side==="BUY"?Math.max(num(item.max_favorable_price,entry),favorable):Math.min(num(item.max_favorable_price,entry),favorable);item.max_adverse_price=side==="BUY"?Math.min(num(item.max_adverse_price,entry),adverse):Math.max(num(item.max_adverse_price,entry),adverse);}
+      if(item){item.max_favorable_price=side==="BUY"?Math.max(num(item.max_favorable_price,entry),favorable):Math.min(num(item.max_favorable_price,entry),favorable);item.max_adverse_price=side==="BUY"?Math.min(num(item.max_adverse_price,entry),adverse):Math.max(num(item.max_adverse_price,entry),adverse);Object.assign(item,targetUpdates);}
     }else{
       await pool.query(`UPDATE signals SET max_favorable_price=CASE WHEN signal='BUY' THEN GREATEST(COALESCE(max_favorable_price,price),$1) ELSE LEAST(COALESCE(max_favorable_price,price),$1) END,max_adverse_price=CASE WHEN signal='BUY' THEN LEAST(COALESCE(max_adverse_price,price),$2) ELSE GREATEST(COALESCE(max_adverse_price,price),$2) END WHERE external_id=$3`,[favorable,adverse,s.external_id]);
+      if(Object.keys(targetUpdates).length){
+        await pool.query(`UPDATE signals SET tp1_hit_at=COALESCE(tp1_hit_at,$1),tp2_hit_at=COALESCE(tp2_hit_at,$2),tp3_hit_at=COALESCE(tp3_hit_at,$3),best_target=$4,managed_stop=$5 WHERE external_id=$6`,[targetUpdates.tp1_hit_at||null,targetUpdates.tp2_hit_at||null,targetUpdates.tp3_hit_at||null,targetUpdates.best_target||s.best_target||null,targetUpdates.managed_stop||s.managed_stop||null,s.external_id]);
+      }
     }
     if(result){
       const closed=await closeSignal({external_id:s.external_id,result,exit_price:exitPrice});
@@ -875,7 +963,11 @@ async function barsBetween(symbol, timeframe, from, to) {
 
 async function deriveCompletedHigherBars(m5Bar) {
   if (String(m5Bar.timeframe) !== "5") return [];
-  const targets = completedHigherTimeframes(m5Bar.bar_time, "5", ANALYSIS_TIMEFRAMES);
+  const targets = completedHigherTimeframes(
+    m5Bar.bar_time,
+    "5",
+    [...new Set([...ANALYSIS_TIMEFRAMES, ...CONTEXT_TIMEFRAMES])].sort((a, b) => num(a) - num(b))
+  );
   const derived = [];
   for (const target of targets) {
     const targetMs = Number(target) * 60000;
@@ -898,9 +990,11 @@ async function deriveCompletedHigherBars(m5Bar) {
 async function processNewBar(bar, { trackTrades = true } = {}) {
   lastBarAtByTimeframe[bar.timeframe] = bar.bar_time;
   const autoClosed = trackTrades ? await trackSignalsWithBar(bar) : [];
+  const smcLifecycle = trackTrades ? await processPendingSmcSetups(bar) : { updates: [], activatedSignals: [] };
   if (!ANALYSIS_TIMEFRAMES.includes(String(bar.timeframe))) {
-    return { bar, analyzed: false, autoClosed, pattern: null, generatedSignal: null };
+    return { bar, analyzed: false, autoClosed, pattern: null, generatedSignal: null, smcSetups: [], smcUpdates: smcLifecycle.updates, smcActivatedSignals: smcLifecycle.activatedSignals };
   }
+  const smcSetups = await discoverSmcSetupsForBar(bar);
   const pattern = await analyzeTimePattern(bar);
   const patternInserted = pattern ? await savePattern(pattern) : false;
   let generatedSignal = null;
@@ -917,7 +1011,10 @@ async function processNewBar(bar, { trackTrades = true } = {}) {
     analyzed: true,
     autoClosed,
     pattern: patternInserted ? pattern : null,
-    generatedSignal
+    generatedSignal,
+    smcSetups,
+    smcUpdates: smcLifecycle.updates,
+    smcActivatedSignals: smcLifecycle.activatedSignals
   };
 }
 
@@ -932,6 +1029,230 @@ async function savePattern(p) {
 async function listPatterns(limit=100){
   if(!pool)return memoryPatterns.slice(0,limit);
   return (await pool.query(`SELECT * FROM pattern_signals ORDER BY created_at DESC LIMIT $1`,[limit])).rows;
+}
+
+async function pendingSmcSetupsForSymbol(symbol) {
+  if (!pool) {
+    return memorySmcSetups
+      .filter(item => item.symbol === symbol && item.status === "PENDING")
+      .sort((a, b) => num(b.adaptive_score) - num(a.adaptive_score))
+      .slice(0, SMC_MAX_PENDING_PER_SYMBOL);
+  }
+  return (await pool.query(
+    `SELECT * FROM smc_setups
+     WHERE symbol=$1 AND status='PENDING'
+     ORDER BY adaptive_score DESC, created_at DESC
+     LIMIT $2`,
+    [symbol, SMC_MAX_PENDING_PER_SYMBOL]
+  )).rows;
+}
+
+async function listSmcSetups({ status = "", symbol = "", limit = 150 } = {}) {
+  const normalizedStatus = clean(status, 20).toUpperCase();
+  const normalizedSymbol = clean(symbol, 30).toUpperCase();
+  const safeLimit = Math.min(500, Math.max(1, num(limit, 150)));
+  if (!pool) {
+    return memorySmcSetups
+      .filter(item => !normalizedStatus || item.status === normalizedStatus)
+      .filter(item => !normalizedSymbol || item.symbol === normalizedSymbol)
+      .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
+      .slice(0, safeLimit);
+  }
+  const conditions = [];
+  const values = [];
+  if (normalizedStatus) { values.push(normalizedStatus); conditions.push(`status=$${values.length}`); }
+  if (normalizedSymbol) { values.push(normalizedSymbol); conditions.push(`symbol=$${values.length}`); }
+  values.push(safeLimit);
+  return (await pool.query(
+    `SELECT * FROM smc_setups ${conditions.length ? `WHERE ${conditions.join(" AND ")}` : ""}
+     ORDER BY created_at DESC LIMIT $${values.length}`,
+    values
+  )).rows;
+}
+
+async function updateSmcSetup(externalId, updates) {
+  const allowed = new Set([
+    "status", "updated_at", "triggered_at", "closed_at", "touch_count",
+    "pending_notified", "signal_external_id", "terminal_reason"
+  ]);
+  const safe = Object.fromEntries(Object.entries(updates).filter(([key]) => allowed.has(key)));
+  if (!Object.keys(safe).length) return null;
+  safe.updated_at = safe.updated_at || new Date().toISOString();
+  if (!pool) {
+    const item = memorySmcSetups.find(setup => setup.external_id === externalId);
+    if (!item) return null;
+    Object.assign(item, safe);
+    return item;
+  }
+  const entries = Object.entries(safe);
+  const values = entries.map(([, value]) => value);
+  values.push(externalId);
+  const assignments = entries.map(([key], index) => `${key}=$${index + 1}`).join(",");
+  return (await pool.query(
+    `UPDATE smc_setups SET ${assignments} WHERE external_id=$${values.length} RETURNING *`,
+    values
+  )).rows[0] || null;
+}
+
+async function notifyTelegramPendingSetup(setup) {
+  if (!telegram.status().configured) return { skipped: true, reason: "Telegram neconfigurat" };
+  if (num(setup.adaptive_score) < SMC_NOTIFY_PENDING_SCORE) return { skipped: true, reason: "scor plan sub prag" };
+  if (num(setup.news_risk) > MAX_NEWS_RISK_LIVE) return { skipped: true, reason: "risc știri prea mare" };
+  try {
+    const result = await telegram.sendPendingSetup(setup);
+    lastTelegramAt = new Date().toISOString();
+    lastTelegramResult = `PLAN SMC ${setup.side} ${setup.symbol} ${timeframeLabel(setup.timeframe)}, mesaj ${result.message_id}`;
+    await updateSmcSetup(setup.external_id, { pending_notified: true });
+    await logTelegram({ status: "SMC_PENDING", messageId: result.message_id, details: lastTelegramResult });
+    return { skipped: false, messageId: result.message_id };
+  } catch (error) {
+    lastTelegramAt = new Date().toISOString();
+    lastTelegramResult = `EROARE PLAN SMC: ${error.message}`;
+    await logTelegram({ status: "ERROR", details: lastTelegramResult }).catch(() => {});
+    throw error;
+  }
+}
+
+async function saveSmcSetup(setup) {
+  const performance = await setupPerformance(setup.model_key);
+  const news = await recentNewsRisk(setup.symbol);
+  setup.learning_samples = performance.samples;
+  setup.historical_probability = performance.samples >= 5 ? Number(performance.weightedWinRate.toFixed(2)) : null;
+  setup.adaptive_score = Math.max(0, Math.min(100, Number((setup.score + performance.adjustment).toFixed(2))));
+  setup.news_risk = news.risk;
+  if (!pool) {
+    if (memorySmcSetups.some(item => item.external_id === setup.external_id)) return { inserted: false, setup };
+    memorySmcSetups.unshift({ id: Date.now(), pending_notified: false, ...setup });
+    memorySmcSetups = memorySmcSetups.slice(0, 2000);
+    return { inserted: true, setup: memorySmcSetups[0] };
+  }
+  const result = await pool.query(`
+    INSERT INTO smc_setups (
+      external_id,created_at,updated_at,expires_at,symbol,timeframe,side,status,
+      entry,zone_low,zone_high,sl,tp1,tp2,tp3,current_price,score,adaptive_score,
+      historical_probability,learning_samples,news_risk,d1_bias,h4_bias,local_bias,
+      structure_event,broken_level,order_block_time,displacement,fvg,fvg_low,fvg_high,
+      liquidity_sweep,sweep_level,premium_discount,mitigations,touch_count,volume_confirmed,
+      model_key,score_breakdown,features,reason
+    ) VALUES (${Array.from({length:41},(_,index)=>`$${index+1}`).join(",")})
+    ON CONFLICT DO NOTHING RETURNING *
+  `, [
+    setup.external_id,setup.created_at,setup.updated_at,setup.expires_at,setup.symbol,setup.timeframe,setup.side,setup.status,
+    setup.entry,setup.zone_low,setup.zone_high,setup.sl,setup.tp1,setup.tp2,setup.tp3,setup.current_price,setup.score,setup.adaptive_score,
+    setup.historical_probability,setup.learning_samples,setup.news_risk,setup.d1_bias,setup.h4_bias,setup.local_bias,
+    setup.structure_event,setup.broken_level,setup.order_block_time,setup.displacement,setup.fvg,setup.fvg_low,setup.fvg_high,
+    setup.liquidity_sweep,setup.sweep_level,setup.premium_discount,setup.mitigations,setup.touch_count,setup.volume_confirmed,
+    setup.model_key,JSON.stringify(setup.score_breakdown),JSON.stringify(setup.features),setup.reason
+  ]);
+  return { inserted: result.rowCount > 0, setup: result.rows[0] || setup };
+}
+
+function smcSetupToSignal(setup, activationReason) {
+  const confluences = [
+    setup.structure_event,
+    setup.fvg ? "FVG" : "",
+    setup.liquidity_sweep ? "LIQUIDITY_SWEEP" : "",
+    setup.premium_discount,
+    "ORDER_BLOCK_CONFIRMED"
+  ].filter(Boolean).join("+");
+  return normalizeSignal({
+    external_id: `SMC-LIVE-${setup.external_id}`,
+    setup_key: setup.model_key,
+    symbol: setup.symbol,
+    timeframe: setup.timeframe,
+    signal: setup.side,
+    price: setup.entry,
+    sl: setup.sl,
+    tp1: setup.tp1,
+    tp2: setup.tp2,
+    tp3: setup.tp3,
+    score: setup.score,
+    probability: setup.historical_probability || 0,
+    atr: Math.abs(num(setup.entry) - num(setup.sl)),
+    rr: 4,
+    trend: `D1 ${setup.d1_bias} / H4 ${setup.h4_bias}`,
+    structure: `SMC_${setup.structure_event}_${setup.premium_discount}`,
+    session: `SMC ${timeframeLabel(setup.timeframe)}`,
+    mtf_confirm: setup.d1_bias === (setup.side === "BUY" ? "BULLISH" : "BEARISH") || setup.h4_bias === (setup.side === "BUY" ? "BULLISH" : "BEARISH"),
+    mtf_trend: `D1 ${setup.d1_bias} · H4 ${setup.h4_bias}`,
+    order_block: `${setup.zone_low}–${setup.zone_high}`,
+    bos: setup.structure_event === "BOS",
+    choch: setup.structure_event === "CHOCH",
+    fvg: bool(setup.fvg),
+    liquidity_sweep: bool(setup.liquidity_sweep),
+    order_block_confirm: true,
+    market_phase: "SMC_RETRACEMENT",
+    premium_discount: setup.premium_discount,
+    fvg_state: setup.fvg ? "IMBALANCE_CONFIRMAT" : "FĂRĂ_FVG",
+    ob_state: "MITIGAT_CU_CONFIRMĂRE_M5",
+    score_breakdown: safeJson(setup.score_breakdown),
+    reason: `${setup.reason} Activare: ${activationReason}. Confluențe: ${confluences}. Eșantion propriu pentru acest model: N=${num(setup.learning_samples)}.`
+  });
+}
+
+async function processPendingSmcSetups(bar) {
+  if (!SMC_ENABLED || String(bar.timeframe) !== "5") return { updates: [], activatedSignals: [] };
+  const setups = await pendingSmcSetupsForSymbol(bar.symbol);
+  const updates = [];
+  const activatedSignals = [];
+  for (const setup of setups) {
+    const evaluation = evaluatePendingSetup(setup, bar, { requireConfirmation: SMC_REQUIRE_M5_CONFIRMATION });
+    if (evaluation.action === "KEEP") continue;
+    if (evaluation.action === "TOUCH") {
+      const updated = await updateSmcSetup(setup.external_id, { touch_count: evaluation.touchCount, terminal_reason: evaluation.reason });
+      if (updated) updates.push(updated);
+      continue;
+    }
+    if (evaluation.action === "EXPIRE" || evaluation.action === "CANCEL") {
+      const status = evaluation.action === "EXPIRE" ? "EXPIRED" : "CANCELLED";
+      const updated = await updateSmcSetup(setup.external_id, { status, closed_at: new Date().toISOString(), terminal_reason: evaluation.reason, touch_count: evaluation.touchCount || setup.touch_count });
+      if (updated) updates.push(updated);
+      continue;
+    }
+    if (evaluation.action === "TRIGGER") {
+      const candidate = smcSetupToSignal(setup, evaluation.reason);
+      const inserted = await saveSignal(candidate);
+      const updated = await updateSmcSetup(setup.external_id, {
+        status: inserted ? "TRIGGERED" : "DUPLICATE",
+        triggered_at: new Date().toISOString(),
+        touch_count: evaluation.touchCount,
+        signal_external_id: candidate.external_id,
+        terminal_reason: evaluation.reason
+      });
+      if (updated) updates.push(updated);
+      if (inserted) {
+        activatedSignals.push(candidate);
+        notifyTelegramSignal(candidate).catch(error => console.error("[TELEGRAM SMC LIVE]", error.message));
+      }
+    }
+  }
+  return { updates, activatedSignals };
+}
+
+async function discoverSmcSetupsForBar(bar) {
+  if (!SMC_ENABLED || !ANALYSIS_TIMEFRAMES.includes(String(bar.timeframe))) return [];
+  const [bars, h4Bars, d1Bars] = await Promise.all([
+    recentBars(bar.symbol, bar.timeframe, 600),
+    recentBars(bar.symbol, "240", 300),
+    recentBars(bar.symbol, "1440", 260)
+  ]);
+  const candidates = findSmcSetups({
+    symbol: bar.symbol,
+    timeframe: bar.timeframe,
+    bars,
+    h4Bars,
+    d1Bars,
+    now: new Date(),
+    config: { minScore: SMC_MIN_SCORE }
+  });
+  const inserted = [];
+  for (const candidate of candidates) {
+    const saved = await saveSmcSetup(candidate);
+    if (!saved.inserted) continue;
+    inserted.push(saved.setup);
+    notifyTelegramPendingSetup(saved.setup).catch(error => console.error("[TELEGRAM SMC PENDING]", error.message));
+  }
+  return inserted;
 }
 
 async function archiveOldSignals() {
@@ -1000,15 +1321,22 @@ async function saveSignal(s) {
   s.confidence_lower = Number(perf.lowerBound.toFixed(2));
   s.regime = classifyRegimeFromSignal(s);
   const proven = perf.samples >= LEARNING_MIN_SAMPLES && perf.lowerBound >= 50 && perf.weightedAvgR > 0;
+  const statisticallyBlocked = perf.samples >= SMC_MIN_BLOCK_SAMPLES && (perf.lowerBound < 38 || perf.weightedAvgR <= -0.15);
   const liveAllowed = s.adaptive_score >= LIVE_MIN_ADAPTIVE_SCORE && news.risk <= MAX_NEWS_RISK_LIVE && lossStreak < MAX_CONSECUTIVE_LOSSES;
-  s.execution_mode = liveAllowed && (proven || perf.samples===0) ? "LIVE" : "WATCH";
+  s.execution_mode = liveAllowed && !statisticallyBlocked ? "LIVE" : "WATCH";
   s.quality_score = Math.max(0,Math.min(100,Number((s.adaptive_score + (proven?5:0) - (s.regime==="RANGE"?5:0)).toFixed(2))));
   const reasons=[];
   if(s.adaptive_score<LIVE_MIN_ADAPTIVE_SCORE)reasons.push(`scor sub ${LIVE_MIN_ADAPTIVE_SCORE}`);
   if(news.risk>MAX_NEWS_RISK_LIVE)reasons.push(`risc știri ${news.risk}/100`);
   if(lossStreak>=MAX_CONSECUTIVE_LOSSES)reasons.push(`circuit breaker după ${lossStreak} pierderi consecutive`);
-  if(perf.samples>0&&!proven)reasons.push(`setup neconfirmat statistic: N=${perf.samples}, limită inferioară ${perf.lowerBound.toFixed(1)}%`);
-  s.decision_reason = reasons.length ? reasons.join("; ") : (perf.samples===0 ? "Mod inițial: fără istoric propriu; urmărește cu risc redus." : "Criteriile de calitate sunt îndeplinite.");
+  if(statisticallyBlocked)reasons.push(`model blocat de rezultate slabe: N=${perf.samples}, limită inferioară ${perf.lowerBound.toFixed(1)}%, medie ponderată ${perf.weightedAvgR.toFixed(2)}R`);
+  s.decision_reason = reasons.length
+    ? reasons.join("; ")
+    : perf.samples===0
+      ? "Mod inițial: fără istoric propriu; folosește risc redus până la validare."
+      : proven
+        ? `Model confirmat pe ${perf.samples} rezultate proprii.`
+        : `Învățare activă: N=${perf.samples}, ajustare ${perf.adjustment.toFixed(2)} puncte; nu există încă dovadă suficientă pentru eticheta „validat”.`;
 
   if (!pool) {
     if (memorySignals.some(x => x.external_id === s.external_id)) return false;
@@ -1106,15 +1434,35 @@ async function closeSignal(payload) {
   const externalId = clean(payload.external_id || payload.signal_id, 120);
   const result = clean(payload.result, 20).toUpperCase();
   if (!externalId) throw new Error("Lipsește external_id");
-  if (!["TP1","TP2","TP3","SL","BE","CLOSED","EXPIRED"].includes(result)) throw new Error("Rezultat invalid");
-  const pnlMap = {TP1:1.5,TP2:2.5,TP3:3.5,SL:-1,BE:0,EXPIRED:0};
-  const pnlR = result === "CLOSED" ? num(payload.pnl_r) : pnlMap[result];
+  if (!["TP1","TP2","TP3","TP1_BE","TP2_BE","SL","BE","CLOSED","EXPIRED"].includes(result)) throw new Error("Rezultat invalid");
+  let signal;
+  if (!pool) signal = memorySignals.find(item => item.external_id === externalId);
+  else signal = (await pool.query(`SELECT * FROM signals WHERE external_id=$1`, [externalId])).rows[0];
+  if (!signal) throw new Error("Semnal negăsit");
+  const entry = num(signal.price);
+  const sl = num(signal.sl);
+  const resultPrice = result === "SL" ? sl
+    : result === "TP1" ? num(signal.tp1)
+    : result === "TP2" ? num(signal.tp2)
+    : result === "TP3" ? num(signal.tp3)
+    : num(payload.exit_price, entry);
+  const pnlR = outcomeR(signal, result, payload);
   if (!pool) {
-    const item = memorySignals.find(x=>x.external_id===externalId); if (!item) throw new Error("Semnal negăsit");
-    Object.assign(item,{status:"CLOSED",result,pnl_r:pnlR,exit_price:num(payload.exit_price),closed_at:new Date().toISOString()}); return item;
+    const closedAt = new Date().toISOString();
+    Object.assign(signal,{status:"CLOSED",result,pnl_r:pnlR,exit_price:resultPrice,closed_at:closedAt});
+    const setup = memorySmcSetups.find(item => item.signal_external_id === externalId);
+    if (setup) Object.assign(setup,{status:"CLOSED",result,pnl_r:pnlR,closed_at:closedAt,updated_at:closedAt,terminal_reason:`Rezultat ${result}: ${pnlR.toFixed(2)}R`});
+    return signal;
   }
-  const q = await pool.query(`UPDATE signals SET status='CLOSED',result=$1,pnl_r=$2,exit_price=$3,closed_at=NOW() WHERE external_id=$4 RETURNING *`,[result,pnlR,num(payload.exit_price),externalId]);
-  if (!q.rows.length) throw new Error("Semnal negăsit"); return q.rows[0];
+  const q = await pool.query(`UPDATE signals SET status='CLOSED',result=$1,pnl_r=$2,exit_price=$3,closed_at=NOW() WHERE external_id=$4 RETURNING *`,[result,pnlR,resultPrice,externalId]);
+  if (!q.rows.length) throw new Error("Semnal negăsit");
+  await pool.query(
+    `UPDATE smc_setups
+     SET status='CLOSED',result=$1,pnl_r=$2,closed_at=NOW(),updated_at=NOW(),terminal_reason=$3
+     WHERE signal_external_id=$4`,
+    [result,pnlR,`Rezultat ${result}: ${pnlR.toFixed(2)}R`,externalId]
+  );
+  return q.rows[0];
 }
 
 function parseBody(req) {
@@ -1218,9 +1566,11 @@ async function logTelegram({ signal = null, status, messageId = null, details = 
 
 async function notifyTelegramSignal(signal) {
   const effectiveScore = num(signal.adaptive_score ?? signal.score);
+  const isSmcActivation = String(signal.external_id || "").startsWith("SMC-LIVE-");
+  const notificationThreshold = isSmcActivation ? SMC_NOTIFY_PENDING_SCORE : telegram.MIN_SCORE;
   if (!telegram.status().configured) { lastTelegramResult = "OMIS: Telegram neconfigurat"; return { skipped:true, reason:lastTelegramResult }; }
   if (signal.execution_mode !== "LIVE") { lastTelegramResult = `OMIS ${signal.external_id}: execution_mode=${signal.execution_mode}`; return { skipped:true, reason:lastTelegramResult }; }
-  if (effectiveScore < telegram.MIN_SCORE) { lastTelegramResult = `OMIS ${signal.external_id}: scor ${effectiveScore} sub ${telegram.MIN_SCORE}`; return { skipped:true, reason:lastTelegramResult }; }
+  if (effectiveScore < notificationThreshold) { lastTelegramResult = `OMIS ${signal.external_id}: scor ${effectiveScore} sub ${notificationThreshold}`; return { skipped:true, reason:lastTelegramResult }; }
   try {
     const result = await telegram.sendSignal(signal);
     lastTelegramAt = new Date().toISOString();
@@ -1235,7 +1585,7 @@ async function notifyTelegramSignal(signal) {
   }
 }
 
-app.get("/health", (req,res)=>res.json({ok:true,version:"17.1.0",database:pool?"postgres":"memory",archiveAfterHours:ARCHIVE_AFTER_HOURS,adminKeyConfigured:Boolean(ADMIN_KEY),newsWebhookConfigured:Boolean(NEWS_WEBHOOK_KEY),officialNewsEnabled:OFFICIAL_NEWS_ENABLED,fmpEnabled:FMP_ENABLED,fmpKeyConfigured:Boolean(FMP_API_KEY),fmpConfigured:FMP_ENABLED&&Boolean(FMP_API_KEY),alphaVantageConfigured:Boolean(ALPHAVANTAGE_API_KEY),finnhubConfigured:Boolean(FINNHUB_API_KEY),autoTrackTrades:AUTO_TRACK_TRADES,lastNewsSync,lastSuccessfulNewsSync,lastNewsSyncError,newsProviders:lastNewsProviderResults,newsCoverage:newsCoverageStatus(),patternMinSamples:PATTERN_MIN_SAMPLES,patternMinProbability:PATTERN_MIN_PROBABILITY,analysisTimeframe:ANALYSIS_TIMEFRAME,analysisTimeframes:ANALYSIS_TIMEFRAMES,analysisProfiles:analysisProfilesPublic(),lastBarAtByTimeframe:{...lastBarAtByTimeframe},autoPatternSignals:AUTO_PATTERN_SIGNALS,patternSignalMinSamples:PATTERN_SIGNAL_MIN_SAMPLES,patternSignalMinProbability:PATTERN_SIGNAL_MIN_PROBABILITY,patternSignalMinScore:PATTERN_SIGNAL_MIN_SCORE,liveMinAdaptiveScore:LIVE_MIN_ADAPTIVE_SCORE,learningMinSamples:LEARNING_MIN_SAMPLES,maxNewsRiskLive:MAX_NEWS_RISK_LIVE,maxConsecutiveLosses:MAX_CONSECUTIVE_LOSSES,webhookStaleMinutes:WEBHOOK_STALE_MINUTES,telegramSystemAlerts:TELEGRAM_SYSTEM_ALERTS,telegram:telegram.status(),lastTelegramAt,lastTelegramResult,lastSystemAlertAt,lastWebhookAt,lastWebhookResult,warnings:systemWarnings(),time:new Date().toISOString()}));
+app.get("/health", (req,res)=>res.json({ok:true,version:"18.1.0",database:pool?"postgres":"memory",archiveAfterHours:ARCHIVE_AFTER_HOURS,adminKeyConfigured:Boolean(ADMIN_KEY),newsWebhookConfigured:Boolean(NEWS_WEBHOOK_KEY),officialNewsEnabled:OFFICIAL_NEWS_ENABLED,fmpEnabled:FMP_ENABLED,fmpKeyConfigured:Boolean(FMP_API_KEY),fmpConfigured:FMP_ENABLED&&Boolean(FMP_API_KEY),alphaVantageConfigured:Boolean(ALPHAVANTAGE_API_KEY),finnhubConfigured:Boolean(FINNHUB_API_KEY),autoTrackTrades:AUTO_TRACK_TRADES,lastNewsSync,lastSuccessfulNewsSync,lastNewsSyncError,newsProviders:lastNewsProviderResults,newsCoverage:newsCoverageStatus(),patternMinSamples:PATTERN_MIN_SAMPLES,patternMinProbability:PATTERN_MIN_PROBABILITY,analysisTimeframe:ANALYSIS_TIMEFRAME,analysisTimeframes:ANALYSIS_TIMEFRAMES,analysisProfiles:analysisProfilesPublic(),contextTimeframes:CONTEXT_TIMEFRAMES,lastBarAtByTimeframe:{...lastBarAtByTimeframe},autoPatternSignals:AUTO_PATTERN_SIGNALS,patternSignalMinSamples:PATTERN_SIGNAL_MIN_SAMPLES,patternSignalMinProbability:PATTERN_SIGNAL_MIN_PROBABILITY,patternSignalMinScore:PATTERN_SIGNAL_MIN_SCORE,smcEnabled:SMC_ENABLED,smcMinScore:SMC_MIN_SCORE,smcNotifyPendingScore:SMC_NOTIFY_PENDING_SCORE,smcRequireM5Confirmation:SMC_REQUIRE_M5_CONFIRMATION,liveMinAdaptiveScore:LIVE_MIN_ADAPTIVE_SCORE,learningMinSamples:LEARNING_MIN_SAMPLES,maxNewsRiskLive:MAX_NEWS_RISK_LIVE,maxConsecutiveLosses:MAX_CONSECUTIVE_LOSSES,webhookStaleMinutes:WEBHOOK_STALE_MINUTES,telegramSystemAlerts:TELEGRAM_SYSTEM_ALERTS,telegram:telegram.status(),lastTelegramAt,lastTelegramResult,lastSystemAlertAt,lastWebhookAt,lastWebhookResult,warnings:systemWarnings(),time:new Date().toISOString()}));
 app.get("/api/system-status", async(req,res)=>{try{res.json(await buildSystemStatus());}catch(e){res.status(500).json({ok:false,error:e.message});}});
 
 app.get("/api/signals", async(req,res)=>{ try { const mode=req.query.mode==="archive"?"archive":"active"; res.json({ok:true,mode,signals:await listSignals(mode,req.query),analytics:await analytics()}); } catch(e){ console.error(e); res.status(500).json({ok:false,error:e.message}); } });
@@ -1278,16 +1628,21 @@ app.post("/api/test-signal",async(req,res)=>{ if(!requireAdmin(req,res))return; 
   const timeframe=normalizeTimeframe(req.body.timeframe||ANALYSIS_TIMEFRAME,ANALYSIS_TIMEFRAME);
   const s=normalizeSignal({external_id:`TEST-${Date.now()}`,symbol:clean(req.body.symbol||"US30",30),timeframe,signal:side,price,
     sl:side==="BUY"?price-risk:price+risk,tp1:side==="BUY"?price+risk*1.5:price-risk*1.5,tp2:side==="BUY"?price+risk*2.5:price-risk*2.5,tp3:side==="BUY"?price+risk*3.5:price-risk*3.5,
-    score:88,probability:79,rsi:58.4,atr,rr:3.5,trend:side==="BUY"?"Bullish":"Bearish",structure:`${side} test`,session:"New York",bos:true,fvg:true,liquidity_sweep:true,vwap_confirm:true,mtf_confirm:true,market_phase:"Expansion",premium_discount:side==="BUY"?"Discount":"Premium",reason:`Semnal demonstrativ v17 ${timeframeLabel(timeframe)} la preț introdus manual.`});
+    score:88,probability:79,rsi:58.4,atr,rr:3.5,trend:side==="BUY"?"Bullish":"Bearish",structure:`${side} test`,session:"New York",bos:true,fvg:true,liquidity_sweep:true,vwap_confirm:true,mtf_confirm:true,market_phase:"Expansion",premium_discount:side==="BUY"?"Discount":"Premium",reason:`Semnal demonstrativ v18 ${timeframeLabel(timeframe)} la preț introdus manual.`});
   await saveSignal(s);res.json({ok:true,signal:s});
 }catch(e){res.status(400).json({ok:false,error:e.message});} });
 
 app.post("/api/test-news",async(req,res)=>{ if(!requireAdmin(req,res))return; try{const n=normalizeNews({external_id:`NEWS-${Date.now()}`,title:"FOMC interest rate decision and Powell press conference",summary:"High-impact Federal Reserve event may increase volatility in US indices and gold.",source:"PropTrader test",symbols:["US30","NAS100","XAUUSD"],impact:90});await saveNews(n);res.json({ok:true,news:n});}catch(e){res.status(500).json({ok:false,error:e.message});} });
 
 app.post("/api/manual-close",async(req,res)=>{if(!requireAdmin(req,res))return;try{res.json({ok:true,closed:await closeSignal(req.body)});}catch(e){res.status(400).json({ok:false,error:e.message});}});
-app.post("/api/clear",async(req,res)=>{if(!requireAdmin(req,res))return;try{if(pool){await pool.query("DELETE FROM signals");await pool.query("DELETE FROM news_events");await pool.query("DELETE FROM pattern_signals");await pool.query("DELETE FROM market_bars");}else{memorySignals=[];memoryNews=[];memoryBars=[];memoryPatterns=[];}res.json({ok:true});}catch(e){res.status(500).json({ok:false,error:e.message});}});
+app.post("/api/clear",async(req,res)=>{if(!requireAdmin(req,res))return;try{if(pool){await pool.query("DELETE FROM signals");await pool.query("DELETE FROM news_events");await pool.query("DELETE FROM pattern_signals");await pool.query("DELETE FROM smc_setups");await pool.query("DELETE FROM market_bars");}else{memorySignals=[];memoryNews=[];memoryBars=[];memoryPatterns=[];memorySmcSetups=[];}res.json({ok:true});}catch(e){res.status(500).json({ok:false,error:e.message});}});
 
 app.get("/api/patterns",async(req,res)=>{try{res.json({ok:true,patterns:await listPatterns(Math.min(300,Math.max(1,num(req.query.limit,100)))),settings:{minSamples:PATTERN_MIN_SAMPLES,minProbability:PATTERN_MIN_PROBABILITY,lookbackDays:PATTERN_LOOKBACK_DAYS,analysisTimeframes:ANALYSIS_TIMEFRAMES,profiles:analysisProfilesPublic()}});}catch(e){res.status(500).json({ok:false,error:e.message});}});
+app.get("/api/smc-setups",async(req,res)=>{try{
+  const setups=await listSmcSetups({status:req.query.status,symbol:req.query.symbol,limit:req.query.limit});
+  const counts=setups.reduce((out,item)=>{out[item.status]=(out[item.status]||0)+1;return out;},{});
+  res.json({ok:true,setups,counts,settings:{enabled:SMC_ENABLED,minScore:SMC_MIN_SCORE,pendingNotificationScore:SMC_NOTIFY_PENDING_SCORE,requireM5Confirmation:SMC_REQUIRE_M5_CONFIRMATION,analysisTimeframes:ANALYSIS_TIMEFRAMES,contextTimeframes:CONTEXT_TIMEFRAMES}});
+}catch(e){res.status(500).json({ok:false,error:e.message});}});
 
 
 app.get("/api/validation",async(req,res)=>{try{
@@ -1405,7 +1760,7 @@ app.post("/api/history-aggregate-all",async(req,res)=>{if(!requireAdmin(req,res)
   const sourceBars=Array.isArray(sourceRaw)?sourceRaw:(sourceRaw&&Array.isArray(sourceRaw.rows)?sourceRaw.rows:[]);
   if(!sourceBars.length)throw new Error(`Nu există date ${symbol} M5 pentru agregare.`);
   const results=[];
-  for(const targetTimeframe of ANALYSIS_TIMEFRAMES.filter(item=>item!=="5")){
+  for(const targetTimeframe of [...new Set([...ANALYSIS_TIMEFRAMES, ...CONTEXT_TIMEFRAMES])].filter(item=>item!=="5").sort((a,b)=>num(a)-num(b))){
     const aggregated=aggregateBars(sourceBars,sourceTimeframe,targetTimeframe,{requireComplete:true});
     const inserted=aggregated.length?await saveBarsBatch(aggregated):0;
     results.push({
@@ -1478,10 +1833,11 @@ app.post("/webhook", async(req,res)=>{try{
     const derived=await deriveCompletedHigherBars(bar);
     const analyses=[await processNewBar(bar,{trackTrades:true})];
     for(const higherBar of derived)analyses.push(await processNewBar(higherBar,{trackTrades:false}));
-    const generatedSignals=analyses.map(item=>item.generatedSignal).filter(Boolean);
+    const generatedSignals=analyses.flatMap(item=>[item.generatedSignal,...(Array.isArray(item.smcActivatedSignals)?item.smcActivatedSignals:[])]).filter(Boolean);
+    const plannedSetups=analyses.flatMap(item=>Array.isArray(item.smcSetups)?item.smcSetups:[]);
     const labels=analyses.filter(item=>item.analyzed).map(item=>timeframeLabel(item.bar.timeframe)).join(", ");
-    lastWebhookResult=`ACCEPTAT BAR ${bar.symbol} ${timeframeLabel(bar.timeframe)} · analizate ${labels||"niciun interval"}${derived.length?` · agregate ${derived.map(item=>timeframeLabel(item.timeframe)).join(", ")}`:""}${generatedSignals.length?` · ${generatedSignals.length} semnal(e) automat(e)`:""}`;
-    return res.json({ok:true,event:"BAR",bar,analysisTimeframes:ANALYSIS_TIMEFRAMES,derivedBars:derived,analyses,generatedSignals});
+    lastWebhookResult=`ACCEPTAT BAR ${bar.symbol} ${timeframeLabel(bar.timeframe)} · analizate ${labels||"niciun interval"}${derived.length?` · agregate ${derived.map(item=>timeframeLabel(item.timeframe)).join(", ")}`:""}${plannedSetups.length?` · ${plannedSetups.length} plan(uri) SMC noi`:""}${generatedSignals.length?` · ${generatedSignals.length} semnal(e) activ(e)`:""}`;
+    return res.json({ok:true,event:"BAR",bar,analysisTimeframes:ANALYSIS_TIMEFRAMES,derivedBars:derived,analyses,plannedSetups,generatedSignals});
   }
   const signal=normalizeSignal(payload); if(!["BUY","SELL"].includes(signal.signal)) throw new Error("Semnalul trebuie să fie BUY sau SELL"); const inserted=await saveSignal(signal); if(inserted) notifyTelegramSignal(signal).catch(e=>console.error("[TELEGRAM]",e.message)); lastWebhookResult=`ACCEPTAT ${signal.signal} ${signal.symbol} ${signal.timeframe} la ${signal.price}`; console.log(`[WEBHOOK] ${lastWebhookResult}`); return res.json({ok:true,signal});
 }catch(e){lastWebhookResult=`RESPINS: ${e.message}`;console.error("POST /webhook:",e);return res.status(400).json({ok:false,error:e.message});}});
@@ -1492,5 +1848,5 @@ initDb().then(async()=>{
   if(OFFICIAL_NEWS_ENABLED||(FMP_ENABLED&&FMP_API_KEY)||ALPHAVANTAGE_API_KEY||FINNHUB_API_KEY){syncRealNews().catch(e=>{lastNewsSyncError=e.message;console.error("News sync:",e.message)});setInterval(()=>syncRealNews().catch(e=>{lastNewsSyncError=e.message;console.error("News sync:",e.message)}),NEWS_AUTO_SYNC_MINUTES*60000).unref();}
   setTimeout(()=>monitorSystem().catch(e=>console.error("System monitor:",e.message)),15000).unref();
   setInterval(()=>monitorSystem().catch(e=>console.error("System monitor:",e.message)),SYSTEM_MONITOR_INTERVAL_MINUTES*60000).unref();
-  app.listen(PORT,()=>console.log(`PropTrader AI v17.1 rulează pe portul ${PORT}`));
+  app.listen(PORT,()=>console.log(`PropTrader AI v18.1 rulează pe portul ${PORT}`));
 }).catch(e=>{console.error("DB init failed:",e);process.exit(1)});
