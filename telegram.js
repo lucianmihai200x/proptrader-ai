@@ -1,5 +1,7 @@
 "use strict";
 
+const { timeframeLabel } = require("./timeframes");
+
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
 const ENABLED = String(process.env.TELEGRAM_ENABLED || "true").toLowerCase() !== "false";
@@ -36,17 +38,21 @@ function signalMessage(s) {
   const icon = side === "BUY" ? "🟢" : "🔴";
   const score = Number(s.adaptive_score ?? s.score ?? 0);
   const reason = String(s.decision_reason || s.reason || "").trim();
+  const entry = Number(s.price ?? s.entry);
+  const sl = Number(s.sl);
+  const risk = Math.abs(entry - sl);
+  const targetR = value => risk > 0 ? Math.abs(Number(value) - entry) / risk : 0;
   return [
     `<b>🚨 PropTrader AI</b>`,
     "",
     `<b>${icon} ${esc(side)} ${esc(s.symbol || "US30")}</b>`,
-    `⏱ Timeframe: <b>${esc(s.timeframe || "15")}m</b>`,
+    `⏱ Interval analizat: <b>${esc(timeframeLabel(s.timeframe || "15"))}</b>`,
     "",
-    `💰 Intrare: <b>${fmt(s.price ?? s.entry)}</b>`,
+    `💰 Intrare: <b>${fmt(entry)}</b>`,
     `🛑 SL: <b>${fmt(s.sl)}</b>`,
-    `🎯 TP1: <b>${fmt(s.tp1)}</b>`,
-    s.tp2 ? `🎯 TP2: <b>${fmt(s.tp2)}</b>` : "",
-    s.tp3 ? `🎯 TP3: <b>${fmt(s.tp3)}</b>` : "",
+    `🎯 TP1: <b>${fmt(s.tp1)}</b> (${fmt(targetR(s.tp1))}R)`,
+    `🎯 TP2: <b>${fmt(s.tp2)}</b> (${fmt(targetR(s.tp2))}R)`,
+    `🎯 TP3: <b>${fmt(s.tp3)}</b> (${fmt(targetR(s.tp3))}R)`,
     "",
     `📊 Scor adaptiv: <b>${fmt(score)}%</b>`,
     `🧠 Estimare Pine: <b>${fmt(s.probability ?? s.score)}%</b>`,

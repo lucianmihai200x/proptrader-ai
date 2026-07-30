@@ -18,6 +18,8 @@ services:
           property: connectionString
       - key: ANALYSIS_TIMEFRAME
         value: 15
+      - key: ANALYSIS_TIMEFRAMES
+        value: 5,15,30,60,240
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_CHAT_ID

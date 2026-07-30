@@ -4,12 +4,14 @@ const { Pool } = require("pg");
 const { getHistoricalRates } = require("dukascopy-node");
 const telegram = require("./telegram");
 const { buildBacktest, auditBars, aggregateBars } = require("./backtest");
-
-function cleanTimeframeEnv(value) {
-  const raw = String(value ?? "15").trim().toUpperCase();
-  const aliases = { M1:"1", M5:"5", M15:"15", M30:"30", H1:"60", H4:"240", D1:"1440" };
-  return aliases[raw] || raw.replace(/[^0-9]/g, "") || "15";
-}
+const {
+  SUPPORTED_ANALYSIS_TIMEFRAMES,
+  normalizeTimeframe,
+  parseAnalysisTimeframes,
+  timeframeLabel,
+  profileFor,
+  completedHigherTimeframes
+} = require("./timeframes");
 
 const app = express();
 let lastWebhookAt = null;
@@ -25,9 +27,17 @@ const ARCHIVE_AFTER_HOURS = Math.max(1, Number(process.env.ARCHIVE_AFTER_HOURS |
 const PATTERN_MIN_SAMPLES = Math.max(10, Number(process.env.PATTERN_MIN_SAMPLES || 25));
 const PATTERN_MIN_PROBABILITY = Math.max(50, Math.min(95, Number(process.env.PATTERN_MIN_PROBABILITY || 68)));
 const PATTERN_LOOKBACK_DAYS = Math.max(14, Number(process.env.PATTERN_LOOKBACK_DAYS || 180));
-const PATTERN_HORIZON_BARS = Math.max(1, Math.min(12, Number(process.env.PATTERN_HORIZON_BARS || 3)));
-const PATTERN_COOLDOWN_MINUTES = Math.max(5, Number(process.env.PATTERN_COOLDOWN_MINUTES || 60));
-const ANALYSIS_TIMEFRAME = cleanTimeframeEnv(process.env.ANALYSIS_TIMEFRAME || "15");
+const PATTERN_HORIZON_BARS_OVERRIDE = process.env.PATTERN_HORIZON_BARS === undefined
+  ? null
+  : Math.max(1, Math.min(24, Number(process.env.PATTERN_HORIZON_BARS)));
+const PATTERN_COOLDOWN_MINUTES_OVERRIDE = process.env.PATTERN_COOLDOWN_MINUTES === undefined
+  ? null
+  : Math.max(5, Number(process.env.PATTERN_COOLDOWN_MINUTES));
+const ANALYSIS_TIMEFRAMES = parseAnalysisTimeframes(process.env.ANALYSIS_TIMEFRAMES);
+const requestedPrimaryTimeframe = normalizeTimeframe(process.env.ANALYSIS_TIMEFRAME || "15", "15");
+const ANALYSIS_TIMEFRAME = ANALYSIS_TIMEFRAMES.includes(requestedPrimaryTimeframe)
+  ? requestedPrimaryTimeframe
+  : (ANALYSIS_TIMEFRAMES.includes("15") ? "15" : ANALYSIS_TIMEFRAMES[0]);
 const FMP_API_KEY = process.env.FMP_API_KEY || "";
 const ALPHAVANTAGE_API_KEY = process.env.ALPHAVANTAGE_API_KEY || "";
 const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY || "";
@@ -57,6 +67,7 @@ let lastSystemAlertAt = null;
 let lastDbCheckAt = null;
 let lastDbCheckOk = null;
 let lastDbCheckError = "";
+const lastBarAtByTimeframe = {};
 
 const pool = DATABASE_URL
   ? new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } })
@@ -83,6 +94,31 @@ const num = (v, fallback = 0) => {
 const bool = v => v === true || v === "true" || v === 1 || v === "1";
 const clean = (v, n = 200) => String(v ?? "").trim().slice(0, n);
 const hoursAgoIso = h => new Date(Date.now() - h * 3600000).toISOString();
+
+function analysisProfile(timeframe) {
+  return profileFor(timeframe, {
+    horizonBars: PATTERN_HORIZON_BARS_OVERRIDE,
+    cooldownMinutes: PATTERN_COOLDOWN_MINUTES_OVERRIDE,
+    minSamples: PATTERN_SIGNAL_MIN_SAMPLES,
+    minProbability: PATTERN_SIGNAL_MIN_PROBABILITY,
+    minScore: PATTERN_SIGNAL_MIN_SCORE
+  });
+}
+
+function analysisProfilesPublic() {
+  return Object.fromEntries(ANALYSIS_TIMEFRAMES.map(timeframe => {
+    const profile = analysisProfile(timeframe);
+    return [timeframe, {
+      label: profile.label,
+      horizonBars: profile.horizonBars,
+      cooldownMinutes: profile.cooldownMinutes,
+      minSamples: profile.minSamples,
+      minProbability: profile.minProbability,
+      minScore: profile.minScore,
+      stopAtr: profile.stopAtr
+    }];
+  }));
+}
 
 function safeJson(v, fallback = {}) {
   if (v && typeof v === "object" && !Array.isArray(v)) return v;
@@ -155,7 +191,7 @@ async function buildSystemStatus() {
   const webhookAge = minutesSince(lastWebhookAt);
   return {
     ok: database.ok,
-    version: "16.4.0",
+    version: "17.0.0",
     database,
     webhook: {
       lastAt: lastWebhookAt,
@@ -170,8 +206,11 @@ async function buildSystemStatus() {
       enabled: AUTO_PATTERN_SIGNALS,
       minSamples: PATTERN_SIGNAL_MIN_SAMPLES,
       minProbability: PATTERN_SIGNAL_MIN_PROBABILITY,
-      minScore: PATTERN_SIGNAL_MIN_SCORE
+      minScore: PATTERN_SIGNAL_MIN_SCORE,
+      analysisTimeframes: ANALYSIS_TIMEFRAMES,
+      profiles: analysisProfilesPublic()
     },
+    lastBarAtByTimeframe: { ...lastBarAtByTimeframe },
     warnings: systemWarnings(),
     checkedAt: new Date().toISOString()
   };
@@ -344,6 +383,7 @@ async function initDb() {
 function setupKey(p) {
   return [
     clean(p.symbol || "N/A", 30).toUpperCase(), clean(p.signal || p.side || "WAIT", 10).toUpperCase(),
+    normalizeTimeframe(p.timeframe || p.interval, "N/A"),
     clean(p.session || p.session_name || "N/A", 40), clean(p.structure || "N/A", 80),
     bool(p.bos) ? "BOS" : "", bool(p.choch) ? "CHOCH" : "", bool(p.fvg) ? "FVG" : "",
     bool(p.liquidity_sweep || p.sweep) ? "SWEEP" : "", bool(p.vwap_confirm) ? "VWAP" : "",
@@ -356,7 +396,7 @@ function normalizeSignal(p) {
   return {
     external_id: clean(p.external_id || p.signal_id || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, 120),
     received_at: new Date().toISOString(), symbol: clean(p.symbol || p.ticker || "N/A", 30).toUpperCase(),
-    timeframe: clean(p.timeframe || p.interval, 20), signal: clean(p.signal || p.side || "WAIT", 10).toUpperCase(),
+    timeframe: normalizeTimeframe(p.timeframe || p.interval, ANALYSIS_TIMEFRAME), signal: clean(p.signal || p.side || "WAIT", 10).toUpperCase(),
     status: "OPEN", price: num(p.price ?? p.close), sl: num(p.sl), tp1: num(p.tp1 ?? p.tp), tp2: num(p.tp2), tp3: num(p.tp3),
     score, probability: Math.max(0, Math.min(100, num(p.probability, score))), adaptive_score: score, learning_adjustment: 0,
     rsi: num(p.rsi), atr: num(p.atr), rr: num(p.rr), trend: clean(p.trend, 50), structure: clean(p.structure, 120),
@@ -369,6 +409,24 @@ function normalizeSignal(p) {
     score_breakdown: safeJson(p.score_breakdown), reason: clean(p.reason || p.setup, 2200), setup_key: setupKey(p),
     news_risk: 0, news_bias: "NEUTRAL", news_summary: ""
   };
+}
+
+function validateSignalLevels(signal) {
+  const side = String(signal.signal || "").toUpperCase();
+  const entry = num(signal.price, NaN);
+  const sl = num(signal.sl, NaN);
+  const tp1 = num(signal.tp1, NaN);
+  const tp2 = num(signal.tp2, NaN);
+  const tp3 = num(signal.tp3, NaN);
+  if (!["BUY", "SELL"].includes(side)) throw new Error("Semnalul trebuie să fie BUY sau SELL");
+  if (![entry, sl, tp1, tp2, tp3].every(value => Number.isFinite(value) && value > 0)) {
+    throw new Error("Semnalul necesită Entry, SL, TP1, TP2 și TP3 pozitive");
+  }
+  const valid = side === "BUY"
+    ? sl < entry && entry < tp1 && tp1 < tp2 && tp2 < tp3
+    : sl > entry && entry > tp1 && tp1 > tp2 && tp2 > tp3;
+  if (!valid) throw new Error(`Niveluri ${side} invalide: verifică ordinea SL, Entry și TP1–TP3`);
+  return signal;
 }
 
 function newsSymbols(text) {
@@ -443,20 +501,34 @@ function normalizeBar(p) {
   const barTime = new Date(p.bar_time || p.time || p.timestamp || Date.now());
   if (Number.isNaN(barTime.getTime())) throw new Error("Timpul lumânării este invalid");
   const symbol = clean(p.symbol || p.ticker, 30).toUpperCase();
-  const timeframe = clean(p.timeframe || p.interval, 20);
+  const timeframe = normalizeTimeframe(p.timeframe || p.interval);
   const o = num(p.open, NaN), h = num(p.high, NaN), l = num(p.low, NaN), c = num(p.close, NaN);
   if (!symbol || !timeframe || ![o,h,l,c].every(Number.isFinite)) throw new Error("BAR necesită symbol, timeframe, open, high, low și close");
+  if (h < Math.max(o, c) || l > Math.min(o, c) || h < l) throw new Error("BAR are valori OHLC invalide");
   return { external_id: clean(p.external_id || `BAR-${symbol}-${timeframe}-${barTime.getTime()}`, 160), bar_time: barTime.toISOString(), symbol, timeframe, open:o, high:h, low:l, close:c, volume:num(p.volume) };
 }
 
 async function saveBar(b) {
   if (!pool) {
-    if (!memoryBars.some(x=>x.external_id===b.external_id)) memoryBars.push({id:Date.now(),...b});
+    const duplicate = memoryBars.some(x =>
+      x.external_id === b.external_id ||
+      (x.symbol === b.symbol && x.timeframe === b.timeframe && new Date(x.bar_time).getTime() === new Date(b.bar_time).getTime())
+    );
+    if (duplicate) return false;
+    memoryBars.push({id:Date.now(),...b});
     memoryBars = memoryBars.filter(x=>new Date(x.bar_time) >= new Date(Date.now()-PATTERN_LOOKBACK_DAYS*86400000)).slice(-30000);
-    return;
+    return true;
   }
-  await pool.query(`INSERT INTO market_bars(external_id,bar_time,symbol,timeframe,open,high,low,close,volume)
-    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT DO NOTHING`,[b.external_id,b.bar_time,b.symbol,b.timeframe,b.open,b.high,b.low,b.close,b.volume]);
+  const result = await pool.query(`
+    INSERT INTO market_bars(external_id,bar_time,symbol,timeframe,open,high,low,close,volume)
+    SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9
+    WHERE NOT EXISTS (
+      SELECT 1 FROM market_bars WHERE symbol=$3 AND timeframe=$4 AND bar_time=$2
+    )
+    ON CONFLICT DO NOTHING
+    RETURNING id
+  `,[b.external_id,b.bar_time,b.symbol,b.timeframe,b.open,b.high,b.low,b.close,b.volume]);
+  return result.rowCount > 0;
 }
 
 
@@ -597,23 +669,41 @@ function ema(values,len){if(!values.length)return 0;const k=2/(len+1);let e=valu
 function atrFromBars(bars,len=14){if(bars.length<2)return 0;const tr=[];for(let i=1;i<bars.length;i++){const h=num(bars[i].high),l=num(bars[i].low),pc=num(bars[i-1].close);tr.push(Math.max(h-l,Math.abs(h-pc),Math.abs(l-pc)));}return tr.slice(-len).reduce((a,x)=>a+x,0)/Math.max(1,Math.min(len,tr.length));}
 function bucketFor(date,timeframe){const d=new Date(date);const mins=d.getUTCHours()*60+d.getUTCMinutes();const tf=Math.max(1,parseInt(timeframe)||5);const bucket=Math.floor(mins/tf)*tf;return `${String(Math.floor(bucket/60)).padStart(2,'0')}:${String(bucket%60).padStart(2,'0')} UTC`;}
 
+async function higherTimeframeConfirmation(symbol, timeframe, side) {
+  const currentIndex = SUPPORTED_ANALYSIS_TIMEFRAMES.indexOf(String(timeframe));
+  const higher = SUPPORTED_ANALYSIS_TIMEFRAMES
+    .slice(currentIndex + 1)
+    .find(item => ANALYSIS_TIMEFRAMES.includes(item));
+  if (!higher) return { available: false, confirmed: true, timeframe: null, trend: "LOCAL" };
+  const bars = await recentBars(symbol, higher, 80);
+  if (bars.length < 20) return { available: false, confirmed: true, timeframe: higher, trend: "INSUFFICIENT_DATA" };
+  const closes = bars.slice(-60).map(item => num(item.close));
+  const fast = ema(closes.slice(-40), 20);
+  const slow = closes.length >= 50 ? ema(closes, 50) : ema(closes, 20);
+  const close = closes[closes.length - 1];
+  const trend = close > fast && fast > slow ? "BUY" : close < fast && fast < slow ? "SELL" : "NEUTRAL";
+  return { available: true, confirmed: trend === side, timeframe: higher, trend };
+}
+
 async function analyzeTimePattern(bar) {
+  const profile = analysisProfile(bar.timeframe);
+  const horizonBars = profile.horizonBars;
   const bars=await recentBars(bar.symbol,bar.timeframe);
-  if(bars.length < PATTERN_MIN_SAMPLES + PATTERN_HORIZON_BARS + 20) return null;
+  if(bars.length < Math.max(PATTERN_MIN_SAMPLES, profile.minSamples) + horizonBars + 20) return null;
   const now=new Date(bar.bar_time), targetBucket=bucketFor(now,bar.timeframe), weekday=now.getUTCDay();
   const moves=[];
-  for(let i=0;i<bars.length-PATTERN_HORIZON_BARS;i++){
+  for(let i=0;i<bars.length-horizonBars;i++){
     const a=bars[i], dt=new Date(a.bar_time);
     if(bucketFor(dt,bar.timeframe)!==targetBucket) continue;
     // Prioritize the same weekday, but accept all weekdays until the sample threshold is reached.
-    const end=bars[i+PATTERN_HORIZON_BARS];
+    const end=bars[i+horizonBars];
     if(!end)continue;
     const move=(num(end.close)-num(a.close))/Math.max(0.000001,num(a.close))*100;
     moves.push({move,sameWeekday:dt.getUTCDay()===weekday});
   }
   let selected=moves.filter(x=>x.sameWeekday).map(x=>x.move);
-  if(selected.length<PATTERN_MIN_SAMPLES) selected=moves.map(x=>x.move);
-  if(selected.length<PATTERN_MIN_SAMPLES) return null;
+  if(selected.length<profile.minSamples) selected=moves.map(x=>x.move);
+  if(selected.length<profile.minSamples) return null;
   const up=selected.filter(x=>x>0).length, down=selected.filter(x=>x<0).length;
   const upProb=up/selected.length*100, downProb=down/selected.length*100;
   const side=upProb>=downProb?'BUY':'SELL', probability=Math.max(upProb,downProb);
@@ -622,36 +712,53 @@ async function analyzeTimePattern(bar) {
   const closes=bars.slice(-60).map(x=>num(x.close));
   const e20=ema(closes.slice(-40),20), e50=ema(closes,50);
   const trendConfirmed=side==='BUY'?num(bar.close)>e20&&e20>e50:num(bar.close)<e20&&e20<e50;
+  const mtf=await higherTimeframeConfirmation(bar.symbol,bar.timeframe,side);
   const atr=atrFromBars(bars.slice(-30));
   const minMovePct=Math.max(0.03,(atr/Math.max(0.000001,num(bar.close))*100)*0.55);
-  if(probability<PATTERN_MIN_PROBABILITY || avgMove<minMovePct || !trendConfirmed) return null;
+  if(probability<Math.max(PATTERN_MIN_PROBABILITY, profile.minProbability) || avgMove<minMovePct || !trendConfirmed || (mtf.available&&!mtf.confirmed)) return null;
   const news=await recentNewsRisk(bar.symbol,new Date(bar.bar_time));
   if(news.risk>=80) return null;
-  const entry=num(bar.close), risk=Math.max(atr*1.1,entry*avgMove/100*0.45);
+  const entry=num(bar.close), risk=Math.max(atr*profile.stopAtr,entry*avgMove/100*0.45);
   const sl=side==='BUY'?entry-risk:entry+risk;
   const tp1=side==='BUY'?entry+risk*1.5:entry-risk*1.5;
   const tp2=side==='BUY'?entry+risk*2.5:entry-risk*2.5;
   const tp3=side==='BUY'?entry+risk*3.5:entry-risk*3.5;
-  const bucketMs=PATTERN_COOLDOWN_MINUTES*60000;
+  const bucketMs=profile.cooldownMinutes*60000;
   const ext=`PATTERN-${bar.symbol}-${bar.timeframe}-${side}-${Math.floor(new Date(bar.bar_time).getTime()/bucketMs)}`;
-  return {external_id:ext,created_at:new Date().toISOString(),symbol:bar.symbol,timeframe:bar.timeframe,side,entry,sl,tp1,tp2,tp3,samples:selected.length,probability:Number(probability.toFixed(2)),avg_move_pct:Number(avgMove.toFixed(4)),median_move_pct:Number(medMove.toFixed(4)),time_bucket:targetBucket,weekday,horizon_bars:PATTERN_HORIZON_BARS,trend_confirmed:trendConfirmed,news_risk:news.risk,status:'CANDIDATE',reason:`Model orar: ${side} a apărut în ${probability.toFixed(1)}% din ${selected.length} cazuri; mișcare medie ${avgMove.toFixed(3)}% în următoarele ${PATTERN_HORIZON_BARS} lumânări. Confirmare EMA20/EMA50 și risc știri ${news.risk}/100.`};
+  const mtfText=mtf.available?` Confirmare ${timeframeLabel(mtf.timeframe)}: ${mtf.trend}.`:"";
+  return {external_id:ext,created_at:new Date().toISOString(),symbol:bar.symbol,timeframe:bar.timeframe,side,entry,sl,tp1,tp2,tp3,samples:selected.length,probability:Number(probability.toFixed(2)),avg_move_pct:Number(avgMove.toFixed(4)),median_move_pct:Number(medMove.toFixed(4)),time_bucket:targetBucket,weekday,horizon_bars:horizonBars,trend_confirmed:trendConfirmed,mtf_confirmed:mtf.confirmed,mtf_timeframe:mtf.timeframe,mtf_trend:mtf.trend,news_risk:news.risk,status:'CANDIDATE',reason:`Model ${profile.label}: ${side} a apărut în ${probability.toFixed(1)}% din ${selected.length} cazuri; mișcare medie ${avgMove.toFixed(3)}% în următoarele ${horizonBars} lumânări. Confirmare EMA20/EMA50.${mtfText} Risc știri ${news.risk}/100.`};
+}
+
+function patternSignalScore(pattern) {
+  const profile = analysisProfile(pattern.timeframe);
+  const sampleBonus = Math.min(8, Math.max(0, Math.log2(Math.max(1, num(pattern.samples) / profile.minSamples) + 1) * 4));
+  const newsPenalty = num(pattern.news_risk) * 0.05;
+  const score = Math.min(95, num(pattern.probability) + 6 + sampleBonus - newsPenalty);
+  return {
+    score: Number(score.toFixed(2)),
+    sampleBonus: Number(sampleBonus.toFixed(2)),
+    newsPenalty: Number(newsPenalty.toFixed(2)),
+    requiredScore: profile.minScore
+  };
 }
 
 function patternQualifiesForSignal(pattern) {
+  if (!pattern) return false;
+  const profile = analysisProfile(pattern.timeframe);
+  const calculated = patternSignalScore(pattern);
   return Boolean(
-    AUTO_PATTERN_SIGNALS && pattern && pattern.trend_confirmed &&
-    num(pattern.samples) >= PATTERN_SIGNAL_MIN_SAMPLES &&
-    num(pattern.probability) >= PATTERN_SIGNAL_MIN_PROBABILITY &&
-    num(pattern.news_risk) <= MAX_NEWS_RISK_LIVE
+    AUTO_PATTERN_SIGNALS && pattern.trend_confirmed &&
+    ANALYSIS_TIMEFRAMES.includes(String(pattern.timeframe)) &&
+    num(pattern.samples) >= profile.minSamples &&
+    num(pattern.probability) >= profile.minProbability &&
+    num(pattern.news_risk) <= MAX_NEWS_RISK_LIVE &&
+    calculated.score >= profile.minScore
   );
 }
 
 function patternToSignal(pattern) {
-  const sampleBonus = Math.min(8, Math.max(0, Math.log2(Math.max(1, num(pattern.samples) / PATTERN_SIGNAL_MIN_SAMPLES) + 1) * 4));
-  const newsPenalty = num(pattern.news_risk) * 0.05;
-  const calculatedScore = Math.min(95, num(pattern.probability) + 6 + sampleBonus - newsPenalty);
-  const safetyBuffer = num(pattern.news_risk) >= 55 ? 7 : 0;
-  const score = Number(Math.max(PATTERN_SIGNAL_MIN_SCORE + safetyBuffer, calculatedScore).toFixed(2));
+  const calculated = patternSignalScore(pattern);
+  const label = timeframeLabel(pattern.timeframe);
   return normalizeSignal({
     event: "SIGNAL",
     external_id: `AUTO-${pattern.external_id}`,
@@ -663,23 +770,94 @@ function patternToSignal(pattern) {
     tp1: pattern.tp1,
     tp2: pattern.tp2,
     tp3: pattern.tp3,
-    score,
+    score: calculated.score,
     probability: pattern.probability,
     rr: 3.5,
     trend: pattern.side === "BUY" ? "Bullish" : "Bearish",
-    structure: "Model orar validat + trend EMA20/EMA50",
+    structure: `Model ${label} validat + trend EMA20/EMA50`,
     session: pattern.time_bucket,
-    mtf_confirm: true,
+    mtf_confirm: pattern.mtf_confirmed !== false,
+    mtf_trend: pattern.mtf_timeframe ? `${timeframeLabel(pattern.mtf_timeframe)} ${pattern.mtf_trend}` : "Local",
     market_phase: "Historical edge",
-    reason: `Semnal generat automat de server din modelul istoric M15. ${pattern.reason}`,
+    reason: `Semnal generat automat de server din modelul istoric ${label}. ${pattern.reason}`,
     score_breakdown: {
       historicalProbability: pattern.probability,
       samples: pattern.samples,
       trendConfirmation: 6,
-      sampleBonus: Number(sampleBonus.toFixed(2)),
-      newsPenalty: Number(newsPenalty.toFixed(2))
+      sampleBonus: calculated.sampleBonus,
+      newsPenalty: calculated.newsPenalty,
+      requiredScore: calculated.requiredScore
     }
   });
+}
+
+async function barsBetween(symbol, timeframe, from, to) {
+  const start = new Date(from);
+  const end = new Date(to);
+  if (!pool) {
+    return memoryBars
+      .filter(item =>
+        item.symbol === symbol &&
+        item.timeframe === timeframe &&
+        new Date(item.bar_time) >= start &&
+        new Date(item.bar_time) <= end
+      )
+      .sort((a, b) => new Date(a.bar_time) - new Date(b.bar_time));
+  }
+  return (await pool.query(
+    `SELECT * FROM market_bars
+     WHERE symbol=$1 AND timeframe=$2 AND bar_time BETWEEN $3 AND $4
+     ORDER BY bar_time ASC`,
+    [symbol, timeframe, start.toISOString(), end.toISOString()]
+  )).rows;
+}
+
+async function deriveCompletedHigherBars(m5Bar) {
+  if (String(m5Bar.timeframe) !== "5") return [];
+  const targets = completedHigherTimeframes(m5Bar.bar_time, "5", ANALYSIS_TIMEFRAMES);
+  const derived = [];
+  for (const target of targets) {
+    const targetMs = Number(target) * 60000;
+    const barStart = new Date(m5Bar.bar_time).getTime();
+    const bucketStart = Math.floor(barStart / targetMs) * targetMs;
+    const source = await barsBetween(
+      m5Bar.symbol,
+      "5",
+      new Date(bucketStart).toISOString(),
+      m5Bar.bar_time
+    );
+    const aggregated = aggregateBars(source, "5", target, { requireComplete: true });
+    if (!aggregated.length) continue;
+    const higherBar = aggregated[aggregated.length - 1];
+    if (await saveBar(higherBar)) derived.push(higherBar);
+  }
+  return derived;
+}
+
+async function processNewBar(bar, { trackTrades = true } = {}) {
+  lastBarAtByTimeframe[bar.timeframe] = bar.bar_time;
+  const autoClosed = trackTrades ? await trackSignalsWithBar(bar) : [];
+  if (!ANALYSIS_TIMEFRAMES.includes(String(bar.timeframe))) {
+    return { bar, analyzed: false, autoClosed, pattern: null, generatedSignal: null };
+  }
+  const pattern = await analyzeTimePattern(bar);
+  const patternInserted = pattern ? await savePattern(pattern) : false;
+  let generatedSignal = null;
+  if (patternInserted && patternQualifiesForSignal(pattern)) {
+    const candidate = patternToSignal(pattern);
+    const signalInserted = await saveSignal(candidate);
+    if (signalInserted) {
+      generatedSignal = candidate;
+      notifyTelegramSignal(candidate).catch(error => console.error("[TELEGRAM AUTO PATTERN]", error.message));
+    }
+  }
+  return {
+    bar,
+    analyzed: true,
+    autoClosed,
+    pattern: patternInserted ? pattern : null,
+    generatedSignal
+  };
 }
 
 async function savePattern(p) {
@@ -748,6 +926,7 @@ async function setupPerformance(key) {
 }
 
 async function saveSignal(s) {
+  validateSignalLevels(s);
   const perf = await setupPerformance(s.setup_key);
   const news = await recentNewsRisk(s.symbol);
   const lossStreak = await consecutiveLosses();
@@ -943,7 +1122,7 @@ function parseHistoricalCsv(csv,{symbol,timeframe,timezoneOffsetMinutes=0}={}){
   return {bars:dedup,rejected,delimiter,headers};
 }
 async function saveBarsBatch(bars){
-  if(!pool){for(const b of bars)await saveBar(b);return bars.length;}
+  if(!pool){let inserted=0;for(const b of bars)if(await saveBar(b))inserted++;return inserted;}
   let inserted=0;
   for(let i=0;i<bars.length;i+=2000){
     const chunk=bars.slice(i,i+2000), values=[], params=[]; let n=1;
@@ -995,7 +1174,7 @@ async function notifyTelegramSignal(signal) {
   }
 }
 
-app.get("/health", (req,res)=>res.json({ok:true,version:"16.4.0",database:pool?"postgres":"memory",archiveAfterHours:ARCHIVE_AFTER_HOURS,adminKeyConfigured:Boolean(ADMIN_KEY),newsWebhookConfigured:Boolean(NEWS_WEBHOOK_KEY),fmpConfigured:Boolean(FMP_API_KEY),alphaVantageConfigured:Boolean(ALPHAVANTAGE_API_KEY),finnhubConfigured:Boolean(FINNHUB_API_KEY),autoTrackTrades:AUTO_TRACK_TRADES,lastNewsSync,lastSuccessfulNewsSync,lastNewsSyncError,newsCoverage:newsCoverageStatus(),patternMinSamples:PATTERN_MIN_SAMPLES,patternMinProbability:PATTERN_MIN_PROBABILITY,patternHorizonBars:PATTERN_HORIZON_BARS,analysisTimeframe:ANALYSIS_TIMEFRAME,autoPatternSignals:AUTO_PATTERN_SIGNALS,patternSignalMinSamples:PATTERN_SIGNAL_MIN_SAMPLES,patternSignalMinProbability:PATTERN_SIGNAL_MIN_PROBABILITY,patternSignalMinScore:PATTERN_SIGNAL_MIN_SCORE,liveMinAdaptiveScore:LIVE_MIN_ADAPTIVE_SCORE,learningMinSamples:LEARNING_MIN_SAMPLES,maxNewsRiskLive:MAX_NEWS_RISK_LIVE,maxConsecutiveLosses:MAX_CONSECUTIVE_LOSSES,webhookStaleMinutes:WEBHOOK_STALE_MINUTES,telegramSystemAlerts:TELEGRAM_SYSTEM_ALERTS,telegram:telegram.status(),lastTelegramAt,lastTelegramResult,lastSystemAlertAt,lastWebhookAt,lastWebhookResult,warnings:systemWarnings(),time:new Date().toISOString()}));
+app.get("/health", (req,res)=>res.json({ok:true,version:"17.0.0",database:pool?"postgres":"memory",archiveAfterHours:ARCHIVE_AFTER_HOURS,adminKeyConfigured:Boolean(ADMIN_KEY),newsWebhookConfigured:Boolean(NEWS_WEBHOOK_KEY),fmpConfigured:Boolean(FMP_API_KEY),alphaVantageConfigured:Boolean(ALPHAVANTAGE_API_KEY),finnhubConfigured:Boolean(FINNHUB_API_KEY),autoTrackTrades:AUTO_TRACK_TRADES,lastNewsSync,lastSuccessfulNewsSync,lastNewsSyncError,newsCoverage:newsCoverageStatus(),patternMinSamples:PATTERN_MIN_SAMPLES,patternMinProbability:PATTERN_MIN_PROBABILITY,analysisTimeframe:ANALYSIS_TIMEFRAME,analysisTimeframes:ANALYSIS_TIMEFRAMES,analysisProfiles:analysisProfilesPublic(),lastBarAtByTimeframe:{...lastBarAtByTimeframe},autoPatternSignals:AUTO_PATTERN_SIGNALS,patternSignalMinSamples:PATTERN_SIGNAL_MIN_SAMPLES,patternSignalMinProbability:PATTERN_SIGNAL_MIN_PROBABILITY,patternSignalMinScore:PATTERN_SIGNAL_MIN_SCORE,liveMinAdaptiveScore:LIVE_MIN_ADAPTIVE_SCORE,learningMinSamples:LEARNING_MIN_SAMPLES,maxNewsRiskLive:MAX_NEWS_RISK_LIVE,maxConsecutiveLosses:MAX_CONSECUTIVE_LOSSES,webhookStaleMinutes:WEBHOOK_STALE_MINUTES,telegramSystemAlerts:TELEGRAM_SYSTEM_ALERTS,telegram:telegram.status(),lastTelegramAt,lastTelegramResult,lastSystemAlertAt,lastWebhookAt,lastWebhookResult,warnings:systemWarnings(),time:new Date().toISOString()}));
 app.get("/api/system-status", async(req,res)=>{try{res.json(await buildSystemStatus());}catch(e){res.status(500).json({ok:false,error:e.message});}});
 
 app.get("/api/signals", async(req,res)=>{ try { const mode=req.query.mode==="archive"?"archive":"active"; res.json({ok:true,mode,signals:await listSignals(mode,req.query),analytics:await analytics()}); } catch(e){ console.error(e); res.status(500).json({ok:false,error:e.message}); } });
@@ -1025,8 +1204,9 @@ app.post("/api/telegram/test", async(req,res)=>{if(!requireAdmin(req,res))return
 app.post("/api/telegram/test-signal", async(req,res)=>{if(!requireAdmin(req,res))return;try{
   const price=num(req.body.price,NaN);if(!Number.isFinite(price)||price<=0)throw new Error("Introdu un preț valid");
   const side=clean(req.body.side||"BUY",10).toUpperCase()==="SELL"?"SELL":"BUY";
+  const timeframe=normalizeTimeframe(req.body.timeframe||ANALYSIS_TIMEFRAME,ANALYSIS_TIMEFRAME);
   const risk=Math.max(price*0.0015,num(req.body.atr,0))*1.1;
-  const signal={external_id:`TELEGRAM-TEST-${Date.now()}`,symbol:clean(req.body.symbol||"US30",30),timeframe:ANALYSIS_TIMEFRAME,signal:side,price,sl:side==="BUY"?price-risk:price+risk,tp1:side==="BUY"?price+risk*1.5:price-risk*1.5,tp2:side==="BUY"?price+risk*2.5:price-risk*2.5,tp3:side==="BUY"?price+risk*3.5:price-risk*3.5,score:92,adaptive_score:92,probability:86,execution_mode:"LIVE",session_name:"TEST",structure:"Test traseu complet",decision_reason:"Mesaj demonstrativ; nu reprezintă o recomandare de tranzacționare."};
+  const signal={external_id:`TELEGRAM-TEST-${Date.now()}`,symbol:clean(req.body.symbol||"US30",30),timeframe,signal:side,price,sl:side==="BUY"?price-risk:price+risk,tp1:side==="BUY"?price+risk*1.5:price-risk*1.5,tp2:side==="BUY"?price+risk*2.5:price-risk*2.5,tp3:side==="BUY"?price+risk*3.5:price-risk*3.5,score:92,adaptive_score:92,probability:86,execution_mode:"LIVE",session_name:"TEST",structure:"Test traseu complet",decision_reason:"Mesaj demonstrativ; nu reprezintă o recomandare de tranzacționare."};
   const result=await telegram.sendSignal(signal);lastTelegramAt=new Date().toISOString();lastTelegramResult=`TEST SIGNAL TRIMIS ${side} ${signal.symbol}, mesaj ${result.message_id}`;await logTelegram({signal,status:"TEST_SIGNAL",messageId:result.message_id,details:lastTelegramResult});res.json({ok:true,messageId:result.message_id,signal});
 }catch(e){lastTelegramAt=new Date().toISOString();lastTelegramResult=`EROARE TEST SIGNAL: ${e.message}`;await logTelegram({status:"ERROR",details:e.message}).catch(()=>{});res.status(400).json({ok:false,error:e.message});}});
 
@@ -1034,9 +1214,10 @@ app.post("/api/test-signal",async(req,res)=>{ if(!requireAdmin(req,res))return; 
   const price=num(req.body.price,NaN); if(!Number.isFinite(price)||price<=0)throw new Error("Introdu un preț curent valid pentru test");
   const atr=Math.max(price*0.0015,num(req.body.atr,0)); const risk=atr*1.1;
   const side=clean(req.body.side||"BUY",10).toUpperCase()==="SELL"?"SELL":"BUY";
-  const s=normalizeSignal({external_id:`TEST-${Date.now()}`,symbol:clean(req.body.symbol||"US30",30),timeframe:ANALYSIS_TIMEFRAME,signal:side,price,
+  const timeframe=normalizeTimeframe(req.body.timeframe||ANALYSIS_TIMEFRAME,ANALYSIS_TIMEFRAME);
+  const s=normalizeSignal({external_id:`TEST-${Date.now()}`,symbol:clean(req.body.symbol||"US30",30),timeframe,signal:side,price,
     sl:side==="BUY"?price-risk:price+risk,tp1:side==="BUY"?price+risk*1.5:price-risk*1.5,tp2:side==="BUY"?price+risk*2.5:price-risk*2.5,tp3:side==="BUY"?price+risk*3.5:price-risk*3.5,
-    score:88,probability:79,rsi:58.4,atr,rr:3.5,trend:side==="BUY"?"Bullish":"Bearish",structure:`${side} test`,session:"New York",bos:true,fvg:true,liquidity_sweep:true,vwap_confirm:true,mtf_confirm:true,market_phase:"Expansion",premium_discount:side==="BUY"?"Discount":"Premium",reason:"Semnal demonstrativ v16.3 M15 la preț introdus manual."});
+    score:88,probability:79,rsi:58.4,atr,rr:3.5,trend:side==="BUY"?"Bullish":"Bearish",structure:`${side} test`,session:"New York",bos:true,fvg:true,liquidity_sweep:true,vwap_confirm:true,mtf_confirm:true,market_phase:"Expansion",premium_discount:side==="BUY"?"Discount":"Premium",reason:`Semnal demonstrativ v17 ${timeframeLabel(timeframe)} la preț introdus manual.`});
   await saveSignal(s);res.json({ok:true,signal:s});
 }catch(e){res.status(400).json({ok:false,error:e.message});} });
 
@@ -1045,7 +1226,7 @@ app.post("/api/test-news",async(req,res)=>{ if(!requireAdmin(req,res))return; tr
 app.post("/api/manual-close",async(req,res)=>{if(!requireAdmin(req,res))return;try{res.json({ok:true,closed:await closeSignal(req.body)});}catch(e){res.status(400).json({ok:false,error:e.message});}});
 app.post("/api/clear",async(req,res)=>{if(!requireAdmin(req,res))return;try{if(pool){await pool.query("DELETE FROM signals");await pool.query("DELETE FROM news_events");await pool.query("DELETE FROM pattern_signals");await pool.query("DELETE FROM market_bars");}else{memorySignals=[];memoryNews=[];memoryBars=[];memoryPatterns=[];}res.json({ok:true});}catch(e){res.status(500).json({ok:false,error:e.message});}});
 
-app.get("/api/patterns",async(req,res)=>{try{res.json({ok:true,patterns:await listPatterns(Math.min(300,Math.max(1,num(req.query.limit,100)))),settings:{minSamples:PATTERN_MIN_SAMPLES,minProbability:PATTERN_MIN_PROBABILITY,lookbackDays:PATTERN_LOOKBACK_DAYS,horizonBars:PATTERN_HORIZON_BARS}});}catch(e){res.status(500).json({ok:false,error:e.message});}});
+app.get("/api/patterns",async(req,res)=>{try{res.json({ok:true,patterns:await listPatterns(Math.min(300,Math.max(1,num(req.query.limit,100)))),settings:{minSamples:PATTERN_MIN_SAMPLES,minProbability:PATTERN_MIN_PROBABILITY,lookbackDays:PATTERN_LOOKBACK_DAYS,analysisTimeframes:ANALYSIS_TIMEFRAMES,profiles:analysisProfilesPublic()}});}catch(e){res.status(500).json({ok:false,error:e.message});}});
 
 
 app.get("/api/validation",async(req,res)=>{try{
@@ -1156,6 +1337,29 @@ app.post("/api/history-aggregate",async(req,res)=>{if(!requireAdmin(req,res))ret
   res.json({ok:true,symbol,sourceTimeframe,targetTimeframe,generated:aggregated.length,inserted,duplicates:aggregated.length-inserted,first:aggregated[0].bar_time,last:aggregated[aggregated.length-1].bar_time});
 }catch(e){res.status(400).json({ok:false,error:e.message});}});
 
+app.post("/api/history-aggregate-all",async(req,res)=>{if(!requireAdmin(req,res))return;try{
+  const symbol=clean(req.body.symbol||"US30",30).toUpperCase();
+  const sourceTimeframe="5";
+  const sourceRaw=await getBarsForBacktest(symbol,sourceTimeframe,500000);
+  const sourceBars=Array.isArray(sourceRaw)?sourceRaw:(sourceRaw&&Array.isArray(sourceRaw.rows)?sourceRaw.rows:[]);
+  if(!sourceBars.length)throw new Error(`Nu există date ${symbol} M5 pentru agregare.`);
+  const results=[];
+  for(const targetTimeframe of ANALYSIS_TIMEFRAMES.filter(item=>item!=="5")){
+    const aggregated=aggregateBars(sourceBars,sourceTimeframe,targetTimeframe,{requireComplete:true});
+    const inserted=aggregated.length?await saveBarsBatch(aggregated):0;
+    results.push({
+      targetTimeframe,
+      label:timeframeLabel(targetTimeframe),
+      generated:aggregated.length,
+      inserted,
+      duplicates:aggregated.length-inserted,
+      first:aggregated[0]?.bar_time||null,
+      last:aggregated[aggregated.length-1]?.bar_time||null
+    });
+  }
+  res.json({ok:true,symbol,sourceTimeframe,analysisTimeframes:ANALYSIS_TIMEFRAMES,results});
+}catch(e){res.status(400).json({ok:false,error:e.message});}});
+
 app.post("/api/backtest",async(req,res)=>{if(!requireAdmin(req,res))return;try{
   const symbol=clean(req.body.symbol||"US30",30).toUpperCase();
   const timeframe=clean(req.body.timeframe||ANALYSIS_TIMEFRAME,20);
@@ -1205,21 +1409,18 @@ app.post("/webhook", async(req,res)=>{try{
   if(event==="CLOSE"){const closed=await closeSignal(payload);lastWebhookResult=`ACCEPTAT CLOSE ${payload.external_id||payload.signal_id||""}`;return res.json({ok:true,closed});}
   if(event==="BAR"){
     const bar=normalizeBar(payload);
-    await saveBar(bar);
-    const closed=await trackSignalsWithBar(bar);
-    let pattern=null,created=false;
-    let generatedSignal=null,signalInserted=false;
-    if(String(bar.timeframe)===String(ANALYSIS_TIMEFRAME)){
-      pattern=await analyzeTimePattern(bar);
-      created=pattern?await savePattern(pattern):false;
-      if(created && patternQualifiesForSignal(pattern)){
-        generatedSignal=patternToSignal(pattern);
-        signalInserted=await saveSignal(generatedSignal);
-        if(signalInserted) notifyTelegramSignal(generatedSignal).catch(e=>console.error("[TELEGRAM AUTO PATTERN]",e.message));
-      }
+    const inserted=await saveBar(bar);
+    if(!inserted){
+      lastWebhookResult=`DUPLICAT BAR ${bar.symbol} ${timeframeLabel(bar.timeframe)}`;
+      return res.json({ok:true,event:"BAR",duplicate:true,bar,analysisTimeframes:ANALYSIS_TIMEFRAMES});
     }
-    lastWebhookResult=`ACCEPTAT BAR ${bar.symbol} ${bar.timeframe}${String(bar.timeframe)===String(ANALYSIS_TIMEFRAME)?" · analiză M15":" · doar colectare"}${signalInserted?" · semnal automat generat":""}`;
-    return res.json({ok:true,event:"BAR",bar,analysisTimeframe:ANALYSIS_TIMEFRAME,autoClosed:closed,pattern:created?pattern:null,generatedSignal:signalInserted?generatedSignal:null});
+    const derived=await deriveCompletedHigherBars(bar);
+    const analyses=[await processNewBar(bar,{trackTrades:true})];
+    for(const higherBar of derived)analyses.push(await processNewBar(higherBar,{trackTrades:false}));
+    const generatedSignals=analyses.map(item=>item.generatedSignal).filter(Boolean);
+    const labels=analyses.filter(item=>item.analyzed).map(item=>timeframeLabel(item.bar.timeframe)).join(", ");
+    lastWebhookResult=`ACCEPTAT BAR ${bar.symbol} ${timeframeLabel(bar.timeframe)} · analizate ${labels||"niciun interval"}${derived.length?` · agregate ${derived.map(item=>timeframeLabel(item.timeframe)).join(", ")}`:""}${generatedSignals.length?` · ${generatedSignals.length} semnal(e) automat(e)`:""}`;
+    return res.json({ok:true,event:"BAR",bar,analysisTimeframes:ANALYSIS_TIMEFRAMES,derivedBars:derived,analyses,generatedSignals});
   }
   const signal=normalizeSignal(payload); if(!["BUY","SELL"].includes(signal.signal)) throw new Error("Semnalul trebuie să fie BUY sau SELL"); const inserted=await saveSignal(signal); if(inserted) notifyTelegramSignal(signal).catch(e=>console.error("[TELEGRAM]",e.message)); lastWebhookResult=`ACCEPTAT ${signal.signal} ${signal.symbol} ${signal.timeframe} la ${signal.price}`; console.log(`[WEBHOOK] ${lastWebhookResult}`); return res.json({ok:true,signal});
 }catch(e){lastWebhookResult=`RESPINS: ${e.message}`;console.error("POST /webhook:",e);return res.status(400).json({ok:false,error:e.message});}});
@@ -1230,5 +1431,5 @@ initDb().then(async()=>{
   if(FMP_API_KEY||ALPHAVANTAGE_API_KEY||FINNHUB_API_KEY){syncRealNews().catch(e=>{lastNewsSyncError=e.message;console.error("News sync:",e.message)});setInterval(()=>syncRealNews().catch(e=>{lastNewsSyncError=e.message;console.error("News sync:",e.message)}),NEWS_AUTO_SYNC_MINUTES*60000).unref();}
   setTimeout(()=>monitorSystem().catch(e=>console.error("System monitor:",e.message)),15000).unref();
   setInterval(()=>monitorSystem().catch(e=>console.error("System monitor:",e.message)),SYSTEM_MONITOR_INTERVAL_MINUTES*60000).unref();
-  app.listen(PORT,()=>console.log(`PropTrader AI v16.4 rulează pe portul ${PORT}`));
+  app.listen(PORT,()=>console.log(`PropTrader AI v17.0 rulează pe portul ${PORT}`));
 }).catch(e=>{console.error("DB init failed:",e);process.exit(1)});

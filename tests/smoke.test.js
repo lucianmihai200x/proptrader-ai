@@ -3,11 +3,12 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 
-test('server includes v16.4 auto signals, monitoring, Telegram, aggregation and integrity backtest', () => {
+test('server includes v17 multi-timeframe analysis, monitoring, Telegram and integrity backtest', () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
-  assert.match(source, /version:"16\.4\.0"/);
-  assert.match(source, /ANALYSIS_TIMEFRAME/);
-  assert.match(source, /api\/history-aggregate/);
+  assert.match(source, /version:"17\.0\.0"/);
+  assert.match(source, /ANALYSIS_TIMEFRAMES/);
+  assert.match(source, /deriveCompletedHigherBars/);
+  assert.match(source, /api\/history-aggregate-all/);
   assert.match(source, /auditBars/);
   assert.match(source, /notifyTelegramSignal/);
   assert.match(source, /api\/telegram\/test/);
@@ -17,20 +18,22 @@ test('server includes v16.4 auto signals, monitoring, Telegram, aggregation and 
   assert.match(source, /monitorSystem/);
 });
 
-test('frontend contains defensive array handling and M15 controls', () => {
+test('frontend contains defensive array handling and M5-H4 controls', () => {
   const html = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8');
-  assert.match(html, /PropTrader AI v16\.4/);
+  assert.match(html, /PropTrader AI v17\.0/);
   assert.match(html, /asArray/);
-  assert.match(html, /aggregateM15/);
-  assert.match(html, /Backtest Integrity v16\.4/);
+  assert.match(html, /aggregateAllTimeframes/);
+  assert.match(html, /M5 · M15 · M30 · H1 · H4/);
+  assert.match(html, /Backtest Integrity v17\.0/);
   assert.match(html, /Test semnal complet/);
   assert.match(html, /Stare sistem/);
 });
 
-test('Pine engine is M15 and sends BAR plus selective SIGNAL events', () => {
-  const pine = fs.readFileSync(path.join(__dirname, '..', 'PropTrader_AI_v16_3_M15_Signal_Engine.pine'), 'utf8');
-  assert.match(pine, /timeframe\.multiplier == 15/);
+test('Pine collector runs on M5 and sends closed BAR events', () => {
+  const pine = fs.readFileSync(path.join(__dirname, '..', 'PropTrader_AI_v17_M5_H4_Collector.pine'), 'utf8');
+  assert.match(pine, /timeframe\.multiplier == 5/);
+  assert.match(pine, /barstate\.isconfirmed/);
   assert.match(pine, /event\\\":\\\"BAR/);
-  assert.match(pine, /event\\\":\\\"SIGNAL/);
-  assert.doesNotMatch(pine, /Analiză automată 30m/);
+  assert.doesNotMatch(pine, /event\\\":\\\"SIGNAL/);
+  assert.match(pine, /M5 · M15 · M30 · H1 · H4/);
 });

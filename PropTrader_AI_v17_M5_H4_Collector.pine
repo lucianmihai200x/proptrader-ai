@@ -1,0 +1,54 @@
+//@version=6
+indicator("PropTrader AI v17 — Colector M5–H4", shorttitle="PTAI M5-H4", overlay=true)
+
+// Se aplică o singură dată pe graficul M5.
+// Fiecare lumânare M5 închisă ajunge la server, care construiește automat
+// M15, M30, H1 și H4 și analizează separat toate cele cinci intervale.
+
+groupConnection = "Conectare"
+sendBars = input.bool(true, "Trimite lumânările M5 la server", group=groupConnection)
+showStatus = input.bool(true, "Arată starea pe grafic", group=groupConnection)
+
+isM5 = timeframe.isminutes and timeframe.multiplier == 5
+collectorReady = isM5 and sendBars
+
+f_num(float value) =>
+    str.tostring(value, format.mintick)
+
+f_payload() =>
+    string payload = "{\"event\":\"BAR\""
+    payload += ",\"external_id\":\"TV-" + syminfo.ticker + "-5-" + str.tostring(time) + "\""
+    payload += ",\"bar_time\":" + str.tostring(time)
+    payload += ",\"symbol\":\"" + syminfo.ticker + "\""
+    payload += ",\"timeframe\":\"5\""
+    payload += ",\"open\":" + f_num(open)
+    payload += ",\"high\":" + f_num(high)
+    payload += ",\"low\":" + f_num(low)
+    payload += ",\"close\":" + f_num(close)
+    payload += ",\"volume\":" + str.tostring(nz(volume, 0))
+    payload += "}"
+    payload
+
+if collectorReady and barstate.isconfirmed
+    alert(f_payload(), alert.freq_once_per_bar_close)
+
+var table statusTable = table.new(position.top_right, 1, 3)
+if showStatus and barstate.islast
+    table.cell(statusTable, 0, 0, "PropTrader AI v17")
+    table.cell(statusTable, 0, 1, collectorReady ? "Colector M5 ACTIV" : "Schimbă graficul pe M5")
+    table.cell(statusTable, 0, 2, "Server: M5 · M15 · M30 · H1 · H4")
+
+plotshape(
+     collectorReady and barstate.isconfirmed,
+     title="BAR M5 trimis",
+     style=shape.circle,
+     location=location.bottom,
+     size=size.tiny,
+     color=color.new(color.blue, 75)
+)
+
+alertcondition(
+     collectorReady and barstate.isconfirmed,
+     title="PropTrader AI v17 — colectare M5",
+     message="La crearea alertei selectează «Any alert() function call»."
+)
