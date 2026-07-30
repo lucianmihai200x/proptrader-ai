@@ -4,6 +4,7 @@ const { Pool } = require("pg");
 const { getHistoricalRates } = require("dukascopy-node");
 const telegram = require("./telegram");
 const { buildBacktest, auditBars, aggregateBars } = require("./backtest");
+const { fetchOfficialNews } = require("./news_feeds");
 const {
   SUPPORTED_ANALYSIS_TIMEFRAMES,
   normalizeTimeframe,
@@ -39,8 +40,10 @@ const ANALYSIS_TIMEFRAME = ANALYSIS_TIMEFRAMES.includes(requestedPrimaryTimefram
   ? requestedPrimaryTimeframe
   : (ANALYSIS_TIMEFRAMES.includes("15") ? "15" : ANALYSIS_TIMEFRAMES[0]);
 const FMP_API_KEY = process.env.FMP_API_KEY || "";
+const FMP_ENABLED = String(process.env.FMP_ENABLED || "false").toLowerCase() === "true";
 const ALPHAVANTAGE_API_KEY = process.env.ALPHAVANTAGE_API_KEY || "";
 const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY || "";
+const OFFICIAL_NEWS_ENABLED = String(process.env.OFFICIAL_NEWS_ENABLED || "true").toLowerCase() !== "false";
 const NEWS_MAX_AGE_HOURS = Math.max(12, Number(process.env.NEWS_MAX_AGE_HOURS || 96));
 const NEWS_MIN_RELEVANCE = Math.max(0, Math.min(100, Number(process.env.NEWS_MIN_RELEVANCE || 35)));
 const NEWS_AUTO_SYNC_MINUTES = Math.max(15, Number(process.env.NEWS_AUTO_SYNC_MINUTES || 60));
@@ -58,10 +61,13 @@ const WEBHOOK_STALE_MINUTES = Math.max(20, Number(process.env.WEBHOOK_STALE_MINU
 const SYSTEM_MONITOR_INTERVAL_MINUTES = Math.max(5, Number(process.env.SYSTEM_MONITOR_INTERVAL_MINUTES || 5));
 const TELEGRAM_SYSTEM_ALERTS = String(process.env.TELEGRAM_SYSTEM_ALERTS || "true").toLowerCase() !== "false";
 const NEWS_UNAVAILABLE_RISK = Math.max(0, Math.min(100, Number(process.env.NEWS_UNAVAILABLE_RISK || 55)));
+const NEWS_CALENDAR_UNAVAILABLE_RISK = Math.max(0, Math.min(100, Number(process.env.NEWS_CALENDAR_UNAVAILABLE_RISK || 35)));
 const NEWS_COUNTRIES = (process.env.NEWS_COUNTRIES || "US").split(",").map(x=>x.trim().toUpperCase()).filter(Boolean);
 let lastNewsSync = null;
 let lastSuccessfulNewsSync = null;
 let lastNewsSyncError = "";
+let lastNewsProviderResults = [];
+let lastSuccessfulCalendarSync = null;
 let lastSystemAlertKey = "";
 let lastSystemAlertAt = null;
 let lastDbCheckAt = null;
@@ -142,12 +148,20 @@ function marketExpectedOpen(now = new Date()) {
 
 function newsCoverageStatus() {
   const ageMinutes = minutesSince(lastSuccessfulNewsSync);
-  const healthy = ageMinutes !== null && ageMinutes <= NEWS_MAX_AGE_HOURS * 60;
+  const calendarAgeMinutes = minutesSince(lastSuccessfulCalendarSync);
+  const headlineHealthy = ageMinutes !== null && ageMinutes <= NEWS_MAX_AGE_HOURS * 60;
+  const calendarHealthy = calendarAgeMinutes !== null && calendarAgeMinutes <= NEWS_MAX_AGE_HOURS * 60;
   return {
-    healthy,
+    healthy: headlineHealthy,
+    headlineHealthy,
+    calendarHealthy,
     lastSuccessfulNewsSync,
+    lastSuccessfulCalendarSync,
     ageMinutes: ageMinutes === null ? null : Number(ageMinutes.toFixed(1)),
+    calendarAgeMinutes: calendarAgeMinutes === null ? null : Number(calendarAgeMinutes.toFixed(1)),
     unavailableRisk: NEWS_UNAVAILABLE_RISK,
+    calendarUnavailableRisk: NEWS_CALENDAR_UNAVAILABLE_RISK,
+    providers: lastNewsProviderResults,
     error: lastNewsSyncError || ""
   };
 }
@@ -182,6 +196,7 @@ function systemWarnings() {
   if (!telegram.status().configured) warnings.push({ code: "TELEGRAM_OFF", severity: "warning", message: "Telegram nu este configurat complet." });
   const news = newsCoverageStatus();
   if (!news.healthy) warnings.push({ code: "NEWS_COVERAGE", severity: "warning", message: lastNewsSyncError ? `Filtrul de știri este degradat: ${lastNewsSyncError}` : "Nu există o sincronizare recentă și reușită a știrilor." });
+  else if (!news.calendarHealthy) warnings.push({ code: "NEWS_CALENDAR", severity: "warning", message: `Fluxurile oficiale sunt active, dar calendarul economic anticipat nu este disponibil; se aplică risc de siguranță ${NEWS_CALENDAR_UNAVAILABLE_RISK}/100.` });
   if (telegram.MIN_SCORE > LIVE_MIN_ADAPTIVE_SCORE) warnings.push({ code: "THRESHOLD_GAP", severity: "info", message: `Semnalele LIVE între ${LIVE_MIN_ADAPTIVE_SCORE} și ${telegram.MIN_SCORE - 1} rămân în aplicație, fără notificare Telegram.` });
   return warnings;
 }
@@ -191,7 +206,7 @@ async function buildSystemStatus() {
   const webhookAge = minutesSince(lastWebhookAt);
   return {
     ok: database.ok,
-    version: "17.0.0",
+    version: "17.1.0",
     database,
     webhook: {
       lastAt: lastWebhookAt,
@@ -378,6 +393,8 @@ async function initDb() {
   await pool.query(`CREATE INDEX IF NOT EXISTS telegram_logs_created_idx ON telegram_logs(created_at DESC)`);
   const newsState = await pool.query(`SELECT MAX(received_at) AS last_received FROM news_events`);
   if (newsState.rows[0]?.last_received) lastSuccessfulNewsSync = new Date(newsState.rows[0].last_received).toISOString();
+  const calendarState = await pool.query(`SELECT MAX(received_at) AS last_received FROM news_events WHERE scheduled=TRUE`);
+  if (calendarState.rows[0]?.last_received) lastSuccessfulCalendarSync = new Date(calendarState.rows[0].last_received).toISOString();
 }
 
 function setupKey(p) {
@@ -467,13 +484,16 @@ function normalizeNews(p) {
   const summary = clean(p.summary || p.description || p.content, 3000);
   const a = analyzeNewsText(title, summary);
   const suppliedImpact = num(p.impact, NaN);
+  const publishedAt = new Date(p.published_at || p.publishedAt || p.date || Date.now());
   return {
     external_id: clean(p.external_id || p.id || p.guid || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, 180),
-    published_at: p.published_at || p.publishedAt || p.date || new Date().toISOString(), title, summary,
+    published_at: Number.isNaN(publishedAt.getTime()) ? new Date().toISOString() : publishedAt.toISOString(), title, summary,
     source: clean(p.source?.name || p.source, 150), url: clean(p.url, 1000),
     symbols: Array.isArray(p.symbols) && p.symbols.length ? p.symbols.map(x => clean(x, 30).toUpperCase()) : a.symbols,
     impact: Number.isFinite(suppliedImpact) ? Math.max(0, Math.min(100, suppliedImpact)) : a.impact,
-    bias: clean(p.bias || a.bias, 20).toUpperCase(), category: clean(p.category || a.category, 50), raw: p
+    bias: clean(p.bias || a.bias, 20).toUpperCase(), category: clean(p.category || a.category, 50),
+    provider: clean(p.provider, 80), sentiment: num(p.sentiment), relevance: Math.max(0, Math.min(100, num(p.relevance, 50))),
+    confidence: Math.max(0, Math.min(100, num(p.confidence, 50))), scheduled: bool(p.scheduled), raw: p
   };
 }
 
@@ -490,6 +510,7 @@ async function recentNewsRisk(symbol, at = new Date()) {
   if (!relevant.length) {
     const coverage = newsCoverageStatus();
     if (!coverage.healthy) return { risk: NEWS_UNAVAILABLE_RISK, bias: "NEUTRAL", summary: `Filtrul de știri nu are acoperire recentă; risc de siguranță ${NEWS_UNAVAILABLE_RISK}/100.` };
+    if (!coverage.calendarHealthy) return { risk: NEWS_CALENDAR_UNAVAILABLE_RISK, bias: "NEUTRAL", summary: `Fluxurile oficiale sunt active, dar calendarul economic anticipat nu este disponibil; risc de siguranță ${NEWS_CALENDAR_UNAVAILABLE_RISK}/100.` };
     return { risk: 0, bias: "NEUTRAL", summary: "Fără știri relevante în fereastra ±3h." };
   }
   const max = relevant.reduce((a, n) => Number(n.impact) > Number(a.impact) ? n : a, relevant[0]);
@@ -577,13 +598,45 @@ function fmpImpact(importance){
   if(x.includes("high"))return 90;if(x.includes("medium"))return 60;if(x.includes("low"))return 30;return 45;
 }
 
+async function syncOfficialNews() {
+  if (!OFFICIAL_NEWS_ENABLED) return { provider: "Fluxuri oficiale SUA", configured: false, disabled: true, received: 0, accepted: 0, saved: 0 };
+  const result = await fetchOfficialNews();
+  let saved = 0;
+  for (const item of result.items) {
+    const n = normalizeNews({
+      external_id: item.externalId,
+      published_at: item.publishedAt,
+      title: item.title,
+      summary: item.summary,
+      source: item.source,
+      provider: item.feedId,
+      url: item.url,
+      relevance: 90,
+      confidence: 95,
+      scheduled: false,
+      raw: item
+    });
+    await saveNews(n);
+    saved++;
+  }
+  return {
+    provider: "Fluxuri oficiale SUA",
+    configured: true,
+    received: result.items.length,
+    accepted: result.items.length,
+    saved,
+    feeds: result.feeds
+  };
+}
+
 async function syncFmpCalendar() {
-  if(!FMP_API_KEY) return {provider:"FMP",configured:false,received:0,accepted:0,saved:0};
+  if(!FMP_ENABLED) return {provider:"FMP",configured:false,disabled:true,keyConfigured:Boolean(FMP_API_KEY),reason:"Oprit implicit; activează FMP_ENABLED numai cu un plan FMP compatibil.",received:0,accepted:0,saved:0};
+  if(!FMP_API_KEY) return {provider:"FMP",configured:false,disabled:false,keyConfigured:false,received:0,accepted:0,saved:0};
   const now=new Date(), from=new Date(now.getTime()-24*3600000), to=new Date(now.getTime()+7*86400000);
   const iso=d=>d.toISOString().slice(0,10);
   const url=`https://financialmodelingprep.com/stable/economic-calendar?from=${iso(from)}&to=${iso(to)}&apikey=${encodeURIComponent(FMP_API_KEY)}`;
   const response=await fetch(url,{headers:{accept:"application/json"}});
-  if(!response.ok) throw new Error(`FMP a răspuns cu HTTP ${response.status}`);
+  if(!response.ok) throw new Error(response.status === 402 ? "FMP necesită un plan compatibil pentru calendarul economic (HTTP 402)" : `FMP a răspuns cu HTTP ${response.status}`);
   const items=await response.json();
   if(!Array.isArray(items)) throw new Error("Răspuns FMP neașteptat");
   let saved=0, accepted=0;
@@ -596,6 +649,7 @@ async function syncFmpCalendar() {
     const n=normalizeNews({external_id:`FMP-${item.id||`${item.date}-${title}`}`,published_at:item.date||item.datetime||new Date().toISOString(),title,summary,source:"Financial Modeling Prep",provider:"FMP",impact:fmpImpact(item.impact||item.importance),category:"ECONOMIC_CALENDAR",scheduled:true,relevance:95,confidence:90,raw:item});
     await saveNews(n); saved++;
   }
+  lastSuccessfulCalendarSync = new Date().toISOString();
   return {provider:"FMP",configured:true,received:items.length,accepted,saved};
 }
 
@@ -646,15 +700,22 @@ async function syncFinnhubNews(){
 }
 
 async function syncRealNews() {
-  if(!FMP_API_KEY && !ALPHAVANTAGE_API_KEY && !FINNHUB_API_KEY) throw new Error("Configurează cel puțin o cheie: FMP_API_KEY, ALPHAVANTAGE_API_KEY sau FINNHUB_API_KEY");
   const results=[];
-  for(const fn of [syncFmpCalendar,syncAlphaVantageNews,syncFinnhubNews]){
-    try{results.push(await fn());}catch(e){results.push({provider:fn.name,configured:true,error:e.message,received:0,accepted:0,saved:0});}
+  const providers = [
+    ["Fluxuri oficiale SUA", syncOfficialNews],
+    ["FMP", syncFmpCalendar],
+    ["Alpha Vantage", syncAlphaVantageNews],
+    ["Finnhub", syncFinnhubNews]
+  ];
+  for(const [provider,fn] of providers){
+    try{results.push(await fn());}catch(e){results.push({provider,configured:true,error:e.message,received:0,accepted:0,saved:0});}
   }
   const received=results.reduce((a,x)=>a+num(x.received),0), accepted=results.reduce((a,x)=>a+num(x.accepted),0), saved=results.reduce((a,x)=>a+num(x.saved),0);
   lastNewsSync=new Date().toISOString();
   if (results.some(x => x.configured && !x.error)) lastSuccessfulNewsSync = lastNewsSync;
+  lastNewsProviderResults = results;
   lastNewsSyncError=results.filter(x=>x.error).map(x=>`${x.provider}: ${x.error}`).join(" | ");
+  if (!results.some(x => x.configured && !x.error)) throw new Error(lastNewsSyncError || "Nu există nicio sursă de știri activă.");
   return {received,accepted,saved,providers:results,lastNewsSync,lastNewsSyncError};
 }
 
@@ -1174,7 +1235,7 @@ async function notifyTelegramSignal(signal) {
   }
 }
 
-app.get("/health", (req,res)=>res.json({ok:true,version:"17.0.0",database:pool?"postgres":"memory",archiveAfterHours:ARCHIVE_AFTER_HOURS,adminKeyConfigured:Boolean(ADMIN_KEY),newsWebhookConfigured:Boolean(NEWS_WEBHOOK_KEY),fmpConfigured:Boolean(FMP_API_KEY),alphaVantageConfigured:Boolean(ALPHAVANTAGE_API_KEY),finnhubConfigured:Boolean(FINNHUB_API_KEY),autoTrackTrades:AUTO_TRACK_TRADES,lastNewsSync,lastSuccessfulNewsSync,lastNewsSyncError,newsCoverage:newsCoverageStatus(),patternMinSamples:PATTERN_MIN_SAMPLES,patternMinProbability:PATTERN_MIN_PROBABILITY,analysisTimeframe:ANALYSIS_TIMEFRAME,analysisTimeframes:ANALYSIS_TIMEFRAMES,analysisProfiles:analysisProfilesPublic(),lastBarAtByTimeframe:{...lastBarAtByTimeframe},autoPatternSignals:AUTO_PATTERN_SIGNALS,patternSignalMinSamples:PATTERN_SIGNAL_MIN_SAMPLES,patternSignalMinProbability:PATTERN_SIGNAL_MIN_PROBABILITY,patternSignalMinScore:PATTERN_SIGNAL_MIN_SCORE,liveMinAdaptiveScore:LIVE_MIN_ADAPTIVE_SCORE,learningMinSamples:LEARNING_MIN_SAMPLES,maxNewsRiskLive:MAX_NEWS_RISK_LIVE,maxConsecutiveLosses:MAX_CONSECUTIVE_LOSSES,webhookStaleMinutes:WEBHOOK_STALE_MINUTES,telegramSystemAlerts:TELEGRAM_SYSTEM_ALERTS,telegram:telegram.status(),lastTelegramAt,lastTelegramResult,lastSystemAlertAt,lastWebhookAt,lastWebhookResult,warnings:systemWarnings(),time:new Date().toISOString()}));
+app.get("/health", (req,res)=>res.json({ok:true,version:"17.1.0",database:pool?"postgres":"memory",archiveAfterHours:ARCHIVE_AFTER_HOURS,adminKeyConfigured:Boolean(ADMIN_KEY),newsWebhookConfigured:Boolean(NEWS_WEBHOOK_KEY),officialNewsEnabled:OFFICIAL_NEWS_ENABLED,fmpEnabled:FMP_ENABLED,fmpKeyConfigured:Boolean(FMP_API_KEY),fmpConfigured:FMP_ENABLED&&Boolean(FMP_API_KEY),alphaVantageConfigured:Boolean(ALPHAVANTAGE_API_KEY),finnhubConfigured:Boolean(FINNHUB_API_KEY),autoTrackTrades:AUTO_TRACK_TRADES,lastNewsSync,lastSuccessfulNewsSync,lastNewsSyncError,newsProviders:lastNewsProviderResults,newsCoverage:newsCoverageStatus(),patternMinSamples:PATTERN_MIN_SAMPLES,patternMinProbability:PATTERN_MIN_PROBABILITY,analysisTimeframe:ANALYSIS_TIMEFRAME,analysisTimeframes:ANALYSIS_TIMEFRAMES,analysisProfiles:analysisProfilesPublic(),lastBarAtByTimeframe:{...lastBarAtByTimeframe},autoPatternSignals:AUTO_PATTERN_SIGNALS,patternSignalMinSamples:PATTERN_SIGNAL_MIN_SAMPLES,patternSignalMinProbability:PATTERN_SIGNAL_MIN_PROBABILITY,patternSignalMinScore:PATTERN_SIGNAL_MIN_SCORE,liveMinAdaptiveScore:LIVE_MIN_ADAPTIVE_SCORE,learningMinSamples:LEARNING_MIN_SAMPLES,maxNewsRiskLive:MAX_NEWS_RISK_LIVE,maxConsecutiveLosses:MAX_CONSECUTIVE_LOSSES,webhookStaleMinutes:WEBHOOK_STALE_MINUTES,telegramSystemAlerts:TELEGRAM_SYSTEM_ALERTS,telegram:telegram.status(),lastTelegramAt,lastTelegramResult,lastSystemAlertAt,lastWebhookAt,lastWebhookResult,warnings:systemWarnings(),time:new Date().toISOString()}));
 app.get("/api/system-status", async(req,res)=>{try{res.json(await buildSystemStatus());}catch(e){res.status(500).json({ok:false,error:e.message});}});
 
 app.get("/api/signals", async(req,res)=>{ try { const mode=req.query.mode==="archive"?"archive":"active"; res.json({ok:true,mode,signals:await listSignals(mode,req.query),analytics:await analytics()}); } catch(e){ console.error(e); res.status(500).json({ok:false,error:e.message}); } });
@@ -1187,16 +1248,16 @@ app.get("/api/news", async(req,res)=>{ try {
   res.json({ok:true,news:rows});
 } catch(e){res.status(500).json({ok:false,error:e.message});} });
 
-app.get("/api/news-status",(req,res)=>res.json({ok:true,fmpConfigured:Boolean(FMP_API_KEY),alphaVantageConfigured:Boolean(ALPHAVANTAGE_API_KEY),finnhubConfigured:Boolean(FINNHUB_API_KEY),lastNewsSync,lastSuccessfulNewsSync,lastNewsSyncError,coverage:newsCoverageStatus(),autoSyncMinutes:NEWS_AUTO_SYNC_MINUTES,maxAgeHours:NEWS_MAX_AGE_HOURS,minRelevance:NEWS_MIN_RELEVANCE}));
+app.get("/api/news-status",(req,res)=>res.json({ok:true,officialNewsEnabled:OFFICIAL_NEWS_ENABLED,fmpEnabled:FMP_ENABLED,fmpKeyConfigured:Boolean(FMP_API_KEY),fmpConfigured:FMP_ENABLED&&Boolean(FMP_API_KEY),alphaVantageConfigured:Boolean(ALPHAVANTAGE_API_KEY),finnhubConfigured:Boolean(FINNHUB_API_KEY),providerResults:lastNewsProviderResults,lastNewsSync,lastSuccessfulNewsSync,lastSuccessfulCalendarSync,lastNewsSyncError,coverage:newsCoverageStatus(),autoSyncMinutes:NEWS_AUTO_SYNC_MINUTES,maxAgeHours:NEWS_MAX_AGE_HOURS,minRelevance:NEWS_MIN_RELEVANCE}));
 
 app.post("/api/news-sync",async(req,res)=>{if(!requireAdmin(req,res))return;try{res.json({ok:true,...await syncRealNews()});}catch(e){lastNewsSyncError=e.message;res.status(400).json({ok:false,error:e.message});}});
 
-app.post("/api/news", async(req,res)=>{ if(!requireAdmin(req,res))return; try{ const list=Array.isArray(req.body.items)?req.body.items:[req.body]; const saved=[]; for(const p of list){const n=normalizeNews(p);await saveNews(n);saved.push(n);}lastSuccessfulNewsSync=new Date().toISOString();res.json({ok:true,saved}); }catch(e){res.status(400).json({ok:false,error:e.message});} });
+app.post("/api/news", async(req,res)=>{ if(!requireAdmin(req,res))return; try{ const list=Array.isArray(req.body.items)?req.body.items:[req.body]; const saved=[]; for(const p of list){const n=normalizeNews(p);await saveNews(n);saved.push(n);}lastSuccessfulNewsSync=new Date().toISOString();if(saved.some(n=>n.scheduled))lastSuccessfulCalendarSync=lastSuccessfulNewsSync;res.json({ok:true,saved}); }catch(e){res.status(400).json({ok:false,error:e.message});} });
 
 app.post("/news-webhook", async(req,res)=>{ try{
   const key=req.query.key||req.get("x-news-key")||""; if(!NEWS_WEBHOOK_KEY||key!==NEWS_WEBHOOK_KEY)return res.status(401).json({ok:false,error:"NEWS_WEBHOOK_KEY incorectă"});
   const payload=parseBody(req); const list=Array.isArray(payload)?payload:(Array.isArray(payload.items)?payload.items:[payload]); const saved=[];
-  for(const p of list){const n=normalizeNews(p);await saveNews(n);saved.push(n);} lastSuccessfulNewsSync=new Date().toISOString(); res.json({ok:true,count:saved.length,saved});
+  for(const p of list){const n=normalizeNews(p);await saveNews(n);saved.push(n);} lastSuccessfulNewsSync=new Date().toISOString(); if(saved.some(n=>n.scheduled))lastSuccessfulCalendarSync=lastSuccessfulNewsSync; res.json({ok:true,count:saved.length,saved});
 }catch(e){res.status(400).json({ok:false,error:e.message});} });
 
 app.get("/api/telegram/status", async(req,res)=>{try{let logs;if(!pool)logs=(global.memoryTelegramLogs||[]).slice(0,20);else logs=(await pool.query(`SELECT * FROM telegram_logs ORDER BY created_at DESC LIMIT 20`)).rows;res.json({ok:true,telegram:telegram.status(),lastTelegramAt,lastTelegramResult,logs});}catch(e){res.status(500).json({ok:false,error:e.message});}});
@@ -1428,8 +1489,8 @@ app.post("/webhook", async(req,res)=>{try{
 initDb().then(async()=>{
   await archiveOldSignals();
   setInterval(()=>archiveOldSignals().catch(e=>console.error("Auto-archive:",e)),15*60*1000).unref();
-  if(FMP_API_KEY||ALPHAVANTAGE_API_KEY||FINNHUB_API_KEY){syncRealNews().catch(e=>{lastNewsSyncError=e.message;console.error("News sync:",e.message)});setInterval(()=>syncRealNews().catch(e=>{lastNewsSyncError=e.message;console.error("News sync:",e.message)}),NEWS_AUTO_SYNC_MINUTES*60000).unref();}
+  if(OFFICIAL_NEWS_ENABLED||(FMP_ENABLED&&FMP_API_KEY)||ALPHAVANTAGE_API_KEY||FINNHUB_API_KEY){syncRealNews().catch(e=>{lastNewsSyncError=e.message;console.error("News sync:",e.message)});setInterval(()=>syncRealNews().catch(e=>{lastNewsSyncError=e.message;console.error("News sync:",e.message)}),NEWS_AUTO_SYNC_MINUTES*60000).unref();}
   setTimeout(()=>monitorSystem().catch(e=>console.error("System monitor:",e.message)),15000).unref();
   setInterval(()=>monitorSystem().catch(e=>console.error("System monitor:",e.message)),SYSTEM_MONITOR_INTERVAL_MINUTES*60000).unref();
-  app.listen(PORT,()=>console.log(`PropTrader AI v17.0 rulează pe portul ${PORT}`));
+  app.listen(PORT,()=>console.log(`PropTrader AI v17.1 rulează pe portul ${PORT}`));
 }).catch(e=>{console.error("DB init failed:",e);process.exit(1)});

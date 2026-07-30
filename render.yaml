@@ -46,6 +46,12 @@ services:
         value: true
       - key: NEWS_UNAVAILABLE_RISK
         value: 55
+      - key: NEWS_CALENDAR_UNAVAILABLE_RISK
+        value: 35
+      - key: OFFICIAL_NEWS_ENABLED
+        value: true
+      - key: FMP_ENABLED
+        value: false
 
 databases:
   - name: proptrader-db

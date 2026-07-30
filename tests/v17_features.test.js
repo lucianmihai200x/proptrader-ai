@@ -10,6 +10,8 @@ test('server converts robust multi-timeframe patterns into signals and applies n
   assert.match(source, /analysisProfile/);
   assert.match(source, /higherTimeframeConfirmation/);
   assert.match(source, /NEWS_UNAVAILABLE_RISK/);
+  assert.match(source, /NEWS_CALENDAR_UNAVAILABLE_RISK/);
+  assert.match(source, /fetchOfficialNews/);
   assert.match(source, /generatedSignals/);
 });
 
