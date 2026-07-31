@@ -66,6 +66,8 @@ services:
         value: 35
       - key: OFFICIAL_NEWS_ENABLED
         value: true
+      - key: NEWS_COUNTRIES
+        value: US,DE,GERMANY,EU,EA,EURO AREA
       - key: FMP_ENABLED
         value: false
 

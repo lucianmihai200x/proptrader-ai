@@ -1,6 +1,13 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { parseRssItems, fetchOfficialNews } = require("../news_feeds");
+const { OFFICIAL_NEWS_FEEDS, parseRssItems, fetchOfficialNews } = require("../news_feeds");
+
+test("official feeds cover US macro, ECB and EIA energy news", () => {
+  const ids = OFFICIAL_NEWS_FEEDS.map(feed => feed.id);
+  assert.deepEqual(ids, ["FED_MONETARY", "BLS_LATEST", "ECB_PRESS", "EIA_TODAY_IN_ENERGY", "EIA_PRESS"]);
+  assert.equal(OFFICIAL_NEWS_FEEDS.find(feed => feed.id === "ECB_PRESS").url, "https://www.ecb.europa.eu/rss/press.html");
+  assert.equal(OFFICIAL_NEWS_FEEDS.find(feed => feed.id === "EIA_TODAY_IN_ENERGY").url, "https://www.eia.gov/rss/todayinenergy.xml");
+});
 
 test("parseRssItems reads RSS and Atom entries", () => {
   const xml = `<?xml version="1.0"?>

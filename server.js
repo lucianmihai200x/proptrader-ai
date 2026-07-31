@@ -26,7 +26,7 @@ const {
 } = require("./timeframes");
 
 const app = express();
-const APP_VERSION = "18.5.0";
+const APP_VERSION = "18.6.0";
 let lastWebhookAt = null;
 let lastWebhookResult = "Niciun webhook primit după pornire";
 let lastTelegramAt = null;
@@ -74,7 +74,7 @@ const SYSTEM_MONITOR_INTERVAL_MINUTES = Math.max(5, Number(process.env.SYSTEM_MO
 const TELEGRAM_SYSTEM_ALERTS = String(process.env.TELEGRAM_SYSTEM_ALERTS || "true").toLowerCase() !== "false";
 const NEWS_UNAVAILABLE_RISK = Math.max(0, Math.min(100, Number(process.env.NEWS_UNAVAILABLE_RISK || 55)));
 const NEWS_CALENDAR_UNAVAILABLE_RISK = Math.max(0, Math.min(100, Number(process.env.NEWS_CALENDAR_UNAVAILABLE_RISK || 35)));
-const NEWS_COUNTRIES = (process.env.NEWS_COUNTRIES || "US").split(",").map(x=>x.trim().toUpperCase()).filter(Boolean);
+const NEWS_COUNTRIES = (process.env.NEWS_COUNTRIES || "US,DE,GERMANY,EU,EA,EURO AREA").split(",").map(x=>x.trim().toUpperCase()).filter(Boolean);
 const SMC_ENABLED = String(process.env.SMC_ENABLED || "true").toLowerCase() !== "false";
 const SMC_MIN_SCORE = Math.max(50, Math.min(95, Number(process.env.SMC_MIN_SCORE || 68)));
 const SMC_NOTIFY_PENDING_SCORE = Math.max(SMC_MIN_SCORE, Math.min(95, Number(process.env.SMC_NOTIFY_PENDING_SCORE || 78)));
@@ -572,6 +572,8 @@ function newsSymbols(text) {
   if (/DOW|US30|DJIA|WALL STREET|FED|FOMC|CPI|NFP|JOBS|INFLATION|INTEREST RATE/.test(t)) out.add("US30");
   if (/NASDAQ|NAS100|NDX|TECH STOCK|SEMICONDUCTOR/.test(t)) out.add("NAS100");
   if (/GOLD|XAU|BULLION|METAL|FED|FOMC|CPI|INFLATION|DOLLAR|TREASURY/.test(t)) out.add("XAUUSD");
+  if (/\bDAX(?:40)?\b|\bGER40\b|\bDE40\b|GERMANY 40|GERMAN(?:Y)?|BUNDESBANK|\bECB\b|EURO\s?ZONE|EURO AREA/.test(t)) out.add("GER40");
+  if (/\bUSOIL\b|\bWTI\b|WEST TEXAS|CRUDE OIL|OIL PRICE|\bOPEC\+?\b|\bEIA\b|PETROLEUM|OIL INVENTOR|CRUDE (?:STOCK|SUPPLY)|REFINERY/.test(t)) out.add("USOIL");
   return [...out];
 }
 
@@ -579,20 +581,21 @@ function analyzeNewsText(title, summary = "") {
   const text = `${title} ${summary}`.toLowerCase();
   let impact = 15;
   let category = "GENERAL";
-  const high = ["fomc", "federal reserve", "interest rate", "rate decision", "cpi", "inflation", "nonfarm", "nfp", "payroll", "unemployment", "gdp", "pce", "powell", "war", "missile", "sanction", "tariff", "bank crisis"];
-  const medium = ["jobless claims", "retail sales", "consumer confidence", "ism", "pmi", "treasury yield", "dollar index", "earnings", "oil price"];
+  const high = ["fomc", "federal reserve", "ecb", "interest rate", "rate decision", "cpi", "inflation", "nonfarm", "nfp", "payroll", "unemployment", "gdp", "pce", "powell", "lagarde", "opec", "production cut", "supply disruption", "war", "missile", "sanction", "tariff", "bank crisis"];
+  const medium = ["jobless claims", "retail sales", "consumer confidence", "ism", "pmi", "ifo", "zew", "treasury yield", "dollar index", "earnings", "oil price", "crude oil", "petroleum", "oil inventories", "oil stocks", "eia"];
   if (high.some(k => text.includes(k))) impact = 90;
   else if (medium.some(k => text.includes(k))) impact = 60;
   else if (/breaking|unexpected|surprise|emergency|record/.test(text)) impact = 45;
 
-  if (/fomc|federal reserve|interest rate|powell/.test(text)) category = "CENTRAL_BANK";
+  if (/fomc|federal reserve|ecb|interest rate|powell|lagarde|bundesbank/.test(text)) category = "CENTRAL_BANK";
   else if (/cpi|inflation|pce/.test(text)) category = "INFLATION";
   else if (/nonfarm|nfp|payroll|unemployment|jobless/.test(text)) category = "LABOR";
+  else if (/wti|crude oil|oil price|opec|eia|petroleum|refinery/.test(text)) category = "ENERGY";
   else if (/war|missile|sanction|tariff/.test(text)) category = "GEOPOLITICAL";
   else if (/earnings/.test(text)) category = "EARNINGS";
 
-  const positive = ["beats", "stronger", "growth", "rally", "easing", "rate cut", "cooling inflation", "ceasefire", "stimulus"];
-  const negative = ["misses", "weaker", "recession", "selloff", "rate hike", "hot inflation", "escalation", "default", "crisis"];
+  const positive = ["beats", "stronger", "growth", "rally", "easing", "rate cut", "cooling inflation", "ceasefire", "stimulus", "inventory draw", "inventories decreased", "production cut", "supply disruption"];
+  const negative = ["misses", "weaker", "recession", "selloff", "rate hike", "hot inflation", "escalation", "default", "crisis", "inventory build", "inventories increased", "production increase", "oversupply"];
   const pos = positive.filter(k => text.includes(k)).length;
   const neg = negative.filter(k => text.includes(k)).length;
   const bias = pos > neg ? "POSITIVE" : neg > pos ? "NEGATIVE" : "NEUTRAL";
@@ -799,10 +802,15 @@ function fmpImpact(importance){
 }
 
 async function syncOfficialNews() {
-  if (!OFFICIAL_NEWS_ENABLED) return { provider: "Fluxuri oficiale SUA", configured: false, disabled: true, received: 0, accepted: 0, saved: 0 };
+  if (!OFFICIAL_NEWS_ENABLED) return { provider: "Fluxuri oficiale", configured: false, disabled: true, received: 0, accepted: 0, saved: 0 };
   const result = await fetchOfficialNews();
+  let accepted = 0;
   let saved = 0;
   for (const item of result.items) {
+    const inferred = newsSymbols(`${item.title} ${item.summary}`);
+    if (item.feedId === "ECB_PRESS" && !inferred.includes("GER40")) inferred.push("GER40");
+    if (item.feedId.startsWith("EIA_") && !inferred.includes("USOIL")) continue;
+    if (!inferred.length) continue;
     const n = normalizeNews({
       external_id: item.externalId,
       published_at: item.publishedAt,
@@ -811,19 +819,21 @@ async function syncOfficialNews() {
       source: item.source,
       provider: item.feedId,
       url: item.url,
+      symbols: inferred,
       relevance: 90,
       confidence: 95,
       scheduled: false,
       raw: item
     });
+    accepted++;
     await saveNews(n);
     saved++;
   }
   return {
-    provider: "Fluxuri oficiale SUA",
+    provider: "Fluxuri oficiale",
     configured: true,
     received: result.items.length,
-    accepted: result.items.length,
+    accepted,
     saved,
     feeds: result.feeds
   };
@@ -907,7 +917,7 @@ async function syncFinnhubNews(){
 async function syncRealNews() {
   const results=[];
   const providers = [
-    ["Fluxuri oficiale SUA", syncOfficialNews],
+    ["Fluxuri oficiale", syncOfficialNews],
     ["FMP", syncFmpCalendar],
     ["Alpha Vantage", syncAlphaVantageNews],
     ["Finnhub", syncFinnhubNews]
@@ -2085,7 +2095,7 @@ app.post("/api/test-signal",async(req,res)=>{ if(!requireAdmin(req,res))return; 
   await saveSignal(s);res.json({ok:true,signal:s});
 }catch(e){res.status(400).json({ok:false,error:e.message});} });
 
-app.post("/api/test-news",async(req,res)=>{ if(!requireAdmin(req,res))return; try{const n=normalizeNews({external_id:`NEWS-${Date.now()}`,title:"FOMC interest rate decision and Powell press conference",summary:"High-impact Federal Reserve event may increase volatility in US indices and gold.",source:"PropTrader test",symbols:["US30","NAS100","XAUUSD"],impact:90});await saveNews(n);res.json({ok:true,news:n});}catch(e){res.status(500).json({ok:false,error:e.message});} });
+app.post("/api/test-news",async(req,res)=>{ if(!requireAdmin(req,res))return; try{const n=normalizeNews({external_id:`NEWS-${Date.now()}`,title:"FOMC, ECB and crude oil volatility test",summary:"High-impact central-bank and energy event may increase volatility in US indices, GER40, gold and USOIL.",source:"PropTrader test",symbols:["US30","NAS100","XAUUSD","GER40","USOIL"],impact:90});await saveNews(n);res.json({ok:true,news:n});}catch(e){res.status(500).json({ok:false,error:e.message});} });
 
 app.post("/api/manual-close",async(req,res)=>{if(!requireAdmin(req,res))return;try{res.json({ok:true,closed:await closeSignal(req.body)});}catch(e){res.status(400).json({ok:false,error:e.message});}});
 app.post("/api/clear",async(req,res)=>{if(!requireAdmin(req,res))return;try{if(pool){await pool.query("DELETE FROM signals");await pool.query("DELETE FROM news_events");await pool.query("DELETE FROM pattern_signals");await pool.query("DELETE FROM smc_setups");await pool.query("DELETE FROM market_bars");}else{memorySignals=[];memoryNews=[];memoryBars=[];memoryPatterns=[];memorySmcSetups=[];}res.json({ok:true});}catch(e){res.status(500).json({ok:false,error:e.message});}});
@@ -2124,7 +2134,9 @@ app.get("/api/validation",async(req,res)=>{try{
 const DUKASCOPY_INSTRUMENTS = {
   US30: { instrument: "usa30idxusd", label: "US30 / USA 30 Index" },
   XAUUSD: { instrument: "xauusd", label: "Gold / XAUUSD" },
-  NAS100: { instrument: "usatechidxusd", label: "NAS100 / US 100 Tech" }
+  NAS100: { instrument: "usatechidxusd", label: "NAS100 / US 100 Tech" },
+  GER40: { instrument: "deuidxeur", label: "GER40 / Germany 40 Index" },
+  USOIL: { instrument: "lightcmdusd", label: "USOIL / US Light Crude Oil (WTI)" }
 };
 const DUKASCOPY_TIMEFRAMES = {"1":"m1","5":"m5","15":"m15","30":"m30","60":"h1","240":"h4","1440":"d1"};
 function dateOnlyUtc(d){return new Date(Date.UTC(d.getUTCFullYear(),d.getUTCMonth(),d.getUTCDate()));}
@@ -2224,7 +2236,7 @@ async function runDukascopyDownload(job){
 }
 app.post("/api/history-download",async(req,res)=>{if(!requireAdmin(req,res))return;try{
   if(historyDownloadJob&&historyDownloadJob.status==="RUNNING")throw new Error("Există deja o descărcare în curs. Așteaptă finalizarea ei.");
-  const symbol=canonicalSymbol(req.body.symbol||"US30");if(!DUKASCOPY_INSTRUMENTS[symbol])throw new Error("Instrument neacceptat. Alege US30, XAUUSD sau NAS100.");
+  const symbol=canonicalSymbol(req.body.symbol||"US30");if(!DUKASCOPY_INSTRUMENTS[symbol])throw new Error("Instrument neacceptat. Alege US30, NAS100, XAUUSD, GER40 sau USOIL.");
   const timeframe=clean(req.body.timeframe||"5",10);if(!DUKASCOPY_TIMEFRAMES[timeframe])throw new Error("Timeframe neacceptat.");
   const priceType=clean(req.body.priceType||"bid",10).toLowerCase()==="ask"?"ask":"bid";
   const years=Math.max(1,Math.min(10,Math.floor(num(req.body.years,5))));
@@ -2349,5 +2361,5 @@ initDb().then(async()=>{
   if(OFFICIAL_NEWS_ENABLED||(FMP_ENABLED&&FMP_API_KEY)||ALPHAVANTAGE_API_KEY||FINNHUB_API_KEY){syncRealNews().catch(e=>{lastNewsSyncError=e.message;console.error("News sync:",e.message)});setInterval(()=>syncRealNews().catch(e=>{lastNewsSyncError=e.message;console.error("News sync:",e.message)}),NEWS_AUTO_SYNC_MINUTES*60000).unref();}
   setTimeout(()=>monitorSystem().catch(e=>console.error("System monitor:",e.message)),15000).unref();
   setInterval(()=>monitorSystem().catch(e=>console.error("System monitor:",e.message)),SYSTEM_MONITOR_INTERVAL_MINUTES*60000).unref();
-  app.listen(PORT,()=>console.log(`PropTrader AI v18.5 rulează pe portul ${PORT}`));
+  app.listen(PORT,()=>console.log(`PropTrader AI v18.6 rulează pe portul ${PORT}`));
 }).catch(e=>{console.error("DB init failed:",e);process.exit(1)});

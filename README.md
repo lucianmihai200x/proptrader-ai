@@ -1,6 +1,8 @@
-# PropTrader AI v18.5 — SMC predictiv M5–H4, statistici curate și niveluri pe TradingView
+# PropTrader AI v18.6 — SMC predictiv M5–H4 pentru US30, NAS100, XAUUSD, GER40 și USOIL
 
 Aplicația primește lumânări M5 închise din TradingView, construiește automat M15, M30, H1, H4 și contextul D1 și caută intrări SMC pe toate intervalele M5–H4. O intrare nu este mutată artificial la prețul curent.
+
+Instrumentele configurate integral sunt `US30`, `NAS100`, `XAUUSD`, `GER40` și `USOIL`: colectare TradingView, planuri SMC, reanalizare până la TP/SL, Telegram, știri, istoric Dukascopy și backtest. Pentru fiecare instrument trebuie creată propria alertă a colectorului pe graficul M5.
 
 Motorul separă două momente:
 
@@ -9,7 +11,7 @@ Motorul separă două momente:
 
 ## Reguli SMC implementate
 
-SMC nu are o specificație tehnică universală. În v18.5 regulile sunt explicite și testabile:
+SMC nu are o specificație tehnică universală. În v18.6 regulile sunt explicite și testabile:
 
 - swing high/low este confirmat numai după două lumânări în dreapta;
 - structura bullish cere HH + HL, iar structura bearish LH + LL; EMA20/EMA50 este doar fallback;
@@ -67,6 +69,8 @@ Serverul salvează automat denumirile de broker sub un simbol unic:
 - `US100`, `USTEC`, `USTECH`, `NDX` și `NASDAQ100` devin `NAS100`;
 - `DJ30`, `DOW30`, `DJI` și `DJIA` devin `US30`;
 - `GOLD` și `GOLDUSD` devin `XAUUSD`.
+- `DE40`, `DAX`, `DAX40`, `GER30`, `DE30` și `GERMANY40` devin `GER40`;
+- `WTI`, `XTIUSD`, `WTICOUSD`, `USCRUDE`, `OIL_CRUDE` și `LIGHT.CMD/USD` devin `USOIL`.
 
 Astfel, lumânările TradingView, istoricul Dukascopy, știrile și rezultatele învățate nu mai sunt împărțite între denumiri diferite.
 
@@ -74,7 +78,7 @@ Astfel, lumânările TradingView, istoricul Dukascopy, știrile și rezultatele 
 
 1. Înlocuiește în GitHub fișierele proiectului cu cele din această arhivă.
 2. Fă un commit și alege în Render **Manual Deploy → Deploy latest commit**.
-3. Verifică `/health`: `version` trebuie să fie `18.5.0`.
+3. Verifică `/health`: `version` trebuie să fie `18.6.0`.
 4. În pagina **Istoric & Backtest**, după ce există minimum 3.000 de lumânări M5 din cel puțin 30 de zile, apasă **Reconstruiește M15 · M30 · H1 · H4 · D1 din M5**.
 
 Variabile recomandate:
@@ -95,13 +99,14 @@ LIVE_MIN_ADAPTIVE_SCORE=72
 TELEGRAM_ENABLED=true
 TELEGRAM_MIN_SCORE=85
 OFFICIAL_NEWS_ENABLED=true
+NEWS_COUNTRIES=US,DE,GERMANY,EU,EA,EURO AREA
 FMP_ENABLED=false
 NEWS_CALENDAR_UNAVAILABLE_RISK=35
 ```
 
 Păstrează valorile existente pentru `WEBHOOK_KEY`, `ADMIN_KEY`, `DATABASE_URL`, `TELEGRAM_BOT_TOKEN` și `TELEGRAM_CHAT_ID`. Nu publica secretele în GitHub.
 
-Migrarea bazei de date este automată la pornire. v18.5:
+Migrarea bazei de date este automată la pornire. v18.6:
 
 - separă implicit statisticile și validarea SMC de Legacy și Modele istorice;
 - păstrează distinct stările WATCH, eligibil LIVE și Telegram trimis;
@@ -110,13 +115,14 @@ Migrarea bazei de date este automată la pornire. v18.5:
 - retrage planurile PENDING suprapuse, păstrând zona cu scorul cel mai bun;
 - rulează reconstruirea intervalelor în fundal și refuză înlocuirea dacă istoricul M5 este insuficient;
 - cere minimum 60 de zile pentru un backtest raportat drept relevant.
+- adaugă GER40 și USOIL în normalizarea brokerilor și în descărcarea istorică Dukascopy (`deuidxeur`, respectiv `lightcmdusd`).
 
 ## TradingView — colector și indicator vizual
 
 Arhiva conține două scripturi Pine cu roluri separate:
 
 1. `PropTrader_AI_v17_M5_H4_Collector.pine` trimite lumânările M5 către server. Dacă alerta existentă funcționează numai prin Webhook URL, nu trebuie recreată.
-2. `PropTrader_AI_v18_5_SMC_Visual.pine` analizează local datele TradingView și desenează pe grafic:
+2. `PropTrader_AI_v18_6_SMC_Visual.pine` analizează local datele TradingView și desenează pe grafic:
    - zona order block pentru intrare;
    - linia Entry;
    - SL;
@@ -132,7 +138,7 @@ Indicatorul vizual verifică M5, M15, M30, H1 și H4 și, implicit, afișează p
 
 1. Deschide același instrument pe graficul de **5 minute**.
 2. În Pine Editor creează un indicator nou.
-3. Copiază integral conținutul fișierului `PropTrader_AI_v18_5_SMC_Visual.pine`.
+3. Copiază integral conținutul fișierului `PropTrader_AI_v18_6_SMC_Visual.pine`.
 4. Apasă **Save**, apoi **Add to chart**.
 5. Lasă `Interval afișat = AUTO — cel mai bun`.
 6. Nu crea alertă pentru acest indicator. El nu conține `alertcondition()` și este numai pentru desenarea nivelurilor.
@@ -154,6 +160,8 @@ Pe graficul de 5 minute:
 - la notificări păstrează bifat numai **Webhook URL**;
 - debifează notificarea în aplicație, popup/toast, e-mail și sunet.
 
+Repetă alerta colectorului pentru fiecare grafic pe care vrei analiză: US30, NAS100, XAUUSD, GER40 și USOIL. Un singur colector Pine nu poate trimite automat lumânările tuturor simbolurilor dacă este instalat doar pe un grafic.
+
 Webhook:
 
 ```text
@@ -164,7 +172,7 @@ TradingView va înregistra tehnic un webhook la fiecare lumânare M5 deoarece ac
 
 ## Știri
 
-FMP este oprit implicit. Dacă variabila a rămas activă, dar abonamentul răspunde HTTP 402, v18.5 oprește automat FMP pentru sesiunea serverului și continuă sincronizarea fluxurilor oficiale gratuite. Titlurile Federal Reserve și BLS funcționează fără chei; dacă nu există calendar anticipat, motorul aplică risc de siguranță în loc de risc zero.
+FMP este oprit implicit. Dacă variabila a rămas activă, dar abonamentul răspunde HTTP 402, v18.6 oprește automat FMP pentru sesiunea serverului și continuă sincronizarea fluxurilor oficiale gratuite. Fluxurile Federal Reserve și BLS acoperă contextul SUA, ECB alimentează contextul GER40, iar EIA furnizează titluri energetice relevante pentru USOIL, toate fără chei API. Dacă nu există calendar anticipat, motorul aplică risc de siguranță în loc de risc zero.
 
 Activează FMP numai dacă planul tău include endpoint-ul calendarului economic:
 

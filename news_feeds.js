@@ -12,6 +12,21 @@ const OFFICIAL_NEWS_FEEDS = Object.freeze([
     id: "BLS_LATEST",
     source: "U.S. Bureau of Labor Statistics",
     url: "https://www.bls.gov/feed/bls_latest.rss"
+  }),
+  Object.freeze({
+    id: "ECB_PRESS",
+    source: "European Central Bank",
+    url: "https://www.ecb.europa.eu/rss/press.html"
+  }),
+  Object.freeze({
+    id: "EIA_TODAY_IN_ENERGY",
+    source: "U.S. Energy Information Administration",
+    url: "https://www.eia.gov/rss/todayinenergy.xml"
+  }),
+  Object.freeze({
+    id: "EIA_PRESS",
+    source: "U.S. Energy Information Administration",
+    url: "https://www.eia.gov/rss/press_rss.xml"
   })
 ]);
 
@@ -92,7 +107,7 @@ async function fetchOfficialNews({
       const response = await fetchImpl(feed.url, {
         headers: {
           accept: "application/rss+xml, application/xml, text/xml, */*",
-          "user-agent": "PropTrader-AI/18.5"
+          "user-agent": "PropTrader-AI/18.6"
         },
         signal: controller.signal
       });

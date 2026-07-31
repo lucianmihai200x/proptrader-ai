@@ -5,7 +5,7 @@ const path = require('node:path');
 
 test('server includes v18 predictive SMC, multi-timeframe analysis, monitoring and Telegram', () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
-  assert.match(source, /APP_VERSION = "18\.5\.0"/);
+  assert.match(source, /APP_VERSION = "18\.6\.0"/);
   assert.match(source, /ANALYSIS_TIMEFRAMES/);
   assert.match(source, /deriveCompletedHigherBars/);
   assert.match(source, /api\/history-aggregate-all/);
@@ -34,14 +34,16 @@ test('server includes v18 predictive SMC, multi-timeframe analysis, monitoring a
 
 test('frontend contains SMC plans, defensive array handling and M5-D1 aggregation controls', () => {
   const html = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8');
-  assert.match(html, /PropTrader AI v18\.5/);
+  assert.match(html, /PropTrader AI v18\.6/);
   assert.match(html, /asArray/);
   assert.match(html, /aggregateAllTimeframes/);
   assert.match(html, /M5 · M15 · M30 · H1 · H4/);
-  assert.match(html, /Backtest Integrity v18\.5/);
+  assert.match(html, /Backtest Integrity v18\.6/);
   assert.match(html, /Planuri SMC/);
   assert.match(html, /Reconstruiește M15 · M30 · H1 · H4 · D1/);
-  assert.match(html, /PropTrader_AI_v18_5_SMC_Visual\.pine/);
+  assert.match(html, /PropTrader_AI_v18_6_SMC_Visual\.pine/);
+  assert.match(html, /GER40 \/ Germany 40/);
+  assert.match(html, /USOIL \/ WTI Crude/);
   assert.match(html, /analyticsScope/);
   assert.match(html, /TELEGRAM TRIMIS/);
   assert.match(html, /Serverul a răspuns/);
@@ -63,7 +65,7 @@ test('Pine collector runs on M5 and sends closed BAR events', () => {
 });
 
 test('Pine SMC visual draws entry zone, SL and TP1-TP3 without creating alerts', () => {
-  const pine = fs.readFileSync(path.join(__dirname, '..', 'PropTrader_AI_v18_5_SMC_Visual.pine'), 'utf8');
+  const pine = fs.readFileSync(path.join(__dirname, '..', 'PropTrader_AI_v18_6_SMC_Visual.pine'), 'utf8');
   assert.match(pine, /SMC Visual M5–H4/);
   assert.match(pine, /request\.security\(syminfo\.tickerid, "1D"/);
   assert.match(pine, /request\.security\(syminfo\.tickerid, "240"/);
