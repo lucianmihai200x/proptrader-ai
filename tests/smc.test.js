@@ -105,6 +105,28 @@ test("ambiguous entry and stop crossing cancels the plan conservatively", () => 
   assert.match(result.reason, /ordine intrabar necunoscută/);
 });
 
+test("pending setup is cancelled when price reaches TP1 without activating entry", () => {
+  const result = evaluatePendingSetup({
+    status: "PENDING", side: "SELL", entry: 1035, sl: 1045, tp1: 1010,
+    expires_at: "2026-01-02T00:00:00Z"
+  }, {
+    bar_time: "2026-01-01T10:00:00Z", open: 1020, high: 1025, low: 1008, close: 1012
+  });
+  assert.equal(result.action, "CANCEL");
+  assert.match(result.reason, /oportunitate ratată/);
+});
+
+test("entry and TP1 crossing in the same candle is rejected as ambiguous", () => {
+  const result = evaluatePendingSetup({
+    status: "PENDING", side: "SELL", entry: 1035, sl: 1045, tp1: 1010,
+    expires_at: "2026-01-02T00:00:00Z"
+  }, {
+    bar_time: "2026-01-01T10:00:00Z", open: 1038, high: 1040, low: 1008, close: 1012
+  });
+  assert.equal(result.action, "CANCEL");
+  assert.match(result.reason, /fără ambiguitate/);
+});
+
 test("SMC targets remain ordered and separated when TP1 uses a liquidity pool above standard TP2", () => {
   const entry = 28298.65;
   const risk = 31.3;

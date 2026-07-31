@@ -1,0 +1,485 @@
+//@version=6
+indicator(
+     "PropTrader AI v18.3 — SMC Visual M5–H4",
+     shorttitle = "PTAI SMC Visual",
+     overlay = true,
+     max_lines_count = 50,
+     max_boxes_count = 10,
+     max_labels_count = 50
+)
+
+// Indicator vizual separat de colectorul webhook.
+// Se aplică pe graficul M5 și desenează cel mai bun plan SMC confirmat
+// dintre M5, M15, M30, H1 și H4, cu bias D1/H4.
+// Nu definește condiții de alertă și nu generează notificări TradingView.
+
+string GROUP_ENGINE = "Motor SMC"
+string GROUP_VISUAL = "Afișare"
+
+bool showVisuals = input.bool(true, "Desenează planul SMC", group = GROUP_VISUAL)
+string timeframeMode = input.string(
+     "AUTO — cel mai bun",
+     "Interval afișat",
+     options = ["AUTO — cel mai bun", "M5", "M15", "M30", "H1", "H4"],
+     group = GROUP_VISUAL
+)
+int extendBars = input.int(80, "Extinde nivelurile (lumânări M5)", minval = 20, maxval = 300, group = GROUP_VISUAL)
+bool showPanel = input.bool(true, "Arată panoul de stare", group = GROUP_VISUAL)
+bool strictConfluence = input.bool(true, "Cere FVG sau sweep de lichiditate", group = GROUP_ENGINE)
+float minScore = input.float(68.0, "Scor SMC minim", minval = 50.0, maxval = 95.0, step = 1.0, group = GROUP_ENGINE)
+float telegramScore = input.float(78.0, "Prag Telegram informativ", minval = 50.0, maxval = 95.0, step = 1.0, group = GROUP_ENGINE)
+float displacementBodyAtr = input.float(0.90, "Corp displacement / ATR", minval = 0.50, maxval = 2.00, step = 0.05, group = GROUP_ENGINE)
+float displacementRangeAtr = input.float(1.15, "Range displacement / ATR", minval = 0.70, maxval = 3.00, step = 0.05, group = GROUP_ENGINE)
+
+f_bias() =>
+    float pivotHigh = ta.pivothigh(high, 2, 2)
+    float pivotLow = ta.pivotlow(low, 2, 2)
+    var float lastHigh = na
+    var float previousHigh = na
+    var float lastLow = na
+    var float previousLow = na
+    if not na(pivotHigh)
+        previousHigh := lastHigh
+        lastHigh := pivotHigh
+    if not na(pivotLow)
+        previousLow := lastLow
+        lastLow := pivotLow
+    float ema20 = ta.ema(close, 20)
+    float ema50 = ta.ema(close, 50)
+    int bias = not na(previousHigh) and not na(previousLow) and lastHigh > previousHigh and lastLow > previousLow ? 1 :
+         not na(previousHigh) and not na(previousLow) and lastHigh < previousHigh and lastLow < previousLow ? -1 :
+         close > ema20 and ema20 > ema50 ? 1 :
+         close < ema20 and ema20 < ema50 ? -1 : 0
+    bias[1]
+
+f_smcPlan(int expiryBars) =>
+    float pivotHigh = ta.pivothigh(high, 2, 2)
+    float pivotLow = ta.pivotlow(low, 2, 2)
+    var float lastHigh = na
+    var float previousHigh = na
+    var float lastLow = na
+    var float previousLow = na
+
+    if not na(pivotHigh)
+        previousHigh := lastHigh
+        lastHigh := pivotHigh
+    if not na(pivotLow)
+        previousLow := lastLow
+        lastLow := pivotLow
+
+    float ema20 = ta.ema(close, 20)
+    float ema50 = ta.ema(close, 50)
+    int localBias = not na(previousHigh) and not na(previousLow) and lastHigh > previousHigh and lastLow > previousLow ? 1 :
+         not na(previousHigh) and not na(previousLow) and lastHigh < previousHigh and lastLow < previousLow ? -1 :
+         close > ema20 and ema20 > ema50 ? 1 :
+         close < ema20 and ema20 < ema50 ? -1 : 0
+
+    float eventAtr = ta.atr(14)
+    float body = math.abs(close - open)
+    float candleRange = high - low
+    bool displacement = not na(eventAtr) and eventAtr > 0 and body >= eventAtr * displacementBodyAtr and candleRange >= eventAtr * displacementRangeAtr
+    bool bullishBreak = displacement and not na(lastHigh) and close > lastHigh and close[1] <= lastHigh
+    bool bearishBreak = displacement and not na(lastLow) and close < lastLow and close[1] >= lastLow
+    int eventSide = bullishBreak ? 1 : bearishBreak ? -1 : 0
+    int structureCode = eventSide == 0 ? 0 : localBias == 0 or localBias == eventSide ? 1 : 2
+
+    int orderBlockAgo = na
+    float orderBlockLow = na
+    float orderBlockHigh = na
+    float orderBlockEntry = na
+    if eventSide != 0
+        for offset = 1 to 8
+            bool oppositeCandle = eventSide == 1 ? close[offset] < open[offset] : close[offset] > open[offset]
+            if na(orderBlockAgo) and oppositeCandle
+                orderBlockAgo := offset
+                orderBlockLow := low[offset]
+                orderBlockHigh := high[offset]
+                orderBlockEntry := (open[offset] + close[offset]) / 2.0
+
+    bool bullishFvg = low > high[2] or low[1] > high[3]
+    bool bearishFvg = high < low[2] or high[1] < low[3]
+    bool hasFvg = eventSide == 1 ? bullishFvg : eventSide == -1 ? bearishFvg : false
+    bool bullishSweep = not na(lastLow) and ta.lowest(low[1], 6) < lastLow and ta.highest(close[1], 6) > lastLow
+    bool bearishSweep = not na(lastHigh) and ta.highest(high[1], 6) > lastHigh and ta.lowest(close[1], 6) < lastHigh
+    bool hasSweep = eventSide == 1 ? bullishSweep : eventSide == -1 ? bearishSweep : false
+
+    float dealingHigh = ta.highest(high, 60)
+    float dealingLow = ta.lowest(low, 60)
+    float equilibrium = (dealingHigh + dealingLow) / 2.0
+    bool premiumDiscountAligned = eventSide == 1 ? orderBlockEntry < equilibrium : eventSide == -1 ? orderBlockEntry > equilibrium : false
+    float averageVolume = ta.sma(volume, 20)
+    bool volumeConfirmed = not na(averageVolume) and averageVolume > 0 and volume >= averageVolume * 1.15
+    float distanceAtr = not na(orderBlockEntry) and eventAtr > 0 ? math.abs(orderBlockEntry - close) / eventAtr : 999.0
+    bool entryIsRetracement = eventSide == 1 ? close >= orderBlockEntry - eventAtr * 0.15 :
+         eventSide == -1 ? close <= orderBlockEntry + eventAtr * 0.15 : false
+
+    float stopBuffer = not na(orderBlockEntry) ? math.max(eventAtr * 0.18, (orderBlockHigh - orderBlockLow) * 0.08) : na
+    float candidateStop = eventSide == 1 ? orderBlockLow - stopBuffer : eventSide == -1 ? orderBlockHigh + stopBuffer : na
+    float candidateRisk = not na(candidateStop) ? math.abs(orderBlockEntry - candidateStop) : na
+    float candidateTp1 = eventSide == 1 ? orderBlockEntry + candidateRisk * 1.5 : orderBlockEntry - candidateRisk * 1.5
+    float candidateTp2 = eventSide == 1 ? orderBlockEntry + candidateRisk * 2.5 : orderBlockEntry - candidateRisk * 2.5
+    float candidateTp3 = eventSide == 1 ? orderBlockEntry + candidateRisk * 4.0 : orderBlockEntry - candidateRisk * 4.0
+
+    float displacementScore = not na(eventAtr) and eventAtr > 0 ? math.min(12.0, 7.0 + body / eventAtr * 2.5) : 0.0
+    float localScore = localBias == eventSide ? 7.0 : localBias == 0 ? 1.0 : -5.0
+    float rawScore = 36.0 + localScore + displacementScore + (hasFvg ? 8.0 : 0.0) +
+         (hasSweep ? 9.0 : 0.0) + (premiumDiscountAligned ? 7.0 : -5.0) +
+         7.0 + (volumeConfirmed ? 3.0 : 0.0) - math.min(8.0, distanceAtr * 1.25)
+
+    var int planKey = 0
+    var int planSide = 0
+    var int planStatus = 0
+    var int planAge = 0
+    var int planStructure = 0
+    var float planEntry = na
+    var float planZoneLow = na
+    var float planZoneHigh = na
+    var float planStop = na
+    var float planTp1 = na
+    var float planTp2 = na
+    var float planTp3 = na
+    var float planScore = na
+
+    if planStatus > 0
+        planAge += 1
+        bool stopInvalidated = planSide == 1 ? low <= planStop : high >= planStop
+        bool entryTouched = low <= planEntry and high >= planEntry
+        bool entryConfirmed = entryTouched and (planSide == 1 ? close >= planEntry and close > open : close <= planEntry and close < open)
+        bool firstTargetReached = planSide == 1 ? high >= planTp1 : low <= planTp1
+        bool targetCompleted = planSide == 1 ? high >= planTp3 : low <= planTp3
+        bool missedBeforeActivation = planStatus == 1 and firstTargetReached
+        if stopInvalidated or targetCompleted or missedBeforeActivation or planAge > expiryBars
+            planStatus := 0
+        else if planStatus == 1 and entryConfirmed
+            planStatus := 2
+
+    bool confluenceAccepted = strictConfluence ? hasFvg or hasSweep : true
+    bool candidateValid = eventSide != 0 and not na(orderBlockAgo) and confluenceAccepted and
+         entryIsRetracement and distanceAtr <= 8.0 and not na(candidateRisk) and candidateRisk > syminfo.mintick and
+         candidateRisk <= close * 0.05 and rawScore >= 45.0
+
+    if candidateValid and planStatus == 0
+        planKey := time
+        planSide := eventSide
+        planStatus := 1
+        planAge := 0
+        planStructure := structureCode
+        planEntry := math.round_to_mintick(orderBlockEntry)
+        planZoneLow := math.round_to_mintick(orderBlockLow)
+        planZoneHigh := math.round_to_mintick(orderBlockHigh)
+        planStop := math.round_to_mintick(candidateStop)
+        planTp1 := math.round_to_mintick(candidateTp1)
+        planTp2 := math.round_to_mintick(candidateTp2)
+        planTp3 := math.round_to_mintick(candidateTp3)
+        planScore := math.min(95.0, math.max(0.0, rawScore))
+
+    [planKey[1], planSide[1], planStatus[1], planEntry[1], planZoneLow[1], planZoneHigh[1],
+     planStop[1], planTp1[1], planTp2[1], planTp3[1], planScore[1], planStructure[1]]
+
+f_adjustedScore(float rawScore, int side, int d1Bias, int h4Bias) =>
+    float d1Points = d1Bias == side ? 16.0 : d1Bias == 0 ? 2.0 : -14.0
+    float h4Points = h4Bias == side ? 13.0 : h4Bias == 0 ? 2.0 : -11.0
+    math.min(95.0, math.max(0.0, rawScore + d1Points + h4Points))
+
+f_modeAllows(string label) =>
+    timeframeMode == "AUTO — cel mai bun" or timeframeMode == label
+
+int d1Bias = request.security(syminfo.tickerid, "1D", f_bias(), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+int h4Bias = request.security(syminfo.tickerid, "240", f_bias(), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+
+[key5, side5, status5, entry5, zoneLow5, zoneHigh5, stop5, tp15, tp25, tp35, rawScore5, structure5] =
+     request.security(syminfo.tickerid, "5", f_smcPlan(72), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+[key15, side15, status15, entry15, zoneLow15, zoneHigh15, stop15, tp115, tp215, tp315, rawScore15, structure15] =
+     request.security(syminfo.tickerid, "15", f_smcPlan(48), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+[key30, side30, status30, entry30, zoneLow30, zoneHigh30, stop30, tp130, tp230, tp330, rawScore30, structure30] =
+     request.security(syminfo.tickerid, "30", f_smcPlan(36), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+[key60, side60, status60, entry60, zoneLow60, zoneHigh60, stop60, tp160, tp260, tp360, rawScore60, structure60] =
+     request.security(syminfo.tickerid, "60", f_smcPlan(30), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+[key240, side240, status240, entry240, zoneLow240, zoneHigh240, stop240, tp1240, tp2240, tp3240, rawScore240, structure240] =
+     request.security(syminfo.tickerid, "240", f_smcPlan(18), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+
+float score5 = f_adjustedScore(rawScore5, side5, d1Bias, h4Bias)
+float score15 = f_adjustedScore(rawScore15, side15, d1Bias, h4Bias)
+float score30 = f_adjustedScore(rawScore30, side30, d1Bias, h4Bias)
+float score60 = f_adjustedScore(rawScore60, side60, d1Bias, h4Bias)
+float score240 = f_adjustedScore(rawScore240, side240, d1Bias, h4Bias)
+
+bool isM5 = timeframe.isminutes and timeframe.multiplier == 5
+int bestKey = 0
+int bestSide = 0
+int bestStatus = 0
+int bestStructure = 0
+float bestEntry = na
+float bestZoneLow = na
+float bestZoneHigh = na
+float bestStop = na
+float bestTp1 = na
+float bestTp2 = na
+float bestTp3 = na
+float bestScore = -1.0
+string bestTf = ""
+
+bool valid5 = not na(key5) and key5 > 0 and status5 > 0 and score5 >= minScore and
+     not (d1Bias == -side5 and h4Bias == -side5) and f_modeAllows("M5")
+if valid5
+    bestKey := key5
+    bestSide := side5
+    bestStatus := status5
+    bestStructure := structure5
+    bestEntry := entry5
+    bestZoneLow := zoneLow5
+    bestZoneHigh := zoneHigh5
+    bestStop := stop5
+    bestTp1 := tp15
+    bestTp2 := tp25
+    bestTp3 := tp35
+    bestScore := score5
+    bestTf := "M5"
+
+bool valid15 = not na(key15) and key15 > 0 and status15 > 0 and score15 >= minScore and
+     not (d1Bias == -side15 and h4Bias == -side15) and f_modeAllows("M15")
+if valid15 and score15 > bestScore
+    bestKey := key15
+    bestSide := side15
+    bestStatus := status15
+    bestStructure := structure15
+    bestEntry := entry15
+    bestZoneLow := zoneLow15
+    bestZoneHigh := zoneHigh15
+    bestStop := stop15
+    bestTp1 := tp115
+    bestTp2 := tp215
+    bestTp3 := tp315
+    bestScore := score15
+    bestTf := "M15"
+
+bool valid30 = not na(key30) and key30 > 0 and status30 > 0 and score30 >= minScore and
+     not (d1Bias == -side30 and h4Bias == -side30) and f_modeAllows("M30")
+if valid30 and score30 > bestScore
+    bestKey := key30
+    bestSide := side30
+    bestStatus := status30
+    bestStructure := structure30
+    bestEntry := entry30
+    bestZoneLow := zoneLow30
+    bestZoneHigh := zoneHigh30
+    bestStop := stop30
+    bestTp1 := tp130
+    bestTp2 := tp230
+    bestTp3 := tp330
+    bestScore := score30
+    bestTf := "M30"
+
+bool valid60 = not na(key60) and key60 > 0 and status60 > 0 and score60 >= minScore and
+     not (d1Bias == -side60 and h4Bias == -side60) and f_modeAllows("H1")
+if valid60 and score60 > bestScore
+    bestKey := key60
+    bestSide := side60
+    bestStatus := status60
+    bestStructure := structure60
+    bestEntry := entry60
+    bestZoneLow := zoneLow60
+    bestZoneHigh := zoneHigh60
+    bestStop := stop60
+    bestTp1 := tp160
+    bestTp2 := tp260
+    bestTp3 := tp360
+    bestScore := score60
+    bestTf := "H1"
+
+bool valid240 = not na(key240) and key240 > 0 and status240 > 0 and score240 >= minScore and
+     not (d1Bias == -side240 and h4Bias == -side240) and f_modeAllows("H4")
+if valid240 and score240 > bestScore
+    bestKey := key240
+    bestSide := side240
+    bestStatus := status240
+    bestStructure := structure240
+    bestEntry := entry240
+    bestZoneLow := zoneLow240
+    bestZoneHigh := zoneHigh240
+    bestStop := stop240
+    bestTp1 := tp1240
+    bestTp2 := tp2240
+    bestTp3 := tp3240
+    bestScore := score240
+    bestTf := "H4"
+
+var int trackedPlanKey = 0
+var string trackedPlanTf = ""
+var int visualStatus = 0
+var int visualTpStage = 0
+var int suppressedPlanKey = 0
+var string suppressedPlanTf = ""
+
+if bestKey != trackedPlanKey or bestTf != trackedPlanTf
+    trackedPlanKey := bestKey
+    trackedPlanTf := bestTf
+    visualStatus := bestKey > 0 ? 1 : 0
+    visualTpStage := 0
+
+if isM5 and bestKey > 0 and barstate.isconfirmed
+    bool m5EntryTouched = low <= bestEntry and high >= bestEntry
+    bool m5StopInvalidated = bestSide == 1 ? low <= bestStop : high >= bestStop
+    bool m5Tp1Reached = bestSide == 1 ? high >= bestTp1 : low <= bestTp1
+    bool m5Tp2Reached = bestSide == 1 ? high >= bestTp2 : low <= bestTp2
+    bool m5TargetCompleted = bestSide == 1 ? high >= bestTp3 : low <= bestTp3
+    bool m5Rejection = bestSide == 1 ? close >= bestEntry and close > open : close <= bestEntry and close < open
+    if m5StopInvalidated or m5TargetCompleted
+        suppressedPlanKey := bestKey
+        suppressedPlanTf := bestTf
+        visualStatus := 0
+        visualTpStage := 0
+    else if visualStatus == 1 and m5Tp1Reached
+        // Prețul a ajuns la țintă înainte ca intrarea să poată fi confirmată.
+        // Dacă Entry și TP1 sunt traversate pe aceeași lumânare, ordinea intrabar este ambiguă.
+        suppressedPlanKey := bestKey
+        suppressedPlanTf := bestTf
+        visualStatus := 0
+        visualTpStage := 0
+    else if visualStatus == 1 and m5EntryTouched and m5Rejection
+        visualStatus := 2
+    else if visualStatus == 2
+        visualTpStage := m5Tp2Reached ? 2 : m5Tp1Reached ? (visualTpStage < 1 ? 1 : visualTpStage) : visualTpStage
+
+bool planSuppressed = bestKey == suppressedPlanKey and bestTf == suppressedPlanTf
+int displayKey = isM5 and showVisuals and not planSuppressed ? bestKey : 0
+int displayStatus = displayKey > 0 ? visualStatus : 0
+bool telegramEligible = displayKey > 0 and bestScore >= telegramScore
+color sideColor = bestSide == 1 ? color.lime : color.red
+color zoneColor = bestSide == 1 ? color.new(color.lime, 84) : color.new(color.red, 84)
+string sideText = bestSide == 1 ? "BUY" : "SELL"
+string statusText = displayStatus == 2 ?
+     (visualTpStage == 2 ? "LIVE · TP2 ATINS" : visualTpStage == 1 ? "LIVE · TP1 ATINS" : (telegramEligible ? "LIVE ELIGIBIL" : "LIVE WATCH")) :
+     (telegramEligible ? "PENDING ELIGIBIL" : "WATCH")
+string structureText = bestStructure == 2 ? "CHOCH" : "BOS"
+
+var int drawnKey = 0
+var int drawnStatus = 0
+var int drawnTpStage = 0
+var string drawnTf = ""
+var box entryZone = na
+var line entryLine = na
+var line stopLine = na
+var line tp1Line = na
+var line tp2Line = na
+var line tp3Line = na
+var label entryLabel = na
+var label stopLabel = na
+var label tp1Label = na
+var label tp2Label = na
+var label tp3Label = na
+
+bool clearVisuals = displayKey == 0 and drawnKey > 0
+bool planChanged = (displayKey > 0 and (displayKey != drawnKey or displayStatus != drawnStatus or visualTpStage != drawnTpStage or bestTf != drawnTf)) or clearVisuals
+if planChanged
+    if not na(entryZone)
+        box.delete(entryZone)
+    if not na(entryLine)
+        line.delete(entryLine)
+    if not na(stopLine)
+        line.delete(stopLine)
+    if not na(tp1Line)
+        line.delete(tp1Line)
+    if not na(tp2Line)
+        line.delete(tp2Line)
+    if not na(tp3Line)
+        line.delete(tp3Line)
+    if not na(entryLabel)
+        label.delete(entryLabel)
+    if not na(stopLabel)
+        label.delete(stopLabel)
+    if not na(tp1Label)
+        label.delete(tp1Label)
+    if not na(tp2Label)
+        label.delete(tp2Label)
+    if not na(tp3Label)
+        label.delete(tp3Label)
+
+    entryZone := na
+    entryLine := na
+    stopLine := na
+    tp1Line := na
+    tp2Line := na
+    tp3Line := na
+    entryLabel := na
+    stopLabel := na
+    tp1Label := na
+    tp2Label := na
+    tp3Label := na
+    drawnKey := displayKey
+    drawnStatus := displayStatus
+    drawnTpStage := displayKey > 0 ? visualTpStage : 0
+    drawnTf := bestTf
+
+    if displayKey > 0
+        int rightIndex = bar_index + extendBars
+        string zoneText = "SMC " + sideText + " · " + bestTf + " · " + statusText + "\n" +
+             structureText + " · scor " + str.tostring(bestScore, "#.0")
+        entryZone := box.new(
+             left = bar_index,
+             top = bestZoneHigh,
+             right = rightIndex,
+             bottom = bestZoneLow,
+             xloc = xloc.bar_index,
+             border_color = sideColor,
+             border_width = 2,
+             bgcolor = zoneColor,
+             text = zoneText,
+             text_color = color.white,
+             text_size = size.small
+        )
+        entryLine := line.new(bar_index, bestEntry, rightIndex, bestEntry, xloc = xloc.bar_index, color = color.white, width = 2)
+        stopLine := line.new(bar_index, bestStop, rightIndex, bestStop, xloc = xloc.bar_index, color = color.red, width = 2, style = line.style_dashed)
+        tp1Line := line.new(bar_index, bestTp1, rightIndex, bestTp1, xloc = xloc.bar_index, color = color.lime, width = 1, style = line.style_dashed)
+        tp2Line := line.new(bar_index, bestTp2, rightIndex, bestTp2, xloc = xloc.bar_index, color = color.lime, width = 2, style = line.style_dashed)
+        tp3Line := line.new(bar_index, bestTp3, rightIndex, bestTp3, xloc = xloc.bar_index, color = color.aqua, width = 2, style = line.style_dashed)
+        entryLabel := label.new(rightIndex, bestEntry, "ENTRY " + str.tostring(bestEntry, format.mintick), xloc = xloc.bar_index, yloc = yloc.price, style = label.style_label_left, color = color.white, textcolor = color.black, size = size.small)
+        stopLabel := label.new(rightIndex, bestStop, "SL " + str.tostring(bestStop, format.mintick), xloc = xloc.bar_index, yloc = yloc.price, style = label.style_label_left, color = color.red, textcolor = color.white, size = size.small)
+        tp1Label := label.new(rightIndex, bestTp1, "TP1" + (visualTpStage >= 1 ? " ✓ " : " ") + str.tostring(bestTp1, format.mintick), xloc = xloc.bar_index, yloc = yloc.price, style = label.style_label_left, color = color.lime, textcolor = color.black, size = size.small)
+        tp2Label := label.new(rightIndex, bestTp2, "TP2" + (visualTpStage >= 2 ? " ✓ " : " ") + str.tostring(bestTp2, format.mintick), xloc = xloc.bar_index, yloc = yloc.price, style = label.style_label_left, color = color.lime, textcolor = color.black, size = size.small)
+        tp3Label := label.new(rightIndex, bestTp3, "TP3 " + str.tostring(bestTp3, format.mintick), xloc = xloc.bar_index, yloc = yloc.price, style = label.style_label_left, color = color.aqua, textcolor = color.black, size = size.small)
+
+if not na(entryZone)
+    int movingRight = bar_index + extendBars
+    box.set_right(entryZone, movingRight)
+    line.set_x2(entryLine, movingRight)
+    line.set_x2(stopLine, movingRight)
+    line.set_x2(tp1Line, movingRight)
+    line.set_x2(tp2Line, movingRight)
+    line.set_x2(tp3Line, movingRight)
+    label.set_x(entryLabel, movingRight)
+    label.set_x(stopLabel, movingRight)
+    label.set_x(tp1Label, movingRight)
+    label.set_x(tp2Label, movingRight)
+    label.set_x(tp3Label, movingRight)
+
+bool newLive = displayKey > 0 and displayStatus == 2 and
+     (nz(displayStatus[1]) != 2 or nz(displayKey[1]) != displayKey or bestTf[1] != bestTf)
+plotshape(newLive and telegramEligible and bestSide == 1, title = "Activare BUY eligibilă", style = shape.labelup, location = location.belowbar, color = color.lime, text = "BUY", textcolor = color.black, size = size.small)
+plotshape(newLive and telegramEligible and bestSide == -1, title = "Activare SELL eligibilă", style = shape.labeldown, location = location.abovebar, color = color.red, text = "SELL", textcolor = color.white, size = size.small)
+plotshape(newLive and not telegramEligible and bestSide == 1, title = "WATCH BUY sub prag", style = shape.labelup, location = location.belowbar, color = color.gray, text = "WATCH", textcolor = color.white, size = size.tiny)
+plotshape(newLive and not telegramEligible and bestSide == -1, title = "WATCH SELL sub prag", style = shape.labeldown, location = location.abovebar, color = color.gray, text = "WATCH", textcolor = color.white, size = size.tiny)
+
+f_biasText(int bias) =>
+    bias == 1 ? "BULLISH" : bias == -1 ? "BEARISH" : "NEUTRAL"
+
+var table statusTable = table.new(position.top_right, 2, 9, bgcolor = color.new(color.black, 15), border_width = 1)
+if showPanel and barstate.islast
+    table.cell(statusTable, 0, 0, "PropTrader AI", text_color = color.white)
+    table.cell(statusTable, 1, 0, "v18.3 SMC", text_color = color.aqua)
+    table.cell(statusTable, 0, 1, "Grafic", text_color = color.silver)
+    table.cell(statusTable, 1, 1, isM5 ? "M5 OK" : "SCHIMBĂ PE M5", text_color = isM5 ? color.lime : color.red)
+    table.cell(statusTable, 0, 2, "Plan", text_color = color.silver)
+    table.cell(statusTable, 1, 2, displayKey > 0 ? sideText + " " + bestTf + " " + statusText : "FĂRĂ SETUP", text_color = displayKey > 0 ? sideColor : color.silver)
+    table.cell(statusTable, 0, 3, "Scor", text_color = color.silver)
+    table.cell(statusTable, 1, 3, displayKey > 0 ? str.tostring(bestScore, "#.0") : "—", text_color = telegramEligible ? color.lime : color.orange)
+    table.cell(statusTable, 0, 4, "Telegram", text_color = color.silver)
+    table.cell(statusTable, 1, 4, displayKey > 0 ? (telegramEligible ? "ELIGIBIL ≥ " + str.tostring(telegramScore, "#") : "NU · scor < " + str.tostring(telegramScore, "#")) : "—", text_color = telegramEligible ? color.lime : color.orange)
+    table.cell(statusTable, 0, 5, "Bias D1", text_color = color.silver)
+    table.cell(statusTable, 1, 5, f_biasText(d1Bias), text_color = d1Bias == 1 ? color.lime : d1Bias == -1 ? color.red : color.silver)
+    table.cell(statusTable, 0, 6, "Bias H4", text_color = color.silver)
+    table.cell(statusTable, 1, 6, f_biasText(h4Bias), text_color = h4Bias == 1 ? color.lime : h4Bias == -1 ? color.red : color.silver)
+    table.cell(statusTable, 0, 7, "Mod", text_color = color.silver)
+    table.cell(statusTable, 1, 7, timeframeMode, text_color = color.white)
+    table.cell(statusTable, 0, 8, "Progres", text_color = color.silver)
+    table.cell(statusTable, 1, 8, displayStatus == 2 ? (visualTpStage == 2 ? "TP2 → TP3/SL" : visualTpStage == 1 ? "TP1 → TP2/TP3/SL" : "ENTRY → TP1/SL") : displayStatus == 1 ? "AȘTEAPTĂ ENTRY" : "—", text_color = displayStatus == 2 ? color.lime : color.silver)
