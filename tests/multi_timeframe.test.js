@@ -9,7 +9,7 @@ const {
   profileFor,
   completedHigherTimeframes
 } = require("../timeframes");
-const { signalMessage, pendingSetupMessage } = require("../telegram");
+const { signalMessage, pendingSetupMessage, sourceLabel } = require("../telegram");
 
 test("timeframe aliases normalize to the five supported analysis intervals", () => {
   assert.equal(normalizeTimeframe("M5"), "5");
@@ -72,6 +72,7 @@ test("Telegram signal contains interval, entry, SL and TP1-TP3", () => {
   assert.match(message, /TP1/);
   assert.match(message, /TP2/);
   assert.match(message, /TP3/);
+  assert.match(message, /Sursă semnal/);
 });
 
 test("Telegram pending SMC plan clearly says not to enter immediately", () => {
@@ -87,4 +88,12 @@ test("Telegram pending SMC plan clearly says not to enter immediately", () => {
   assert.match(message, /NU intra la prețul curent/);
   assert.match(message, /Order block/i);
   assert.match(message, /TP3/);
+  assert.match(message, /SMC SERVER/);
+});
+
+test("Telegram distinguishes SMC, historical models, tests and ordinary webhooks", () => {
+  assert.equal(sourceLabel({ external_id: "SMC-LIVE-SMC-NAS100" }), "SMC LIVE");
+  assert.equal(sourceLabel({ external_id: "AUTO-NAS100-15" }), "MODEL ISTORIC");
+  assert.equal(sourceLabel({ external_id: "TEST-123" }), "TEST");
+  assert.equal(sourceLabel({ external_id: "MANUAL-US100-TEST" }), "WEBHOOK");
 });

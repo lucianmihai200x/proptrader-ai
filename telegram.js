@@ -33,6 +33,15 @@ function fmt(value) {
   return new Intl.NumberFormat("ro-RO", { maximumFractionDigits: 2 }).format(n);
 }
 
+function sourceLabel(s) {
+  const explicit = String(s.signal_source || "").toUpperCase();
+  if (explicit === "SMC_LIVE" || String(s.external_id || "").startsWith("SMC-LIVE-")) return "SMC LIVE";
+  if (explicit === "MODEL_ISTORIC" || String(s.external_id || "").startsWith("AUTO-")) return "MODEL ISTORIC";
+  const externalId = String(s.external_id || "");
+  if (explicit === "TEST" || externalId.startsWith("TEST-") || externalId.startsWith("TELEGRAM-TEST-")) return "TEST";
+  return "WEBHOOK";
+}
+
 function signalMessage(s) {
   const side = String(s.signal || s.side || "").toUpperCase();
   const icon = side === "BUY" ? "🟢" : "🔴";
@@ -48,6 +57,7 @@ function signalMessage(s) {
     "",
     `<b>${icon} ${esc(side)} ${esc(s.symbol || "US30")}</b>`,
     `⏱ Interval analizat: <b>${esc(timeframeLabel(s.timeframe || "15"))}</b>`,
+    `🧭 Sursă semnal: <b>${esc(sourceLabel(s))}</b>`,
     "",
     `💰 Intrare: <b>${fmt(entry)}</b>`,
     `🛑 SL: <b>${fmt(s.sl)}</b>`,
@@ -76,6 +86,7 @@ function pendingSetupMessage(s) {
     "<b>🗺️ PLAN SMC — INTRARE ÎN AȘTEPTARE</b>",
     "",
     `<b>${icon} ${esc(side)} ${esc(s.symbol || "US30")}</b> · ${esc(timeframeLabel(s.timeframe || "15"))}`,
+    "🧭 Sursă plan: <b>SMC SERVER</b>",
     "⚠️ <b>NU intra la prețul curent.</b> Așteaptă retragerea în order block.",
     "",
     `Preț la analiză: <b>${fmt(s.current_price)}</b>`,
@@ -153,4 +164,4 @@ async function sendSignal(signal) { return send(signalMessage(signal)); }
 async function sendPendingSetup(setup) { return send(pendingSetupMessage(setup)); }
 async function sendSystemAlert(html) { return send(String(html || "")); }
 
-module.exports = { status, sendTest, sendSignal, sendPendingSetup, sendSystemAlert, signalMessage, pendingSetupMessage, MIN_SCORE };
+module.exports = { status, sendTest, sendSignal, sendPendingSetup, sendSystemAlert, signalMessage, pendingSetupMessage, sourceLabel, MIN_SCORE };

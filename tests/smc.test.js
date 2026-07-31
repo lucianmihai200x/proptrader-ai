@@ -4,7 +4,8 @@ const {
   structureBias,
   findBreakEvents,
   findSmcSetups,
-  evaluatePendingSetup
+  evaluatePendingSetup,
+  targetLevels
 } = require("../smc");
 
 function bar(index, open, high, low, close, timeframe = 5) {
@@ -102,4 +103,21 @@ test("ambiguous entry and stop crossing cancels the plan conservatively", () => 
   });
   assert.equal(result.action, "CANCEL");
   assert.match(result.reason, /ordine intrabar necunoscută/);
+});
+
+test("SMC targets remain ordered and separated when TP1 uses a liquidity pool above standard TP2", () => {
+  const entry = 28298.65;
+  const risk = 31.3;
+  const swings = {
+    highs: [
+      { price: 28375.4 },
+      { price: 28448 }
+    ],
+    lows: []
+  };
+  const [tp1, tp2, tp3] = targetLevels("BUY", entry, risk, swings);
+  assert.equal(tp1, 28375.4);
+  assert.ok(tp2 + 1e-6 >= tp1 + risk * 0.35, `TP2 ${tp2} trebuie separat de TP1 ${tp1}`);
+  assert.ok(tp3 + 1e-6 >= tp2 + risk * 0.35, `TP3 ${tp3} trebuie separat de TP2 ${tp2}`);
+  assert.ok(entry < tp1 && tp1 < tp2 && tp2 < tp3);
 });

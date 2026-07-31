@@ -7,6 +7,7 @@ const { buildBacktest, auditBars, aggregateBars } = require("./backtest");
 const { fetchOfficialNews } = require("./news_feeds");
 const { findSmcSetups, evaluatePendingSetup } = require("./smc");
 const { outcomeR } = require("./trade_management");
+const { canonicalSymbol, aliasSummary } = require("./symbols");
 const {
   SUPPORTED_ANALYSIS_TIMEFRAMES,
   CONTEXT_TIMEFRAMES,
@@ -18,6 +19,7 @@ const {
 } = require("./timeframes");
 
 const app = express();
+const APP_VERSION = "18.2.0";
 let lastWebhookAt = null;
 let lastWebhookResult = "Niciun webhook primit după pornire";
 let lastTelegramAt = null;
@@ -77,6 +79,7 @@ let lastSuccessfulNewsSync = null;
 let lastNewsSyncError = "";
 let lastNewsProviderResults = [];
 let lastSuccessfulCalendarSync = null;
+let fmpRuntimeDisabledReason = "";
 let lastSystemAlertKey = "";
 let lastSystemAlertAt = null;
 let lastDbCheckAt = null;
@@ -216,7 +219,7 @@ async function buildSystemStatus() {
   const webhookAge = minutesSince(lastWebhookAt);
   return {
     ok: database.ok,
-    version: "18.1.0",
+    version: APP_VERSION,
     database,
     webhook: {
       lastAt: lastWebhookAt,
@@ -242,6 +245,7 @@ async function buildSystemStatus() {
       requireM5Confirmation: SMC_REQUIRE_M5_CONFIRMATION,
       contextTimeframes: CONTEXT_TIMEFRAMES
     },
+    symbolAliases: aliasSummary(),
     lastBarAtByTimeframe: { ...lastBarAtByTimeframe },
     warnings: systemWarnings(),
     checkedAt: new Date().toISOString()
@@ -302,6 +306,7 @@ async function initDb() {
     ["max_favorable_price", "NUMERIC"], ["max_adverse_price", "NUMERIC"], ["auto_closed", "BOOLEAN DEFAULT FALSE"],
     ["execution_mode", "TEXT DEFAULT 'WATCH'"], ["quality_score", "NUMERIC DEFAULT 0"],
     ["confidence_lower", "NUMERIC DEFAULT 0"], ["decision_reason", "TEXT"], ["regime", "TEXT DEFAULT 'UNKNOWN'"],
+    ["signal_source", "TEXT DEFAULT 'WEBHOOK'"],
     ["tp1_hit_at", "TIMESTAMPTZ"], ["tp2_hit_at", "TIMESTAMPTZ"], ["tp3_hit_at", "TIMESTAMPTZ"],
     ["best_target", "TEXT"], ["managed_stop", "NUMERIC"]
   ];
@@ -477,7 +482,7 @@ function setupKey(p) {
   const explicit = clean(p.setup_key || p.model_key, 300);
   if (explicit) return explicit;
   return [
-    clean(p.symbol || "N/A", 30).toUpperCase(), clean(p.signal || p.side || "WAIT", 10).toUpperCase(),
+    canonicalSymbol(p.symbol || "N/A", "N/A"), clean(p.signal || p.side || "WAIT", 10).toUpperCase(),
     normalizeTimeframe(p.timeframe || p.interval, "N/A"),
     clean(p.session || p.session_name || "N/A", 40), clean(p.structure || "N/A", 80),
     bool(p.bos) ? "BOS" : "", bool(p.choch) ? "CHOCH" : "", bool(p.fvg) ? "FVG" : "",
@@ -488,9 +493,18 @@ function setupKey(p) {
 
 function normalizeSignal(p) {
   const score = Math.max(0, Math.min(100, num(p.score, 50)));
+  const externalId = clean(p.external_id || p.signal_id || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, 120);
+  const signalSource = clean(
+    p.signal_source ||
+      (externalId.startsWith("SMC-LIVE-") ? "SMC_LIVE" :
+        externalId.startsWith("AUTO-") ? "MODEL_ISTORIC" :
+          (externalId.startsWith("TEST-") || externalId.startsWith("TELEGRAM-TEST-")) ? "TEST" : "WEBHOOK"),
+    30
+  ).toUpperCase();
   return {
-    external_id: clean(p.external_id || p.signal_id || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, 120),
-    received_at: new Date().toISOString(), symbol: clean(p.symbol || p.ticker || "N/A", 30).toUpperCase(),
+    external_id: externalId,
+    signal_source: signalSource,
+    received_at: new Date().toISOString(), symbol: canonicalSymbol(p.symbol || p.ticker || "N/A", "N/A"),
     timeframe: normalizeTimeframe(p.timeframe || p.interval, ANALYSIS_TIMEFRAME), signal: clean(p.signal || p.side || "WAIT", 10).toUpperCase(),
     status: "OPEN", price: num(p.price ?? p.close), sl: num(p.sl), tp1: num(p.tp1 ?? p.tp), tp2: num(p.tp2), tp3: num(p.tp3),
     score, probability: Math.max(0, Math.min(100, num(p.probability, score))), adaptive_score: score, learning_adjustment: 0,
@@ -567,7 +581,7 @@ function normalizeNews(p) {
     external_id: clean(p.external_id || p.id || p.guid || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, 180),
     published_at: Number.isNaN(publishedAt.getTime()) ? new Date().toISOString() : publishedAt.toISOString(), title, summary,
     source: clean(p.source?.name || p.source, 150), url: clean(p.url, 1000),
-    symbols: Array.isArray(p.symbols) && p.symbols.length ? p.symbols.map(x => clean(x, 30).toUpperCase()) : a.symbols,
+    symbols: Array.isArray(p.symbols) && p.symbols.length ? [...new Set(p.symbols.map(x => canonicalSymbol(x)).filter(Boolean))] : a.symbols,
     impact: Number.isFinite(suppliedImpact) ? Math.max(0, Math.min(100, suppliedImpact)) : a.impact,
     bias: clean(p.bias || a.bias, 20).toUpperCase(), category: clean(p.category || a.category, 50),
     provider: clean(p.provider, 80), sentiment: num(p.sentiment), relevance: Math.max(0, Math.min(100, num(p.relevance, 50))),
@@ -576,6 +590,7 @@ function normalizeNews(p) {
 }
 
 async function recentNewsRisk(symbol, at = new Date()) {
+  symbol = canonicalSymbol(symbol);
   const from = new Date(at.getTime() - 3 * 3600000).toISOString();
   const to = new Date(at.getTime() + 1 * 3600000).toISOString();
   let rows;
@@ -599,7 +614,7 @@ async function recentNewsRisk(symbol, at = new Date()) {
 function normalizeBar(p) {
   const barTime = new Date(p.bar_time || p.time || p.timestamp || Date.now());
   if (Number.isNaN(barTime.getTime())) throw new Error("Timpul lumânării este invalid");
-  const symbol = clean(p.symbol || p.ticker, 30).toUpperCase();
+  const symbol = canonicalSymbol(p.symbol || p.ticker);
   const timeframe = normalizeTimeframe(p.timeframe || p.interval);
   const o = num(p.open, NaN), h = num(p.high, NaN), l = num(p.low, NaN), c = num(p.close, NaN);
   if (!symbol || !timeframe || ![o,h,l,c].every(Number.isFinite)) throw new Error("BAR necesită symbol, timeframe, open, high, low și close");
@@ -608,6 +623,7 @@ function normalizeBar(p) {
 }
 
 async function saveBar(b) {
+  b = { ...b, symbol: canonicalSymbol(b.symbol) };
   if (!pool) {
     const duplicate = memoryBars.some(x =>
       x.external_id === b.external_id ||
@@ -720,11 +736,16 @@ async function syncOfficialNews() {
 async function syncFmpCalendar() {
   if(!FMP_ENABLED) return {provider:"FMP",configured:false,disabled:true,keyConfigured:Boolean(FMP_API_KEY),reason:"Oprit implicit; activează FMP_ENABLED numai cu un plan FMP compatibil.",received:0,accepted:0,saved:0};
   if(!FMP_API_KEY) return {provider:"FMP",configured:false,disabled:false,keyConfigured:false,received:0,accepted:0,saved:0};
+  if(fmpRuntimeDisabledReason) return {provider:"FMP",configured:false,disabled:true,keyConfigured:true,reason:fmpRuntimeDisabledReason,received:0,accepted:0,saved:0};
   const now=new Date(), from=new Date(now.getTime()-24*3600000), to=new Date(now.getTime()+7*86400000);
   const iso=d=>d.toISOString().slice(0,10);
   const url=`https://financialmodelingprep.com/stable/economic-calendar?from=${iso(from)}&to=${iso(to)}&apikey=${encodeURIComponent(FMP_API_KEY)}`;
   const response=await fetch(url,{headers:{accept:"application/json"}});
-  if(!response.ok) throw new Error(response.status === 402 ? "FMP necesită un plan compatibil pentru calendarul economic (HTTP 402)" : `FMP a răspuns cu HTTP ${response.status}`);
+  if(response.status === 402) {
+    fmpRuntimeDisabledReason = "Dezactivat automat după HTTP 402; fluxurile oficiale gratuite rămân active.";
+    return {provider:"FMP",configured:false,disabled:true,keyConfigured:true,reason:fmpRuntimeDisabledReason,httpStatus:402,received:0,accepted:0,saved:0};
+  }
+  if(!response.ok) throw new Error(`FMP a răspuns cu HTTP ${response.status}`);
   const items=await response.json();
   if(!Array.isArray(items)) throw new Error("Răspuns FMP neașteptat");
   let saved=0, accepted=0;
@@ -1049,7 +1070,7 @@ async function pendingSmcSetupsForSymbol(symbol) {
 
 async function listSmcSetups({ status = "", symbol = "", limit = 150 } = {}) {
   const normalizedStatus = clean(status, 20).toUpperCase();
-  const normalizedSymbol = clean(symbol, 30).toUpperCase();
+  const normalizedSymbol = canonicalSymbol(symbol);
   const safeLimit = Math.min(500, Math.max(1, num(limit, 150)));
   if (!pool) {
     return memorySmcSetups
@@ -1095,9 +1116,16 @@ async function updateSmcSetup(externalId, updates) {
 }
 
 async function notifyTelegramPendingSetup(setup) {
-  if (!telegram.status().configured) return { skipped: true, reason: "Telegram neconfigurat" };
-  if (num(setup.adaptive_score) < SMC_NOTIFY_PENDING_SCORE) return { skipped: true, reason: "scor plan sub prag" };
-  if (num(setup.news_risk) > MAX_NEWS_RISK_LIVE) return { skipped: true, reason: "risc știri prea mare" };
+  const logSignal = { external_id: setup.external_id, symbol: setup.symbol, signal: setup.side };
+  const skip = async reason => {
+    lastTelegramAt = new Date().toISOString();
+    lastTelegramResult = `OMIS PLAN SMC ${setup.side} ${setup.symbol} ${timeframeLabel(setup.timeframe)}: ${reason}`;
+    await logTelegram({ signal: logSignal, status: "SKIPPED", details: lastTelegramResult }).catch(() => {});
+    return { skipped: true, reason };
+  };
+  if (!telegram.status().configured) return skip("Telegram neconfigurat");
+  if (num(setup.adaptive_score) < SMC_NOTIFY_PENDING_SCORE) return skip(`scor ${num(setup.adaptive_score)} sub ${SMC_NOTIFY_PENDING_SCORE}`);
+  if (num(setup.news_risk) > MAX_NEWS_RISK_LIVE) return skip(`risc știri ${num(setup.news_risk)}/100 peste ${MAX_NEWS_RISK_LIVE}`);
   try {
     const result = await telegram.sendPendingSetup(setup);
     lastTelegramAt = new Date().toISOString();
@@ -1349,14 +1377,14 @@ async function saveSignal(s) {
       adaptive_score,learning_adjustment,rsi,atr,rr,trend,structure,session_name,mtf_trend,vwap_side,
       order_block,bos,choch,fvg,liquidity_sweep,vwap_confirm,mtf_confirm,order_block_confirm,market_phase,
       equal_highs,equal_lows,premium_discount,fib_zone,fvg_state,ob_state,kill_zone,score_breakdown,reason,
-      news_risk,news_bias,news_summary,setup_key,execution_mode,quality_score,confidence_lower,decision_reason,regime
-    ) VALUES (${Array.from({length:50},(_,i)=>`$${i+1}`).join(',')}) ON CONFLICT DO NOTHING RETURNING id
+      news_risk,news_bias,news_summary,setup_key,execution_mode,quality_score,confidence_lower,decision_reason,regime,signal_source
+    ) VALUES (${Array.from({length:51},(_,i)=>`$${i+1}`).join(',')}) ON CONFLICT DO NOTHING RETURNING id
   `, [
     s.external_id,s.received_at,s.symbol,s.timeframe,s.signal,s.status,s.price,s.sl,s.tp1,s.tp2,s.tp3,s.score,s.probability,
     s.adaptive_score,s.learning_adjustment,s.rsi,s.atr,s.rr,s.trend,s.structure,s.session_name,s.mtf_trend,s.vwap_side,
     s.order_block,s.bos,s.choch,s.fvg,s.liquidity_sweep,s.vwap_confirm,s.mtf_confirm,s.order_block_confirm,s.market_phase,
     s.equal_highs,s.equal_lows,s.premium_discount,s.fib_zone,s.fvg_state,s.ob_state,s.kill_zone,JSON.stringify(s.score_breakdown),s.reason,
-    s.news_risk,s.news_bias,s.news_summary,s.setup_key,s.execution_mode,s.quality_score,s.confidence_lower,s.decision_reason,s.regime
+    s.news_risk,s.news_bias,s.news_summary,s.setup_key,s.execution_mode,s.quality_score,s.confidence_lower,s.decision_reason,s.regime,s.signal_source
   ]);
   return inserted.rows.length > 0;
 }
@@ -1378,7 +1406,7 @@ async function listSignals(mode = "active", filters = {}) {
   const limit = Math.min(500, Math.max(1, num(filters.limit, mode === "archive" ? 200 : 100)));
   if (!pool) {
     let arr = memorySignals.filter(x => mode === "archive" ? !!x.archived_at : !x.archived_at);
-    if (filters.symbol) arr = arr.filter(x => x.symbol.includes(filters.symbol.toUpperCase()));
+    if (filters.symbol) arr = arr.filter(x => x.symbol.includes(canonicalSymbol(filters.symbol)));
     if (filters.side) arr = arr.filter(x => x.signal === filters.side.toUpperCase());
     if (filters.status) arr = arr.filter(x => x.status === filters.status.toUpperCase());
     return arr.slice(0, limit);
@@ -1386,7 +1414,7 @@ async function listSignals(mode = "active", filters = {}) {
   const cond = [mode === "archive" ? "archived_at IS NOT NULL" : "archived_at IS NULL"];
   const vals = [];
   const add = (sql, val) => { vals.push(val); cond.push(sql.replace("?", `$${vals.length}`)); };
-  if (filters.symbol) add("symbol ILIKE ?", `%${filters.symbol}%`);
+  if (filters.symbol) add("symbol ILIKE ?", `%${canonicalSymbol(filters.symbol)}%`);
   if (filters.side) add("signal = ?", filters.side.toUpperCase());
   if (filters.status) add("status = ?", filters.status.toUpperCase());
   vals.push(limit);
@@ -1522,7 +1550,7 @@ function parseHistoricalCsv(csv,{symbol,timeframe,timezoneOffsetMinutes=0}={}){
     const o=Number(String(cells[ix.open]).replace(",",".")),h=Number(String(cells[ix.high]).replace(",",".")),l=Number(String(cells[ix.low]).replace(",",".")),c=Number(String(cells[ix.close]).replace(",",".")),v=ix.volume>=0?Number(String(cells[ix.volume]).replace(",",".")):0;
     if(!d||[o,h,l,c].some(x=>!Number.isFinite(x))||h<l||h<Math.max(o,c)||l>Math.min(o,c)){rejected++;continue;}
     d.setUTCMinutes(d.getUTCMinutes()-Number(timezoneOffsetMinutes||0));
-    const sym=clean(symbol||"US30",30).toUpperCase(),tf=clean(timeframe||"5",20);
+    const sym=canonicalSymbol(symbol||"US30"),tf=clean(timeframe||"5",20);
     bars.push({external_id:`CSV-${sym}-${tf}-${d.getTime()}`,bar_time:d.toISOString(),symbol:sym,timeframe:tf,open:o,high:h,low:l,close:c,volume:Number.isFinite(v)?v:0});
   }
   bars.sort((a,b)=>new Date(a.bar_time)-new Date(b.bar_time));
@@ -1531,10 +1559,11 @@ function parseHistoricalCsv(csv,{symbol,timeframe,timezoneOffsetMinutes=0}={}){
   return {bars:dedup,rejected,delimiter,headers};
 }
 async function saveBarsBatch(bars){
-  if(!pool){let inserted=0;for(const b of bars)if(await saveBar(b))inserted++;return inserted;}
+  const normalizedBars=bars.map(b=>({...b,symbol:canonicalSymbol(b.symbol)}));
+  if(!pool){let inserted=0;for(const b of normalizedBars)if(await saveBar(b))inserted++;return inserted;}
   let inserted=0;
-  for(let i=0;i<bars.length;i+=2000){
-    const chunk=bars.slice(i,i+2000), values=[], params=[]; let n=1;
+  for(let i=0;i<normalizedBars.length;i+=2000){
+    const chunk=normalizedBars.slice(i,i+2000), values=[], params=[]; let n=1;
     for(const b of chunk){values.push(`($${n++},$${n++},$${n++},$${n++},$${n++},$${n++},$${n++},$${n++},$${n++})`);params.push(b.external_id,b.bar_time,b.symbol,b.timeframe,b.open,b.high,b.low,b.close,b.volume);}
     const q=await pool.query(`INSERT INTO market_bars(external_id,bar_time,symbol,timeframe,open,high,low,close,volume) VALUES ${values.join(",")} ON CONFLICT DO NOTHING`,params);inserted+=q.rowCount;
   }
@@ -1568,13 +1597,19 @@ async function notifyTelegramSignal(signal) {
   const effectiveScore = num(signal.adaptive_score ?? signal.score);
   const isSmcActivation = String(signal.external_id || "").startsWith("SMC-LIVE-");
   const notificationThreshold = isSmcActivation ? SMC_NOTIFY_PENDING_SCORE : telegram.MIN_SCORE;
-  if (!telegram.status().configured) { lastTelegramResult = "OMIS: Telegram neconfigurat"; return { skipped:true, reason:lastTelegramResult }; }
-  if (signal.execution_mode !== "LIVE") { lastTelegramResult = `OMIS ${signal.external_id}: execution_mode=${signal.execution_mode}`; return { skipped:true, reason:lastTelegramResult }; }
-  if (effectiveScore < notificationThreshold) { lastTelegramResult = `OMIS ${signal.external_id}: scor ${effectiveScore} sub ${notificationThreshold}`; return { skipped:true, reason:lastTelegramResult }; }
+  const skip = async reason => {
+    lastTelegramAt = new Date().toISOString();
+    lastTelegramResult = `OMIS ${signal.external_id}: ${reason}`;
+    await logTelegram({signal,status:"SKIPPED",details:lastTelegramResult}).catch(() => {});
+    return {skipped:true,reason:lastTelegramResult};
+  };
+  if (!telegram.status().configured) return skip("Telegram neconfigurat");
+  if (signal.execution_mode !== "LIVE") return skip(`execution_mode=${signal.execution_mode}; ${signal.decision_reason || "filtre server"}`);
+  if (effectiveScore < notificationThreshold) return skip(`scor ${effectiveScore} sub ${notificationThreshold}`);
   try {
     const result = await telegram.sendSignal(signal);
     lastTelegramAt = new Date().toISOString();
-    lastTelegramResult = `TRIMIS ${signal.signal} ${signal.symbol}, mesaj ${result.message_id}`;
+    lastTelegramResult = `TRIMIS ${telegram.sourceLabel(signal)} ${signal.signal} ${signal.symbol}, mesaj ${result.message_id}`;
     await logTelegram({signal,status:"SENT",messageId:result.message_id,details:lastTelegramResult});
     return {skipped:false,messageId:result.message_id};
   } catch (error) {
@@ -1585,7 +1620,7 @@ async function notifyTelegramSignal(signal) {
   }
 }
 
-app.get("/health", (req,res)=>res.json({ok:true,version:"18.1.0",database:pool?"postgres":"memory",archiveAfterHours:ARCHIVE_AFTER_HOURS,adminKeyConfigured:Boolean(ADMIN_KEY),newsWebhookConfigured:Boolean(NEWS_WEBHOOK_KEY),officialNewsEnabled:OFFICIAL_NEWS_ENABLED,fmpEnabled:FMP_ENABLED,fmpKeyConfigured:Boolean(FMP_API_KEY),fmpConfigured:FMP_ENABLED&&Boolean(FMP_API_KEY),alphaVantageConfigured:Boolean(ALPHAVANTAGE_API_KEY),finnhubConfigured:Boolean(FINNHUB_API_KEY),autoTrackTrades:AUTO_TRACK_TRADES,lastNewsSync,lastSuccessfulNewsSync,lastNewsSyncError,newsProviders:lastNewsProviderResults,newsCoverage:newsCoverageStatus(),patternMinSamples:PATTERN_MIN_SAMPLES,patternMinProbability:PATTERN_MIN_PROBABILITY,analysisTimeframe:ANALYSIS_TIMEFRAME,analysisTimeframes:ANALYSIS_TIMEFRAMES,analysisProfiles:analysisProfilesPublic(),contextTimeframes:CONTEXT_TIMEFRAMES,lastBarAtByTimeframe:{...lastBarAtByTimeframe},autoPatternSignals:AUTO_PATTERN_SIGNALS,patternSignalMinSamples:PATTERN_SIGNAL_MIN_SAMPLES,patternSignalMinProbability:PATTERN_SIGNAL_MIN_PROBABILITY,patternSignalMinScore:PATTERN_SIGNAL_MIN_SCORE,smcEnabled:SMC_ENABLED,smcMinScore:SMC_MIN_SCORE,smcNotifyPendingScore:SMC_NOTIFY_PENDING_SCORE,smcRequireM5Confirmation:SMC_REQUIRE_M5_CONFIRMATION,liveMinAdaptiveScore:LIVE_MIN_ADAPTIVE_SCORE,learningMinSamples:LEARNING_MIN_SAMPLES,maxNewsRiskLive:MAX_NEWS_RISK_LIVE,maxConsecutiveLosses:MAX_CONSECUTIVE_LOSSES,webhookStaleMinutes:WEBHOOK_STALE_MINUTES,telegramSystemAlerts:TELEGRAM_SYSTEM_ALERTS,telegram:telegram.status(),lastTelegramAt,lastTelegramResult,lastSystemAlertAt,lastWebhookAt,lastWebhookResult,warnings:systemWarnings(),time:new Date().toISOString()}));
+app.get("/health", (req,res)=>res.json({ok:true,version:APP_VERSION,database:pool?"postgres":"memory",archiveAfterHours:ARCHIVE_AFTER_HOURS,adminKeyConfigured:Boolean(ADMIN_KEY),newsWebhookConfigured:Boolean(NEWS_WEBHOOK_KEY),officialNewsEnabled:OFFICIAL_NEWS_ENABLED,fmpEnabled:FMP_ENABLED,fmpKeyConfigured:Boolean(FMP_API_KEY),fmpConfigured:FMP_ENABLED&&Boolean(FMP_API_KEY)&&!fmpRuntimeDisabledReason,fmpRuntimeDisabledReason,alphaVantageConfigured:Boolean(ALPHAVANTAGE_API_KEY),finnhubConfigured:Boolean(FINNHUB_API_KEY),autoTrackTrades:AUTO_TRACK_TRADES,lastNewsSync,lastSuccessfulNewsSync,lastNewsSyncError,newsProviders:lastNewsProviderResults,newsCoverage:newsCoverageStatus(),patternMinSamples:PATTERN_MIN_SAMPLES,patternMinProbability:PATTERN_MIN_PROBABILITY,analysisTimeframe:ANALYSIS_TIMEFRAME,analysisTimeframes:ANALYSIS_TIMEFRAMES,analysisProfiles:analysisProfilesPublic(),contextTimeframes:CONTEXT_TIMEFRAMES,symbolAliases:aliasSummary(),lastBarAtByTimeframe:{...lastBarAtByTimeframe},autoPatternSignals:AUTO_PATTERN_SIGNALS,patternSignalMinSamples:PATTERN_SIGNAL_MIN_SAMPLES,patternSignalMinProbability:PATTERN_SIGNAL_MIN_PROBABILITY,patternSignalMinScore:PATTERN_SIGNAL_MIN_SCORE,smcEnabled:SMC_ENABLED,smcMinScore:SMC_MIN_SCORE,smcNotifyPendingScore:SMC_NOTIFY_PENDING_SCORE,smcRequireM5Confirmation:SMC_REQUIRE_M5_CONFIRMATION,liveMinAdaptiveScore:LIVE_MIN_ADAPTIVE_SCORE,learningMinSamples:LEARNING_MIN_SAMPLES,maxNewsRiskLive:MAX_NEWS_RISK_LIVE,maxConsecutiveLosses:MAX_CONSECUTIVE_LOSSES,webhookStaleMinutes:WEBHOOK_STALE_MINUTES,telegramSystemAlerts:TELEGRAM_SYSTEM_ALERTS,telegram:telegram.status(),lastTelegramAt,lastTelegramResult,lastSystemAlertAt,lastWebhookAt,lastWebhookResult,warnings:systemWarnings(),time:new Date().toISOString()}));
 app.get("/api/system-status", async(req,res)=>{try{res.json(await buildSystemStatus());}catch(e){res.status(500).json({ok:false,error:e.message});}});
 
 app.get("/api/signals", async(req,res)=>{ try { const mode=req.query.mode==="archive"?"archive":"active"; res.json({ok:true,mode,signals:await listSignals(mode,req.query),analytics:await analytics()}); } catch(e){ console.error(e); res.status(500).json({ok:false,error:e.message}); } });
@@ -1598,7 +1633,7 @@ app.get("/api/news", async(req,res)=>{ try {
   res.json({ok:true,news:rows});
 } catch(e){res.status(500).json({ok:false,error:e.message});} });
 
-app.get("/api/news-status",(req,res)=>res.json({ok:true,officialNewsEnabled:OFFICIAL_NEWS_ENABLED,fmpEnabled:FMP_ENABLED,fmpKeyConfigured:Boolean(FMP_API_KEY),fmpConfigured:FMP_ENABLED&&Boolean(FMP_API_KEY),alphaVantageConfigured:Boolean(ALPHAVANTAGE_API_KEY),finnhubConfigured:Boolean(FINNHUB_API_KEY),providerResults:lastNewsProviderResults,lastNewsSync,lastSuccessfulNewsSync,lastSuccessfulCalendarSync,lastNewsSyncError,coverage:newsCoverageStatus(),autoSyncMinutes:NEWS_AUTO_SYNC_MINUTES,maxAgeHours:NEWS_MAX_AGE_HOURS,minRelevance:NEWS_MIN_RELEVANCE}));
+app.get("/api/news-status",(req,res)=>res.json({ok:true,officialNewsEnabled:OFFICIAL_NEWS_ENABLED,fmpEnabled:FMP_ENABLED,fmpKeyConfigured:Boolean(FMP_API_KEY),fmpConfigured:FMP_ENABLED&&Boolean(FMP_API_KEY)&&!fmpRuntimeDisabledReason,fmpRuntimeDisabledReason,alphaVantageConfigured:Boolean(ALPHAVANTAGE_API_KEY),finnhubConfigured:Boolean(FINNHUB_API_KEY),providerResults:lastNewsProviderResults,lastNewsSync,lastSuccessfulNewsSync,lastSuccessfulCalendarSync,lastNewsSyncError,coverage:newsCoverageStatus(),autoSyncMinutes:NEWS_AUTO_SYNC_MINUTES,maxAgeHours:NEWS_MAX_AGE_HOURS,minRelevance:NEWS_MIN_RELEVANCE}));
 
 app.post("/api/news-sync",async(req,res)=>{if(!requireAdmin(req,res))return;try{res.json({ok:true,...await syncRealNews()});}catch(e){lastNewsSyncError=e.message;res.status(400).json({ok:false,error:e.message});}});
 
@@ -1617,7 +1652,7 @@ app.post("/api/telegram/test-signal", async(req,res)=>{if(!requireAdmin(req,res)
   const side=clean(req.body.side||"BUY",10).toUpperCase()==="SELL"?"SELL":"BUY";
   const timeframe=normalizeTimeframe(req.body.timeframe||ANALYSIS_TIMEFRAME,ANALYSIS_TIMEFRAME);
   const risk=Math.max(price*0.0015,num(req.body.atr,0))*1.1;
-  const signal={external_id:`TELEGRAM-TEST-${Date.now()}`,symbol:clean(req.body.symbol||"US30",30),timeframe,signal:side,price,sl:side==="BUY"?price-risk:price+risk,tp1:side==="BUY"?price+risk*1.5:price-risk*1.5,tp2:side==="BUY"?price+risk*2.5:price-risk*2.5,tp3:side==="BUY"?price+risk*3.5:price-risk*3.5,score:92,adaptive_score:92,probability:86,execution_mode:"LIVE",session_name:"TEST",structure:"Test traseu complet",decision_reason:"Mesaj demonstrativ; nu reprezintă o recomandare de tranzacționare."};
+  const signal={external_id:`TELEGRAM-TEST-${Date.now()}`,signal_source:"TEST",symbol:canonicalSymbol(req.body.symbol||"US30"),timeframe,signal:side,price,sl:side==="BUY"?price-risk:price+risk,tp1:side==="BUY"?price+risk*1.5:price-risk*1.5,tp2:side==="BUY"?price+risk*2.5:price-risk*2.5,tp3:side==="BUY"?price+risk*3.5:price-risk*3.5,score:92,adaptive_score:92,probability:86,execution_mode:"LIVE",session_name:"TEST",structure:"Test traseu complet",decision_reason:"Mesaj demonstrativ; nu reprezintă o recomandare de tranzacționare."};
   const result=await telegram.sendSignal(signal);lastTelegramAt=new Date().toISOString();lastTelegramResult=`TEST SIGNAL TRIMIS ${side} ${signal.symbol}, mesaj ${result.message_id}`;await logTelegram({signal,status:"TEST_SIGNAL",messageId:result.message_id,details:lastTelegramResult});res.json({ok:true,messageId:result.message_id,signal});
 }catch(e){lastTelegramAt=new Date().toISOString();lastTelegramResult=`EROARE TEST SIGNAL: ${e.message}`;await logTelegram({status:"ERROR",details:e.message}).catch(()=>{});res.status(400).json({ok:false,error:e.message});}});
 
@@ -1626,7 +1661,7 @@ app.post("/api/test-signal",async(req,res)=>{ if(!requireAdmin(req,res))return; 
   const atr=Math.max(price*0.0015,num(req.body.atr,0)); const risk=atr*1.1;
   const side=clean(req.body.side||"BUY",10).toUpperCase()==="SELL"?"SELL":"BUY";
   const timeframe=normalizeTimeframe(req.body.timeframe||ANALYSIS_TIMEFRAME,ANALYSIS_TIMEFRAME);
-  const s=normalizeSignal({external_id:`TEST-${Date.now()}`,symbol:clean(req.body.symbol||"US30",30),timeframe,signal:side,price,
+  const s=normalizeSignal({external_id:`TEST-${Date.now()}`,signal_source:"TEST",symbol:canonicalSymbol(req.body.symbol||"US30"),timeframe,signal:side,price,
     sl:side==="BUY"?price-risk:price+risk,tp1:side==="BUY"?price+risk*1.5:price-risk*1.5,tp2:side==="BUY"?price+risk*2.5:price-risk*2.5,tp3:side==="BUY"?price+risk*3.5:price-risk*3.5,
     score:88,probability:79,rsi:58.4,atr,rr:3.5,trend:side==="BUY"?"Bullish":"Bearish",structure:`${side} test`,session:"New York",bos:true,fvg:true,liquidity_sweep:true,vwap_confirm:true,mtf_confirm:true,market_phase:"Expansion",premium_discount:side==="BUY"?"Discount":"Premium",reason:`Semnal demonstrativ v18 ${timeframeLabel(timeframe)} la preț introdus manual.`});
   await saveSignal(s);res.json({ok:true,signal:s});
@@ -1719,7 +1754,7 @@ async function runDukascopyDownload(job){
 }
 app.post("/api/history-download",async(req,res)=>{if(!requireAdmin(req,res))return;try{
   if(historyDownloadJob&&historyDownloadJob.status==="RUNNING")throw new Error("Există deja o descărcare în curs. Așteaptă finalizarea ei.");
-  const symbol=clean(req.body.symbol||"US30",30).toUpperCase();if(!DUKASCOPY_INSTRUMENTS[symbol])throw new Error("Instrument neacceptat. Alege US30, XAUUSD sau NAS100.");
+  const symbol=canonicalSymbol(req.body.symbol||"US30");if(!DUKASCOPY_INSTRUMENTS[symbol])throw new Error("Instrument neacceptat. Alege US30, XAUUSD sau NAS100.");
   const timeframe=clean(req.body.timeframe||"5",10);if(!DUKASCOPY_TIMEFRAMES[timeframe])throw new Error("Timeframe neacceptat.");
   const priceType=clean(req.body.priceType||"bid",10).toLowerCase()==="ask"?"ask":"bid";
   const years=Math.max(1,Math.min(10,Math.floor(num(req.body.years,5))));
@@ -1741,7 +1776,7 @@ app.post("/api/history-import",async(req,res)=>{if(!requireAdmin(req,res))return
 }catch(e){res.status(400).json({ok:false,error:e.message});}});
 
 app.post("/api/history-aggregate",async(req,res)=>{if(!requireAdmin(req,res))return;try{
-  const symbol=clean(req.body.symbol||"US30",30).toUpperCase();
+  const symbol=canonicalSymbol(req.body.symbol||"US30");
   const sourceTimeframe=clean(req.body.sourceTimeframe||"5",20);
   const targetTimeframe=clean(req.body.targetTimeframe||ANALYSIS_TIMEFRAME,20);
   const sourceRaw=await getBarsForBacktest(symbol,sourceTimeframe,500000);
@@ -1754,7 +1789,7 @@ app.post("/api/history-aggregate",async(req,res)=>{if(!requireAdmin(req,res))ret
 }catch(e){res.status(400).json({ok:false,error:e.message});}});
 
 app.post("/api/history-aggregate-all",async(req,res)=>{if(!requireAdmin(req,res))return;try{
-  const symbol=clean(req.body.symbol||"US30",30).toUpperCase();
+  const symbol=canonicalSymbol(req.body.symbol||"US30");
   const sourceTimeframe="5";
   const sourceRaw=await getBarsForBacktest(symbol,sourceTimeframe,500000);
   const sourceBars=Array.isArray(sourceRaw)?sourceRaw:(sourceRaw&&Array.isArray(sourceRaw.rows)?sourceRaw.rows:[]);
@@ -1777,7 +1812,7 @@ app.post("/api/history-aggregate-all",async(req,res)=>{if(!requireAdmin(req,res)
 }catch(e){res.status(400).json({ok:false,error:e.message});}});
 
 app.post("/api/backtest",async(req,res)=>{if(!requireAdmin(req,res))return;try{
-  const symbol=clean(req.body.symbol||"US30",30).toUpperCase();
+  const symbol=canonicalSymbol(req.body.symbol||"US30");
   const timeframe=clean(req.body.timeframe||ANALYSIS_TIMEFRAME,20);
   const settings={
     horizonBars:Math.max(1,Math.min(24,num(req.body.horizonBars,3))),
@@ -1848,5 +1883,5 @@ initDb().then(async()=>{
   if(OFFICIAL_NEWS_ENABLED||(FMP_ENABLED&&FMP_API_KEY)||ALPHAVANTAGE_API_KEY||FINNHUB_API_KEY){syncRealNews().catch(e=>{lastNewsSyncError=e.message;console.error("News sync:",e.message)});setInterval(()=>syncRealNews().catch(e=>{lastNewsSyncError=e.message;console.error("News sync:",e.message)}),NEWS_AUTO_SYNC_MINUTES*60000).unref();}
   setTimeout(()=>monitorSystem().catch(e=>console.error("System monitor:",e.message)),15000).unref();
   setInterval(()=>monitorSystem().catch(e=>console.error("System monitor:",e.message)),SYSTEM_MONITOR_INTERVAL_MINUTES*60000).unref();
-  app.listen(PORT,()=>console.log(`PropTrader AI v18.1 rulează pe portul ${PORT}`));
+  app.listen(PORT,()=>console.log(`PropTrader AI v18.2 rulează pe portul ${PORT}`));
 }).catch(e=>{console.error("DB init failed:",e);process.exit(1)});

@@ -242,19 +242,25 @@ function premiumDiscount(bars, eventIndex, entry, side) {
 
 function targetLevels(side, entry, risk, swings) {
   const multipliers = [1.5, 2.5, 4];
+  const minimumGapR = 0.35;
   const pools = side === "BUY"
     ? swings.highs.map(item => item.price).filter(price => price > entry).sort((a, b) => a - b)
     : swings.lows.map(item => item.price).filter(price => price < entry).sort((a, b) => b - a);
   let previous = entry;
   return multipliers.map((multiple, targetIndex) => {
     const threshold = side === "BUY" ? entry + risk * multiple : entry - risk * multiple;
+    const minimumSeparatedTarget = side === "BUY"
+      ? previous + risk * minimumGapR
+      : previous - risk * minimumGapR;
     const pool = pools.find(price => {
       const beyondThreshold = side === "BUY" ? price >= threshold : price <= threshold;
-      const beyondPrevious = side === "BUY" ? price > previous + risk * 0.35 : price < previous - risk * 0.35;
+      const beyondPrevious = side === "BUY" ? price >= minimumSeparatedTarget : price <= minimumSeparatedTarget;
       const notExcessive = Math.abs(price - entry) <= risk * (multiple + 1.25 + targetIndex * 0.5);
       return beyondThreshold && beyondPrevious && notExcessive;
     });
-    const target = pool || threshold;
+    const target = pool || (side === "BUY"
+      ? Math.max(threshold, minimumSeparatedTarget)
+      : Math.min(threshold, minimumSeparatedTarget));
     previous = target;
     return round(target);
   });

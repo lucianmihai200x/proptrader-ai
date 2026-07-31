@@ -1,4 +1,4 @@
-# PropTrader AI v18.1 — SMC predictiv M5–H4 și niveluri pe TradingView
+# PropTrader AI v18.2 — SMC predictiv M5–H4 și niveluri pe TradingView
 
 Aplicația primește lumânări M5 închise din TradingView, construiește automat M15, M30, H1, H4 și contextul D1 și caută intrări SMC pe toate intervalele M5–H4. O intrare nu este mutată artificial la prețul curent.
 
@@ -9,7 +9,7 @@ Motorul separă două momente:
 
 ## Reguli SMC implementate
 
-SMC nu are o specificație tehnică universală. În v18.1 regulile sunt explicite și testabile:
+SMC nu are o specificație tehnică universală. În v18.2 regulile sunt explicite și testabile:
 
 - swing high/low este confirmat numai după două lumânări în dreapta;
 - structura bullish cere HH + HL, iar structura bearish LH + LL; EMA20/EMA50 este doar fallback;
@@ -21,7 +21,7 @@ SMC nu are o specificație tehnică universală. În v18.1 regulile sunt explici
 - zonele invalidate sau testate de prea multe ori sunt eliminate;
 - D1 și H4 dau biasul de context, iar M5/M15/M30/H1/H4 pot produce planul;
 - intrarea este mijlocul corpului order block-ului, SL trece de wick cu buffer ATR;
-- TP1, TP2 și TP3 pornesc de la minimum 1,5R, 2,5R și 4R și pot folosi pool-uri de lichiditate valide.
+- TP1, TP2 și TP3 pornesc de la minimum 1,5R, 2,5R și 4R, pot folosi pool-uri de lichiditate valide și sunt forțate să rămână strict ordonate, cu minimum 0,35R între două ținte.
 
 Motorul nu forțează un setup dacă aceste condiții nu există.
 
@@ -54,11 +54,23 @@ Există două tipuri de mesaje:
 
 Ambele includ intervalul, Entry, SL, TP1–TP3, biasul și starea validării istorice. Pentru SMC, pragul specializat de notificare este `SMC_NOTIFY_PENDING_SCORE`; celelalte semnale folosesc `TELEGRAM_MIN_SCORE`.
 
+Fiecare mesaj LIVE indică explicit sursa: `SMC LIVE`, `MODEL ISTORIC`, `WEBHOOK` sau `TEST`. Planurile omise sunt salvate în jurnalul Telegram cu motivul concret: scor sub prag, mod WATCH, risc de știri sau Telegram neconfigurat.
+
+## Aliasuri de instrument
+
+Serverul salvează automat denumirile de broker sub un simbol unic:
+
+- `US100`, `USTEC`, `USTECH`, `NDX` și `NASDAQ100` devin `NAS100`;
+- `DJ30`, `DOW30`, `DJI` și `DJIA` devin `US30`;
+- `GOLD` și `GOLDUSD` devin `XAUUSD`.
+
+Astfel, lumânările TradingView, istoricul Dukascopy, știrile și rezultatele învățate nu mai sunt împărțite între denumiri diferite.
+
 ## Actualizare pe Render
 
 1. Înlocuiește în GitHub fișierele proiectului cu cele din această arhivă.
 2. Fă un commit și alege în Render **Manual Deploy → Deploy latest commit**.
-3. Verifică `/health`: `version` trebuie să fie `18.1.0`.
+3. Verifică `/health`: `version` trebuie să fie `18.2.0`.
 4. În pagina **Istoric & Backtest**, după ce există date M5, apasă **Construiește M15 · M30 · H1 · H4 · D1 din M5**.
 
 Variabile recomandate:
@@ -90,12 +102,14 @@ Migrarea bazei de date este automată la pornire: sunt create tabela `smc_setups
 Arhiva conține două scripturi Pine cu roluri separate:
 
 1. `PropTrader_AI_v17_M5_H4_Collector.pine` trimite lumânările M5 către server. Dacă alerta existentă funcționează numai prin Webhook URL, nu trebuie recreată.
-2. `PropTrader_AI_v18_1_SMC_Visual.pine` analizează local datele TradingView și desenează pe grafic:
+2. `PropTrader_AI_v18_2_SMC_Visual.pine` analizează local datele TradingView și desenează pe grafic:
    - zona order block pentru intrare;
    - linia Entry;
    - SL;
    - TP1, TP2 și TP3;
-   - direcția BUY/SELL, intervalul, BOS/CHOCH, starea PENDING/LIVE și scorul SMC;
+   - direcția BUY/SELL, intervalul, BOS/CHOCH, starea PENDING/LIVE/WATCH și scorul SMC;
+   - eligibilitatea informativă pentru pragul Telegram de 78;
+   - ultimul plan păstrat în stil estompat după încheiere;
    - biasul D1 și H4 într-un panou.
 
 Indicatorul vizual verifică M5, M15, M30, H1 și H4 și, implicit, afișează planul activ cu scorul cel mai mare. Din setări poți forța afișarea unui singur interval.
@@ -104,12 +118,12 @@ Indicatorul vizual verifică M5, M15, M30, H1 și H4 și, implicit, afișează p
 
 1. Deschide același instrument pe graficul de **5 minute**.
 2. În Pine Editor creează un indicator nou.
-3. Copiază integral conținutul fișierului `PropTrader_AI_v18_1_SMC_Visual.pine`.
+3. Copiază integral conținutul fișierului `PropTrader_AI_v18_2_SMC_Visual.pine`.
 4. Apasă **Save**, apoi **Add to chart**.
 5. Lasă `Interval afișat = AUTO — cel mai bun`.
 6. Nu crea alertă pentru acest indicator. El nu conține `alertcondition()` și este numai pentru desenarea nivelurilor.
 
-Zona verde indică un plan BUY, iar zona roșie un plan SELL. Nivelurile sunt extinse spre dreapta și dispar când planul este invalidat, expiră sau TP3 este atins. Eticheta LIVE apare numai după atingerea Entry și o respingere confirmată pe M5.
+Zona verde indică un plan BUY, iar zona roșie un plan SELL. Nivelurile sunt extinse spre dreapta. După invalidare, expirare sau TP3, ultimul plan rămâne vizibil în gri dacă opțiunea `Păstrează ultimul plan pe grafic` este activă. Eticheta BUY/SELL apare numai după atingerea Entry, respingere confirmată M5 și scor local cel puțin egal cu pragul informativ Telegram; sub prag apare `WATCH`.
 
 ### Limită tehnică importantă
 
@@ -136,7 +150,7 @@ TradingView va înregistra tehnic un webhook la fiecare lumânare M5 deoarece ac
 
 ## Știri
 
-FMP este oprit implicit. Astfel, cheia FMP fără acces la calendar nu mai produce repetat HTTP 402. Titlurile Federal Reserve și BLS funcționează fără chei; dacă nu există calendar anticipat, motorul aplică risc de siguranță în loc de risc zero.
+FMP este oprit implicit. Dacă variabila a rămas activă, dar abonamentul răspunde HTTP 402, v18.2 oprește automat FMP pentru sesiunea serverului și continuă sincronizarea fluxurilor oficiale gratuite. Titlurile Federal Reserve și BLS funcționează fără chei; dacă nu există calendar anticipat, motorul aplică risc de siguranță în loc de risc zero.
 
 Activează FMP numai dacă planul tău include endpoint-ul calendarului economic:
 

@@ -13,6 +13,7 @@ test('server converts robust multi-timeframe patterns into signals and applies n
   assert.match(source, /NEWS_CALENDAR_UNAVAILABLE_RISK/);
   assert.match(source, /fetchOfficialNews/);
   assert.match(source, /generatedSignals/);
+  assert.match(source, /signal_source/);
 });
 
 test('Telegram module supports system alerts and all three targets', () => {
