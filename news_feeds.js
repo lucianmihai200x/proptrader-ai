@@ -92,7 +92,7 @@ async function fetchOfficialNews({
       const response = await fetchImpl(feed.url, {
         headers: {
           accept: "application/rss+xml, application/xml, text/xml, */*",
-          "user-agent": "PropTrader-AI/18.4"
+          "user-agent": "PropTrader-AI/18.5"
         },
         signal: controller.signal
       });

@@ -10,6 +10,12 @@ const { outcomeR } = require("./trade_management");
 const { buildTradeReview, buildMonitoringReview, lossFactorStats } = require("./learning");
 const { canonicalSymbol, aliasSummary } = require("./symbols");
 const {
+  signalFamily,
+  matchesAnalyticsScope,
+  premiumDiscountAligned,
+  zoneOverlapRatio
+} = require("./signal_policy");
+const {
   SUPPORTED_ANALYSIS_TIMEFRAMES,
   CONTEXT_TIMEFRAMES,
   normalizeTimeframe,
@@ -20,7 +26,7 @@ const {
 } = require("./timeframes");
 
 const app = express();
-const APP_VERSION = "18.4.0";
+const APP_VERSION = "18.5.0";
 let lastWebhookAt = null;
 let lastWebhookResult = "Niciun webhook primit după pornire";
 let lastTelegramAt = null;
@@ -75,6 +81,8 @@ const SMC_NOTIFY_PENDING_SCORE = Math.max(SMC_MIN_SCORE, Math.min(95, Number(pro
 const SMC_REQUIRE_M5_CONFIRMATION = String(process.env.SMC_REQUIRE_M5_CONFIRMATION || "true").toLowerCase() !== "false";
 const SMC_MAX_PENDING_PER_SYMBOL = Math.max(3, Math.min(50, Number(process.env.SMC_MAX_PENDING_PER_SYMBOL || 15)));
 const SMC_MIN_BLOCK_SAMPLES = Math.max(5, Number(process.env.SMC_MIN_BLOCK_SAMPLES || 8));
+const SMC_OVERLAP_THRESHOLD = Math.max(0.25, Math.min(0.95, Number(process.env.SMC_OVERLAP_THRESHOLD || 0.5)));
+const BACKTEST_MIN_TRADING_DAYS = Math.max(30, Number(process.env.BACKTEST_MIN_TRADING_DAYS || 60));
 let lastNewsSync = null;
 let lastSuccessfulNewsSync = null;
 let lastNewsSyncError = "";
@@ -99,6 +107,7 @@ let memoryPatterns = [];
 let memorySmcSetups = [];
 
 let historyDownloadJob = null;
+let historyAggregationJob = null;
 const HISTORY_CHUNK_DAYS = Math.max(7, Math.min(90, Number(process.env.HISTORY_CHUNK_DAYS || 30)));
 const HISTORY_RETRY_ATTEMPTS = Math.max(1, Math.min(8, Number(process.env.HISTORY_RETRY_ATTEMPTS || 4)));
 const HISTORY_RETRY_BASE_MS = Math.max(500, Number(process.env.HISTORY_RETRY_BASE_MS || 2000));
@@ -211,7 +220,7 @@ function systemWarnings() {
   const news = newsCoverageStatus();
   if (!news.healthy) warnings.push({ code: "NEWS_COVERAGE", severity: "warning", message: lastNewsSyncError ? `Filtrul de știri este degradat: ${lastNewsSyncError}` : "Nu există o sincronizare recentă și reușită a știrilor." });
   else if (!news.calendarHealthy) warnings.push({ code: "NEWS_CALENDAR", severity: "warning", message: `Fluxurile oficiale sunt active, dar calendarul economic anticipat nu este disponibil; se aplică risc de siguranță ${NEWS_CALENDAR_UNAVAILABLE_RISK}/100.` });
-  if (telegram.MIN_SCORE > LIVE_MIN_ADAPTIVE_SCORE) warnings.push({ code: "THRESHOLD_GAP", severity: "info", message: `Semnalele LIVE între ${LIVE_MIN_ADAPTIVE_SCORE} și ${telegram.MIN_SCORE - 1} rămân în aplicație, fără notificare Telegram.` });
+  if (SMC_NOTIFY_PENDING_SCORE > SMC_MIN_SCORE) warnings.push({ code: "SMC_RESEARCH_GAP", severity: "info", message: `Planurile SMC cu scor între ${SMC_MIN_SCORE} și ${SMC_NOTIFY_PENDING_SCORE - 1} rămân observații în aplicație, fără notificare Telegram.` });
   return warnings;
 }
 
@@ -308,6 +317,8 @@ async function initDb() {
     ["execution_mode", "TEXT DEFAULT 'WATCH'"], ["quality_score", "NUMERIC DEFAULT 0"],
     ["confidence_lower", "NUMERIC DEFAULT 0"], ["decision_reason", "TEXT"], ["regime", "TEXT DEFAULT 'UNKNOWN'"],
     ["signal_source", "TEXT DEFAULT 'WEBHOOK'"],
+    ["notification_status", "TEXT DEFAULT 'NOT_SENT'"], ["notified_at", "TIMESTAMPTZ"],
+    ["telegram_message_id", "TEXT"],
     ["tp1_hit_at", "TIMESTAMPTZ"], ["tp2_hit_at", "TIMESTAMPTZ"], ["tp3_hit_at", "TIMESTAMPTZ"],
     ["best_target", "TEXT"], ["managed_stop", "NUMERIC"],
     ["last_reanalysis_at", "TIMESTAMPTZ"], ["monitoring_state", "JSONB"], ["monitoring_summary", "TEXT"],
@@ -442,10 +453,20 @@ async function initDb() {
   `);
   for (const [name, type] of [
     ["result", "TEXT"], ["pnl_r", "NUMERIC"], ["last_revalidated_at", "TIMESTAMPTZ"],
-    ["activation_score", "NUMERIC"], ["activation_context", "JSONB"]
+    ["activation_score", "NUMERIC"], ["activation_context", "JSONB"],
+    ["actionable", "BOOLEAN DEFAULT TRUE"], ["blocking_reason", "TEXT"]
   ]) {
     await pool.query(`ALTER TABLE smc_setups ADD COLUMN IF NOT EXISTS ${name} ${type}`);
   }
+  await pool.query(`
+    UPDATE smc_setups
+    SET status='WATCH',actionable=FALSE,updated_at=NOW(),
+        blocking_reason=CONCAT(side,' în ',premium_discount,': plan păstrat doar pentru cercetare; nu poate deveni LIVE și nu trimite Telegram.')
+    WHERE status='PENDING' AND (
+      (side='BUY' AND premium_discount='PREMIUM') OR
+      (side='SELL' AND premium_discount='DISCOUNT')
+    )
+  `);
   await pool.query(`CREATE INDEX IF NOT EXISTS smc_setups_pending_idx ON smc_setups(symbol,status,expires_at)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS smc_setups_created_idx ON smc_setups(created_at DESC)`);
 
@@ -522,7 +543,8 @@ function normalizeSignal(p) {
     equal_lows: bool(p.equal_lows), premium_discount: clean(p.premium_discount, 40), fib_zone: clean(p.fib_zone, 60),
     fvg_state: clean(p.fvg_state, 50), ob_state: clean(p.ob_state, 50), kill_zone: clean(p.kill_zone, 50),
     score_breakdown: safeJson(p.score_breakdown), reason: clean(p.reason || p.setup, 2200), setup_key: setupKey(p),
-    news_risk: 0, news_bias: "NEUTRAL", news_summary: ""
+    news_risk: 0, news_bias: "NEUTRAL", news_summary: "",
+    notification_status: "NOT_SENT", notified_at: null, telegram_message_id: null
   };
 }
 
@@ -1136,15 +1158,37 @@ async function listPatterns(limit=100){
 async function pendingSmcSetupsForSymbol(symbol) {
   if (!pool) {
     return memorySmcSetups
-      .filter(item => item.symbol === symbol && item.status === "PENDING")
+      .filter(item => item.symbol === symbol && item.status === "PENDING" && item.actionable !== false)
       .sort((a, b) => num(b.adaptive_score) - num(a.adaptive_score));
   }
   return (await pool.query(
     `SELECT * FROM smc_setups
-     WHERE symbol=$1 AND status='PENDING'
+     WHERE symbol=$1 AND status='PENDING' AND COALESCE(actionable,TRUE)=TRUE
      ORDER BY adaptive_score DESC, created_at DESC`,
     [symbol]
   )).rows;
+}
+
+async function competingPendingSmcSetups(setup) {
+  let rows;
+  if (!pool) {
+    rows = memorySmcSetups.filter(item =>
+      item.status === "PENDING" &&
+      item.actionable !== false &&
+      item.symbol === setup.symbol &&
+      item.side === setup.side &&
+      String(item.timeframe) === String(setup.timeframe)
+    );
+  } else {
+    rows = (await pool.query(
+      `SELECT * FROM smc_setups
+       WHERE status='PENDING' AND COALESCE(actionable,TRUE)=TRUE
+         AND symbol=$1 AND side=$2 AND timeframe=$3
+       ORDER BY adaptive_score DESC, created_at DESC`,
+      [setup.symbol, setup.side, String(setup.timeframe)]
+    )).rows;
+  }
+  return rows.filter(item => zoneOverlapRatio(item, setup) >= SMC_OVERLAP_THRESHOLD);
 }
 
 async function prunePendingSmcSetupsForSymbol(symbol) {
@@ -1158,6 +1202,34 @@ async function prunePendingSmcSetupsForSymbol(symbol) {
       terminal_reason: `Plan înlocuit: există deja ${SMC_MAX_PENDING_PER_SYMBOL} planuri PENDING mai puternice sau mai recente pentru ${symbol}.`
     });
     if (updated) cancelled.push(updated);
+  }
+  return cancelled;
+}
+
+async function deduplicateExistingPendingSmcSetups() {
+  const pending = await listSmcSetups({ status: "PENDING", limit: 500 });
+  const groups = new Map();
+  for (const setup of pending.filter(item => item.actionable !== false)) {
+    const key = `${setup.symbol}|${setup.side}|${setup.timeframe}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(setup);
+  }
+  let cancelled = 0;
+  for (const setups of groups.values()) {
+    const kept = [];
+    for (const setup of setups.sort((a,b)=>num(b.adaptive_score)-num(a.adaptive_score))) {
+      const stronger = kept.find(item => zoneOverlapRatio(item, setup) >= SMC_OVERLAP_THRESHOLD);
+      if (!stronger) {
+        kept.push(setup);
+        continue;
+      }
+      await updateSmcSetup(setup.external_id, {
+        status: "CANCELLED",
+        closed_at: new Date().toISOString(),
+        terminal_reason: `Plan duplicat retras: zona se suprapune cu ${stronger.external_id}, care are scor mai mare.`
+      });
+      cancelled++;
+    }
   }
   return cancelled;
 }
@@ -1220,6 +1292,7 @@ async function notifyTelegramPendingSetup(setup) {
     return { skipped: true, reason };
   };
   if (!telegram.status().configured) return skip("Telegram neconfigurat");
+  if (setup.actionable === false || setup.status !== "PENDING") return skip(setup.blocking_reason || "plan păstrat doar ca observație");
   if (num(setup.adaptive_score) < SMC_NOTIFY_PENDING_SCORE) return skip(`scor ${num(setup.adaptive_score)} sub ${SMC_NOTIFY_PENDING_SCORE}`);
   if (num(setup.news_risk) > MAX_NEWS_RISK_LIVE) return skip(`risc știri ${num(setup.news_risk)}/100 peste ${MAX_NEWS_RISK_LIVE}`);
   try {
@@ -1227,12 +1300,12 @@ async function notifyTelegramPendingSetup(setup) {
     lastTelegramAt = new Date().toISOString();
     lastTelegramResult = `PLAN SMC ${setup.side} ${setup.symbol} ${timeframeLabel(setup.timeframe)}, mesaj ${result.message_id}`;
     await updateSmcSetup(setup.external_id, { pending_notified: true });
-    await logTelegram({ status: "SMC_PENDING", messageId: result.message_id, details: lastTelegramResult });
+    await logTelegram({ signal: logSignal, status: "SMC_PENDING", messageId: result.message_id, details: lastTelegramResult });
     return { skipped: false, messageId: result.message_id };
   } catch (error) {
     lastTelegramAt = new Date().toISOString();
     lastTelegramResult = `EROARE PLAN SMC: ${error.message}`;
-    await logTelegram({ status: "ERROR", details: lastTelegramResult }).catch(() => {});
+    await logTelegram({ signal: logSignal, status: "ERROR", details: lastTelegramResult }).catch(() => {});
     throw error;
   }
 }
@@ -1244,6 +1317,30 @@ async function saveSmcSetup(setup) {
   setup.historical_probability = performance.samples >= 5 ? Number(performance.weightedWinRate.toFixed(2)) : null;
   setup.adaptive_score = Math.max(0, Math.min(100, Number((setup.score + performance.adjustment).toFixed(2))));
   setup.news_risk = news.risk;
+  setup.actionable = premiumDiscountAligned(setup.side, setup.premium_discount);
+  setup.blocking_reason = setup.actionable
+    ? ""
+    : `${setup.side} în ${setup.premium_discount}: plan păstrat doar pentru cercetare; nu poate deveni LIVE și nu trimite Telegram.`;
+  if (!setup.actionable) setup.status = "WATCH";
+  if (setup.actionable) {
+    const competing = await competingPendingSmcSetups(setup);
+    const stronger = competing.find(item => num(item.adaptive_score) >= num(setup.adaptive_score));
+    if (stronger) {
+      return {
+        inserted: false,
+        setup,
+        duplicateOf: stronger.external_id,
+        reason: `Zonă suprapusă cu planul ${stronger.external_id}, care are scor egal sau mai mare.`
+      };
+    }
+    for (const existing of competing) {
+      await updateSmcSetup(existing.external_id, {
+        status: "CANCELLED",
+        closed_at: new Date().toISOString(),
+        terminal_reason: `Înlocuit de un plan SMC suprapus mai puternic: ${setup.external_id}.`
+      });
+    }
+  }
   if (!pool) {
     if (memorySmcSetups.some(item => item.external_id === setup.external_id)) return { inserted: false, setup };
     memorySmcSetups.unshift({ id: Date.now(), pending_notified: false, ...setup });
@@ -1257,8 +1354,8 @@ async function saveSmcSetup(setup) {
       historical_probability,learning_samples,news_risk,d1_bias,h4_bias,local_bias,
       structure_event,broken_level,order_block_time,displacement,fvg,fvg_low,fvg_high,
       liquidity_sweep,sweep_level,premium_discount,mitigations,touch_count,volume_confirmed,
-      model_key,score_breakdown,features,reason
-    ) VALUES (${Array.from({length:41},(_,index)=>`$${index+1}`).join(",")})
+      model_key,score_breakdown,features,reason,actionable,blocking_reason
+    ) VALUES (${Array.from({length:43},(_,index)=>`$${index+1}`).join(",")})
     ON CONFLICT DO NOTHING RETURNING *
   `, [
     setup.external_id,setup.created_at,setup.updated_at,setup.expires_at,setup.symbol,setup.timeframe,setup.side,setup.status,
@@ -1266,7 +1363,7 @@ async function saveSmcSetup(setup) {
     setup.historical_probability,setup.learning_samples,setup.news_risk,setup.d1_bias,setup.h4_bias,setup.local_bias,
     setup.structure_event,setup.broken_level,setup.order_block_time,setup.displacement,setup.fvg,setup.fvg_low,setup.fvg_high,
     setup.liquidity_sweep,setup.sweep_level,setup.premium_discount,setup.mitigations,setup.touch_count,setup.volume_confirmed,
-    setup.model_key,JSON.stringify(setup.score_breakdown),JSON.stringify(setup.features),setup.reason
+    setup.model_key,JSON.stringify(setup.score_breakdown),JSON.stringify(setup.features),setup.reason,setup.actionable,setup.blocking_reason
   ]);
   return { inserted: result.rowCount > 0, setup: result.rows[0] || setup };
 }
@@ -1366,6 +1463,24 @@ async function revalidateSmcSetupAtEntry(setup, candidate) {
   };
 }
 
+async function openSmcExposureForSymbol(symbol) {
+  if (!pool) {
+    return memorySignals.find(item =>
+      item.status === "OPEN" &&
+      item.symbol === symbol &&
+      signalFamily(item) === "SMC"
+    ) || null;
+  }
+  return (await pool.query(
+    `SELECT * FROM signals
+     WHERE status='OPEN' AND symbol=$1
+       AND (signal_source LIKE 'SMC%' OR external_id LIKE 'SMC-LIVE-%')
+     ORDER BY adaptive_score DESC, received_at DESC
+     LIMIT 1`,
+    [symbol]
+  )).rows[0] || null;
+}
+
 async function processPendingSmcSetups(bar) {
   if (!SMC_ENABLED || String(bar.timeframe) !== "5") return { updates: [], activatedSignals: [] };
   const setups = await pendingSmcSetupsForSymbol(bar.symbol);
@@ -1387,6 +1502,17 @@ async function processPendingSmcSetups(bar) {
     }
     if (evaluation.action === "TRIGGER") {
       const candidate = smcSetupToSignal(setup, evaluation.reason);
+      const existingExposure = await openSmcExposureForSymbol(setup.symbol);
+      if (existingExposure) {
+        const rejected = await updateSmcSetup(setup.external_id, {
+          status: "CANCELLED",
+          closed_at: new Date().toISOString(),
+          touch_count: evaluation.touchCount,
+          terminal_reason: `Activare anulată: există deja un semnal SMC OPEN pentru ${setup.symbol} (${existingExposure.signal} ${timeframeLabel(existingExposure.timeframe)}).`
+        });
+        if (rejected) updates.push(rejected);
+        continue;
+      }
       const revalidation = await revalidateSmcSetupAtEntry(setup, candidate);
       if (!revalidation.valid) {
         const rejected = await updateSmcSetup(setup.external_id, {
@@ -1457,7 +1583,7 @@ async function discoverSmcSetupsForBar(bar) {
   const cancelled = await prunePendingSmcSetupsForSymbol(bar.symbol);
   const cancelledIds = new Set(cancelled.map(setup => setup.external_id));
   for (const setup of inserted) {
-    if (!cancelledIds.has(setup.external_id)) {
+    if (!cancelledIds.has(setup.external_id) && setup.status === "PENDING" && setup.actionable !== false) {
       notifyTelegramPendingSetup(setup).catch(error => console.error("[TELEGRAM SMC PENDING]", error.message));
     }
   }
@@ -1487,10 +1613,28 @@ function recentWeightedStats(rows) {
   rows.forEach((x,i)=>{const w=Math.pow(0.985,i);wSum+=w;rSum+=num(x.pnl_r)*w;if(num(x.pnl_r)>0)winSum+=w;});
   return {weightedWinRate:winSum/wSum*100,weightedAvgR:rSum/wSum,effectiveSamples:wSum};
 }
-async function consecutiveLosses() {
+async function consecutiveLosses(signal = {}) {
+  const family = signalFamily(signal);
+  const symbol = canonicalSymbol(signal.symbol || "N/A", "N/A");
   let rows;
-  if(!pool) rows=memorySignals.filter(x=>x.status==="CLOSED").sort((a,b)=>new Date(b.closed_at)-new Date(a.closed_at)).slice(0,20);
-  else rows=(await pool.query(`SELECT pnl_r FROM signals WHERE status='CLOSED' ORDER BY closed_at DESC LIMIT 20`)).rows;
+  if(!pool) {
+    rows=memorySignals
+      .filter(x=>x.status==="CLOSED"&&x.symbol===symbol&&signalFamily(x)===family)
+      .sort((a,b)=>new Date(b.closed_at)-new Date(a.closed_at))
+      .slice(0,20);
+  } else {
+    const familySql = family === "SMC"
+      ? `(signal_source LIKE 'SMC%' OR external_id LIKE 'SMC-LIVE-%')`
+      : family === "MODEL"
+        ? `(signal_source='MODEL_ISTORIC' OR external_id LIKE 'AUTO-%')`
+        : family === "TEST"
+          ? `(signal_source='TEST' OR external_id LIKE 'TEST-%' OR external_id LIKE 'TELEGRAM-TEST-%')`
+          : `COALESCE(signal_source,'WEBHOOK') NOT LIKE 'SMC%' AND COALESCE(signal_source,'WEBHOOK') NOT IN ('MODEL_ISTORIC','TEST') AND COALESCE(external_id,'') NOT LIKE 'SMC-LIVE-%' AND COALESCE(external_id,'') NOT LIKE 'AUTO-%' AND COALESCE(external_id,'') NOT LIKE 'TEST-%'`;
+    rows=(await pool.query(
+      `SELECT pnl_r FROM signals WHERE status='CLOSED' AND symbol=$1 AND ${familySql} ORDER BY closed_at DESC LIMIT 20`,
+      [symbol]
+    )).rows;
+  }
   let n=0; for(const r of rows){if(num(r.pnl_r)<0)n++;else break;} return n;
 }
 function classifyRegimeFromSignal(s){
@@ -1525,7 +1669,7 @@ async function setupPerformance(key) {
 async function prepareSignalDecision(s) {
   const perf = await setupPerformance(s.setup_key);
   const news = await recentNewsRisk(s.symbol);
-  const lossStreak = await consecutiveLosses();
+  const lossStreak = await consecutiveLosses(s);
   const newsPenalty = news.risk >= 80 ? -14 : news.risk >= 55 ? -7 : 0;
   const samplePenalty = perf.samples > 0 && perf.samples < LEARNING_MIN_SAMPLES ? -3 : 0;
   const streakPenalty = lossStreak >= MAX_CONSECUTIVE_LOSSES ? -10 : 0;
@@ -1569,14 +1713,16 @@ async function saveSignal(s, { prepared = false } = {}) {
       adaptive_score,learning_adjustment,rsi,atr,rr,trend,structure,session_name,mtf_trend,vwap_side,
       order_block,bos,choch,fvg,liquidity_sweep,vwap_confirm,mtf_confirm,order_block_confirm,market_phase,
       equal_highs,equal_lows,premium_discount,fib_zone,fvg_state,ob_state,kill_zone,score_breakdown,reason,
-      news_risk,news_bias,news_summary,setup_key,execution_mode,quality_score,confidence_lower,decision_reason,regime,signal_source
-    ) VALUES (${Array.from({length:51},(_,i)=>`$${i+1}`).join(',')}) ON CONFLICT DO NOTHING RETURNING id
+      news_risk,news_bias,news_summary,setup_key,execution_mode,quality_score,confidence_lower,decision_reason,regime,signal_source,
+      notification_status,notified_at,telegram_message_id
+    ) VALUES (${Array.from({length:54},(_,i)=>`$${i+1}`).join(',')}) ON CONFLICT DO NOTHING RETURNING id
   `, [
     s.external_id,s.received_at,s.symbol,s.timeframe,s.signal,s.status,s.price,s.sl,s.tp1,s.tp2,s.tp3,s.score,s.probability,
     s.adaptive_score,s.learning_adjustment,s.rsi,s.atr,s.rr,s.trend,s.structure,s.session_name,s.mtf_trend,s.vwap_side,
     s.order_block,s.bos,s.choch,s.fvg,s.liquidity_sweep,s.vwap_confirm,s.mtf_confirm,s.order_block_confirm,s.market_phase,
     s.equal_highs,s.equal_lows,s.premium_discount,s.fib_zone,s.fvg_state,s.ob_state,s.kill_zone,JSON.stringify(s.score_breakdown),s.reason,
-    s.news_risk,s.news_bias,s.news_summary,s.setup_key,s.execution_mode,s.quality_score,s.confidence_lower,s.decision_reason,s.regime,s.signal_source
+    s.news_risk,s.news_bias,s.news_summary,s.setup_key,s.execution_mode,s.quality_score,s.confidence_lower,s.decision_reason,s.regime,s.signal_source,
+    s.notification_status||"NOT_SENT",s.notified_at||null,s.telegram_message_id||null
   ]);
   return inserted.rows.length > 0;
 }
@@ -1629,25 +1775,50 @@ function groupStats(data, keyFn) {
   return Object.values(map).map(g => ({ ...g, winRate: g.closed ? g.wins / g.closed * 100 : 0, avgR: g.closed ? g.totalR / g.closed : 0 }));
 }
 
-async function analytics() {
-  const data = await allSignalsForAnalytics();
+function summaryStats(data) {
   const closed = data.filter(x => x.status === "CLOSED");
   const wins = closed.filter(x => num(x.pnl_r) > 0), losses = closed.filter(x => num(x.pnl_r) < 0);
   const totalR = closed.reduce((a, x) => a + num(x.pnl_r), 0);
   const grossWin = wins.reduce((a, x) => a + num(x.pnl_r), 0);
   const grossLoss = Math.abs(losses.reduce((a, x) => a + num(x.pnl_r), 0));
+  return {
+    total:data.length, active:data.filter(x=>!x.archived_at).length, archived:data.filter(x=>x.archived_at).length,
+    open:data.filter(x=>x.status==="OPEN").length, closed:closed.length, wins:wins.length, losses:losses.length,
+    winRate:closed.length?wins.length/closed.length*100:0, totalR, profitFactor:grossLoss?grossWin/grossLoss:(grossWin>0?null:0),
+    avgScore:data.length?data.reduce((a,x)=>a+num(x.score),0)/data.length:0,
+    avgAdaptiveScore:data.length?data.reduce((a,x)=>a+num(x.adaptive_score,x.score),0)/data.length:0
+  };
+}
+
+async function analytics(requestedScope = "SMC") {
+  const allData = await allSignalsForAnalytics();
+  const scope = ["SMC","LEGACY","MODEL","ALL"].includes(String(requestedScope || "").toUpperCase())
+    ? String(requestedScope).toUpperCase()
+    : "SMC";
+  const data = allData.filter(item => matchesAnalyticsScope(item, scope));
+  const closed = data.filter(x => x.status === "CLOSED");
   let eq = 0;
   const equityCurve = [...closed].sort((a,b)=>new Date(a.closed_at||a.received_at)-new Date(b.closed_at||b.received_at))
     .map(x=>({time:x.closed_at||x.received_at,equity:(eq+=num(x.pnl_r))}));
   const setups = groupStats(closed, x => x.setup_key).filter(x => x.closed >= 3).sort((a,b) => b.avgR - a.avgR).slice(0, 15);
-  return { summary: {
-      total:data.length, active:data.filter(x=>!x.archived_at).length, archived:data.filter(x=>x.archived_at).length,
-      open:data.filter(x=>x.status==="OPEN").length, closed:closed.length, wins:wins.length, losses:losses.length,
-      winRate:closed.length?wins.length/closed.length*100:0, totalR, profitFactor:grossLoss?grossWin/grossLoss:(grossWin>0?null:0),
-      avgScore:data.length?data.reduce((a,x)=>a+num(x.score),0)/data.length:0,
-      avgAdaptiveScore:data.length?data.reduce((a,x)=>a+num(x.adaptive_score,x.score),0)/data.length:0
-    }, bySymbol:groupStats(data,x=>x.symbol), bySession:groupStats(data,x=>x.session_name),
-    byMarketPhase:groupStats(data,x=>x.market_phase), topSetups:setups, equityCurve };
+  const smcData = allData.filter(item => signalFamily(item) === "SMC");
+  return {
+    scope,
+    summary: summaryStats(data),
+    segments: {
+      smcAll: summaryStats(smcData),
+      smcLiveEligible: summaryStats(smcData.filter(item => item.execution_mode === "LIVE")),
+      smcWatch: summaryStats(smcData.filter(item => item.execution_mode !== "LIVE")),
+      telegramSent: summaryStats(smcData.filter(item => item.notification_status === "SENT")),
+      legacy: summaryStats(allData.filter(item => signalFamily(item) === "LEGACY")),
+      model: summaryStats(allData.filter(item => signalFamily(item) === "MODEL"))
+    },
+    bySymbol:groupStats(data,x=>x.symbol),
+    bySession:groupStats(data,x=>x.session_name),
+    byMarketPhase:groupStats(data,x=>x.market_phase),
+    topSetups:setups,
+    equityCurve
+  };
 }
 
 async function closeSignal(payload) {
@@ -1760,16 +1931,36 @@ function parseHistoricalCsv(csv,{symbol,timeframe,timezoneOffsetMinutes=0}={}){
   if(!dedup.length) throw new Error("Nu am putut interpreta nicio lumânare validă");
   return {bars:dedup,rejected,delimiter,headers};
 }
-async function saveBarsBatch(bars){
+async function saveBarsBatch(bars, executor=pool){
   const normalizedBars=bars.map(b=>({...b,symbol:canonicalSymbol(b.symbol)}));
   if(!pool){let inserted=0;for(const b of normalizedBars)if(await saveBar(b))inserted++;return inserted;}
   let inserted=0;
   for(let i=0;i<normalizedBars.length;i+=2000){
     const chunk=normalizedBars.slice(i,i+2000), values=[], params=[]; let n=1;
     for(const b of chunk){values.push(`($${n++},$${n++},$${n++},$${n++},$${n++},$${n++},$${n++},$${n++},$${n++})`);params.push(b.external_id,b.bar_time,b.symbol,b.timeframe,b.open,b.high,b.low,b.close,b.volume);}
-    const q=await pool.query(`INSERT INTO market_bars(external_id,bar_time,symbol,timeframe,open,high,low,close,volume) VALUES ${values.join(",")} ON CONFLICT DO NOTHING`,params);inserted+=q.rowCount;
+    const q=await executor.query(`INSERT INTO market_bars(external_id,bar_time,symbol,timeframe,open,high,low,close,volume) VALUES ${values.join(",")} ON CONFLICT DO NOTHING`,params);inserted+=q.rowCount;
   }
   return inserted;
+}
+async function replaceBarsDataset(symbol,timeframe,bars){
+  if(!pool){
+    const before=memoryBars.length;
+    memoryBars=memoryBars.filter(item=>!(item.symbol===symbol&&String(item.timeframe)===String(timeframe)));
+    return {replaced:before-memoryBars.length,inserted:await saveBarsBatch(bars)};
+  }
+  const client=await pool.connect();
+  try{
+    await client.query("BEGIN");
+    const removed=await client.query(`DELETE FROM market_bars WHERE symbol=$1 AND timeframe=$2`,[symbol,String(timeframe)]);
+    const inserted=await saveBarsBatch(bars,client);
+    await client.query("COMMIT");
+    return {replaced:removed.rowCount,inserted};
+  }catch(error){
+    await client.query("ROLLBACK");
+    throw error;
+  }finally{
+    client.release();
+  }
 }
 async function getBarsForBacktest(symbol,timeframe,limit=250000){
   if(!pool)return memoryBars.filter(x=>x.symbol===symbol&&x.timeframe===timeframe).sort((a,b)=>new Date(a.bar_time)-new Date(b.bar_time)).slice(-limit);
@@ -1795,6 +1986,23 @@ async function logTelegram({ signal = null, status, messageId = null, details = 
   return (await pool.query(`INSERT INTO telegram_logs(external_id,symbol,side,status,message_id,details) VALUES($1,$2,$3,$4,$5,$6) RETURNING *`, [row.external_id,row.symbol,row.side,row.status,row.message_id,row.details])).rows[0];
 }
 
+async function updateSignalNotification(externalId, status, messageId = null) {
+  const normalizedStatus = clean(status || "NOT_SENT", 30).toUpperCase();
+  const notifiedAt = normalizedStatus === "SENT" ? new Date().toISOString() : null;
+  if (!pool) {
+    const item = memorySignals.find(signal => signal.external_id === externalId);
+    if (item) Object.assign(item, { notification_status: normalizedStatus, notified_at: notifiedAt, telegram_message_id: messageId ? String(messageId) : null });
+    return item || null;
+  }
+  return (await pool.query(
+    `UPDATE signals
+     SET notification_status=$1,notified_at=$2,telegram_message_id=$3
+     WHERE external_id=$4
+     RETURNING *`,
+    [normalizedStatus, notifiedAt, messageId ? String(messageId) : null, externalId]
+  )).rows[0] || null;
+}
+
 async function notifyTelegramSignal(signal) {
   const effectiveScore = num(signal.adaptive_score ?? signal.score);
   const isSmcActivation = String(signal.external_id || "").startsWith("SMC-LIVE-");
@@ -1802,6 +2010,8 @@ async function notifyTelegramSignal(signal) {
   const skip = async reason => {
     lastTelegramAt = new Date().toISOString();
     lastTelegramResult = `OMIS ${signal.external_id}: ${reason}`;
+    signal.notification_status = "SKIPPED";
+    await updateSignalNotification(signal.external_id, "SKIPPED").catch(() => {});
     await logTelegram({signal,status:"SKIPPED",details:lastTelegramResult}).catch(() => {});
     return {skipped:true,reason:lastTelegramResult};
   };
@@ -1812,11 +2022,17 @@ async function notifyTelegramSignal(signal) {
     const result = await telegram.sendSignal(signal);
     lastTelegramAt = new Date().toISOString();
     lastTelegramResult = `TRIMIS ${telegram.sourceLabel(signal)} ${signal.signal} ${signal.symbol}, mesaj ${result.message_id}`;
+    signal.notification_status = "SENT";
+    signal.notified_at = lastTelegramAt;
+    signal.telegram_message_id = String(result.message_id);
+    await updateSignalNotification(signal.external_id, "SENT", result.message_id);
     await logTelegram({signal,status:"SENT",messageId:result.message_id,details:lastTelegramResult});
     return {skipped:false,messageId:result.message_id};
   } catch (error) {
     lastTelegramAt = new Date().toISOString();
     lastTelegramResult = `EROARE: ${error.message}`;
+    signal.notification_status = "ERROR";
+    await updateSignalNotification(signal.external_id, "ERROR").catch(() => {});
     await logTelegram({signal,status:"ERROR",details:error.message});
     throw error;
   }
@@ -1825,8 +2041,8 @@ async function notifyTelegramSignal(signal) {
 app.get("/health", (req,res)=>res.json({ok:true,version:APP_VERSION,database:pool?"postgres":"memory",archiveAfterHours:ARCHIVE_AFTER_HOURS,adminKeyConfigured:Boolean(ADMIN_KEY),newsWebhookConfigured:Boolean(NEWS_WEBHOOK_KEY),officialNewsEnabled:OFFICIAL_NEWS_ENABLED,fmpEnabled:FMP_ENABLED,fmpKeyConfigured:Boolean(FMP_API_KEY),fmpConfigured:FMP_ENABLED&&Boolean(FMP_API_KEY)&&!fmpRuntimeDisabledReason,fmpRuntimeDisabledReason,alphaVantageConfigured:Boolean(ALPHAVANTAGE_API_KEY),finnhubConfigured:Boolean(FINNHUB_API_KEY),autoTrackTrades:AUTO_TRACK_TRADES,lastNewsSync,lastSuccessfulNewsSync,lastNewsSyncError,newsProviders:lastNewsProviderResults,newsCoverage:newsCoverageStatus(),patternMinSamples:PATTERN_MIN_SAMPLES,patternMinProbability:PATTERN_MIN_PROBABILITY,analysisTimeframe:ANALYSIS_TIMEFRAME,analysisTimeframes:ANALYSIS_TIMEFRAMES,analysisProfiles:analysisProfilesPublic(),contextTimeframes:CONTEXT_TIMEFRAMES,symbolAliases:aliasSummary(),lastBarAtByTimeframe:{...lastBarAtByTimeframe},autoPatternSignals:AUTO_PATTERN_SIGNALS,patternSignalMinSamples:PATTERN_SIGNAL_MIN_SAMPLES,patternSignalMinProbability:PATTERN_SIGNAL_MIN_PROBABILITY,patternSignalMinScore:PATTERN_SIGNAL_MIN_SCORE,smcEnabled:SMC_ENABLED,smcMinScore:SMC_MIN_SCORE,smcNotifyPendingScore:SMC_NOTIFY_PENDING_SCORE,smcRequireM5Confirmation:SMC_REQUIRE_M5_CONFIRMATION,liveMinAdaptiveScore:LIVE_MIN_ADAPTIVE_SCORE,learningMinSamples:LEARNING_MIN_SAMPLES,maxNewsRiskLive:MAX_NEWS_RISK_LIVE,maxConsecutiveLosses:MAX_CONSECUTIVE_LOSSES,webhookStaleMinutes:WEBHOOK_STALE_MINUTES,telegramSystemAlerts:TELEGRAM_SYSTEM_ALERTS,telegram:telegram.status(),lastTelegramAt,lastTelegramResult,lastSystemAlertAt,lastWebhookAt,lastWebhookResult,warnings:systemWarnings(),time:new Date().toISOString()}));
 app.get("/api/system-status", async(req,res)=>{try{res.json(await buildSystemStatus());}catch(e){res.status(500).json({ok:false,error:e.message});}});
 
-app.get("/api/signals", async(req,res)=>{ try { const mode=req.query.mode==="archive"?"archive":"active"; res.json({ok:true,mode,signals:await listSignals(mode,req.query),analytics:await analytics()}); } catch(e){ console.error(e); res.status(500).json({ok:false,error:e.message}); } });
-app.get("/api/analytics", async(req,res)=>{ try { res.json({ok:true,analytics:await analytics()}); } catch(e){res.status(500).json({ok:false,error:e.message});} });
+app.get("/api/signals", async(req,res)=>{ try { const mode=req.query.mode==="archive"?"archive":"active"; res.json({ok:true,mode,signals:await listSignals(mode,req.query),analytics:await analytics(req.query.analyticsScope||"SMC")}); } catch(e){ console.error(e); res.status(500).json({ok:false,error:e.message}); } });
+app.get("/api/analytics", async(req,res)=>{ try { res.json({ok:true,analytics:await analytics(req.query.scope||"SMC")}); } catch(e){res.status(500).json({ok:false,error:e.message});} });
 app.post("/api/archive-now", async(req,res)=>{ if(!requireAdmin(req,res))return; try{res.json({ok:true,archived:await archiveOldSignals()});}catch(e){res.status(500).json({ok:false,error:e.message});} });
 
 app.get("/api/news", async(req,res)=>{ try {
@@ -1878,12 +2094,14 @@ app.get("/api/patterns",async(req,res)=>{try{res.json({ok:true,patterns:await li
 app.get("/api/smc-setups",async(req,res)=>{try{
   const setups=await listSmcSetups({status:req.query.status,symbol:req.query.symbol,limit:req.query.limit});
   const counts=setups.reduce((out,item)=>{out[item.status]=(out[item.status]||0)+1;return out;},{});
-  res.json({ok:true,setups,counts,settings:{enabled:SMC_ENABLED,minScore:SMC_MIN_SCORE,pendingNotificationScore:SMC_NOTIFY_PENDING_SCORE,requireM5Confirmation:SMC_REQUIRE_M5_CONFIRMATION,analysisTimeframes:ANALYSIS_TIMEFRAMES,contextTimeframes:CONTEXT_TIMEFRAMES}});
+  res.json({ok:true,setups,counts,settings:{enabled:SMC_ENABLED,minScore:SMC_MIN_SCORE,pendingNotificationScore:SMC_NOTIFY_PENDING_SCORE,requireM5Confirmation:SMC_REQUIRE_M5_CONFIRMATION,overlapThreshold:SMC_OVERLAP_THRESHOLD,alignmentRule:"BUY_DISCOUNT_SELL_PREMIUM",analysisTimeframes:ANALYSIS_TIMEFRAMES,contextTimeframes:CONTEXT_TIMEFRAMES}});
 }catch(e){res.status(500).json({ok:false,error:e.message});}});
 
 
 app.get("/api/validation",async(req,res)=>{try{
-  const rows=await allSignalsForAnalytics();
+  const requestedScope=clean(req.query.scope||"SMC",20).toUpperCase();
+  const scope=["SMC","LEGACY","MODEL","ALL"].includes(requestedScope)?requestedScope:"SMC";
+  const rows=(await allSignalsForAnalytics()).filter(item=>matchesAnalyticsScope(item,scope));
   const closed=rows.filter(x=>x.status==="CLOSED").sort((a,b)=>new Date(a.closed_at)-new Date(b.closed_at));
   const split=Math.max(1,Math.floor(closed.length*0.8)),train=closed.slice(0,split),test=closed.slice(split);
   const summarize=a=>{const wins=a.filter(x=>num(x.pnl_r)>0).length,total=a.length,totalR=a.reduce((z,x)=>z+num(x.pnl_r),0),grossWin=a.filter(x=>num(x.pnl_r)>0).reduce((z,x)=>z+num(x.pnl_r),0),grossLoss=Math.abs(a.filter(x=>num(x.pnl_r)<0).reduce((z,x)=>z+num(x.pnl_r),0));return {trades:total,winRate:total?wins/total*100:0,lowerBound:wilsonLowerBound(wins,total)*100,avgR:total?totalR/total:0,profitFactor:grossLoss?grossWin/grossLoss:(grossWin>0?null:0),totalR};};
@@ -1892,7 +2110,13 @@ app.get("/api/validation",async(req,res)=>{try{
   const calibrated=closed.filter(x=>Number.isFinite(num(x.probability,NaN)));
   const brier=calibrated.length?calibrated.reduce((a,x)=>{const pr=num(x.probability)/100,y=num(x.pnl_r)>0?1:0;return a+(pr-y)**2},0)/calibrated.length:null;
   const ready=closed.length>=VALIDATION_MIN_TRADES&&v.trades>=10&&v.avgR>0&&v.lowerBound>=45&&maxDD<=Math.max(6,all.totalR*0.8+4);
-  res.json({ok:true,validation:{ready,requiredTrades:VALIDATION_MIN_TRADES,all,train:t,test:v,maxDrawdownR:maxDD,brierScore:brier,closedTrades:closed.length,message:ready?"Există dovezi preliminare pe segmentul de validare. Continuă monitorizarea și controlul riscului.":"Date insuficiente sau validarea pe date nevăzute nu confirmă încă avantajul statistic."}});
+  const byExecutionMode={
+    liveEligible:summarize(closed.filter(item=>item.execution_mode==="LIVE")),
+    watch:summarize(closed.filter(item=>item.execution_mode!=="LIVE")),
+    telegramSent:summarize(closed.filter(item=>item.notification_status==="SENT"))
+  };
+  const progress=Math.min(100,Math.round(closed.length/VALIDATION_MIN_TRADES*100));
+  res.json({ok:true,validation:{scope,ready,requiredTrades:VALIDATION_MIN_TRADES,progress,all,train:t,test:v,byExecutionMode,maxDrawdownR:maxDD,brierScore:brier,closedTrades:closed.length,message:ready?`Motorul ${scope} are dovezi preliminare pe segmentul de validare. Continuă monitorizarea și controlul riscului.`:`Motorul ${scope} are ${closed.length}/${VALIDATION_MIN_TRADES} rezultate necesare. Datele sunt încă insuficiente sau segmentul nevăzut nu confirmă avantajul statistic.`}});
 }catch(e){res.status(500).json({ok:false,error:e.message});}});
 
 
@@ -1909,6 +2133,50 @@ function historyJobPublic(){
   if(!historyDownloadJob)return null;
   const {id,status,symbol,timeframe,priceType,from,to,startedAt,finishedAt,currentFrom,currentTo,chunksDone,chunksTotal,downloaded,inserted,duplicates,error,retries,lastSuccessfulTo,log}=historyDownloadJob;
   return {id,status,symbol,timeframe,priceType,from,to,startedAt,finishedAt,currentFrom,currentTo,chunksDone,chunksTotal,downloaded,inserted,duplicates,error,retries,lastSuccessfulTo,log:(log||[]).slice(-40),progress:chunksTotal?Math.min(100,Math.round(chunksDone/chunksTotal*100)):0};
+}
+function historyAggregationJobPublic(){
+  if(!historyAggregationJob)return null;
+  const {id,status,symbol,sourceTimeframe,startedAt,finishedAt,currentTimeframe,stepsDone,stepsTotal,sourceBars,results,error}=historyAggregationJob;
+  return {id,status,symbol,sourceTimeframe,startedAt,finishedAt,currentTimeframe,stepsDone,stepsTotal,sourceBars,results,error,progress:stepsTotal?Math.min(100,Math.round(stepsDone/stepsTotal*100)):0};
+}
+async function runHistoryAggregation(job){
+  try{
+    const sourceRaw=await getBarsForBacktest(job.symbol,job.sourceTimeframe,500000);
+    const sourceBars=Array.isArray(sourceRaw)?sourceRaw:(sourceRaw&&Array.isArray(sourceRaw.rows)?sourceRaw.rows:[]);
+    if(!sourceBars.length)throw new Error(`Nu există date ${job.symbol} M5 pentru agregare. Descarcă sau importă mai întâi istoricul M5.`);
+    const sourceTradingDays=new Set(sourceBars.map(item=>String(item.bar_time).slice(0,10))).size;
+    if(sourceBars.length<3000||sourceTradingDays<30)throw new Error(`Istoricul M5 este incomplet: ${sourceBars.length}/3000 lumânări și ${sourceTradingDays}/30 zile. Agregarea a fost oprită pentru a nu înlocui intervalele superioare cu date insuficiente.`);
+    job.sourceBars=sourceBars.length;
+    const targets=[...new Set([...ANALYSIS_TIMEFRAMES,...CONTEXT_TIMEFRAMES])]
+      .filter(item=>item!=="5")
+      .sort((a,b)=>num(a)-num(b));
+    job.stepsTotal=targets.length;
+    for(const targetTimeframe of targets){
+      job.currentTimeframe=targetTimeframe;
+      const aggregated=aggregateBars(sourceBars,job.sourceTimeframe,targetTimeframe,{requireComplete:true});
+      const replacement=aggregated.length?await replaceBarsDataset(job.symbol,targetTimeframe,aggregated):{inserted:0,replaced:0};
+      const inserted=replacement.inserted;
+      job.results.push({
+        targetTimeframe,
+        label:timeframeLabel(targetTimeframe),
+        generated:aggregated.length,
+        inserted,
+        replaced:replacement.replaced,
+        duplicates:aggregated.length-inserted,
+        first:aggregated[0]?.bar_time||null,
+        last:aggregated[aggregated.length-1]?.bar_time||null
+      });
+      job.stepsDone++;
+      await new Promise(resolve=>setImmediate(resolve));
+    }
+    job.currentTimeframe=null;
+    job.status="COMPLETED";
+    job.finishedAt=new Date().toISOString();
+  }catch(error){
+    job.status="FAILED";
+    job.error=error.message;
+    job.finishedAt=new Date().toISOString();
+  }
 }
 const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 function normalizeDukascopyRows(data){
@@ -1992,26 +2260,12 @@ app.post("/api/history-aggregate",async(req,res)=>{if(!requireAdmin(req,res))ret
 
 app.post("/api/history-aggregate-all",async(req,res)=>{if(!requireAdmin(req,res))return;try{
   const symbol=canonicalSymbol(req.body.symbol||"US30");
-  const sourceTimeframe="5";
-  const sourceRaw=await getBarsForBacktest(symbol,sourceTimeframe,500000);
-  const sourceBars=Array.isArray(sourceRaw)?sourceRaw:(sourceRaw&&Array.isArray(sourceRaw.rows)?sourceRaw.rows:[]);
-  if(!sourceBars.length)throw new Error(`Nu există date ${symbol} M5 pentru agregare.`);
-  const results=[];
-  for(const targetTimeframe of [...new Set([...ANALYSIS_TIMEFRAMES, ...CONTEXT_TIMEFRAMES])].filter(item=>item!=="5").sort((a,b)=>num(a)-num(b))){
-    const aggregated=aggregateBars(sourceBars,sourceTimeframe,targetTimeframe,{requireComplete:true});
-    const inserted=aggregated.length?await saveBarsBatch(aggregated):0;
-    results.push({
-      targetTimeframe,
-      label:timeframeLabel(targetTimeframe),
-      generated:aggregated.length,
-      inserted,
-      duplicates:aggregated.length-inserted,
-      first:aggregated[0]?.bar_time||null,
-      last:aggregated[aggregated.length-1]?.bar_time||null
-    });
-  }
-  res.json({ok:true,symbol,sourceTimeframe,analysisTimeframes:ANALYSIS_TIMEFRAMES,results});
+  if(historyAggregationJob?.status==="RUNNING")return res.status(409).json({ok:false,error:`Agregarea pentru ${historyAggregationJob.symbol} este deja în curs.`,job:historyAggregationJobPublic()});
+  historyAggregationJob={id:`AGG-${Date.now()}`,status:"RUNNING",symbol,sourceTimeframe:"5",startedAt:new Date().toISOString(),finishedAt:null,currentTimeframe:null,stepsDone:0,stepsTotal:0,sourceBars:0,results:[],error:""};
+  setImmediate(()=>runHistoryAggregation(historyAggregationJob));
+  res.status(202).json({ok:true,job:historyAggregationJobPublic()});
 }catch(e){res.status(400).json({ok:false,error:e.message});}});
+app.get("/api/history-aggregate-all/status",(req,res)=>res.json({ok:true,job:historyAggregationJobPublic()}));
 
 app.post("/api/backtest",async(req,res)=>{if(!requireAdmin(req,res))return;try{
   const symbol=canonicalSymbol(req.body.symbol||"US30");
@@ -2030,9 +2284,13 @@ app.post("/api/backtest",async(req,res)=>{if(!requireAdmin(req,res))return;try{
   const normalized=Array.isArray(barsRaw)?barsRaw:(barsRaw&&Array.isArray(barsRaw.rows)?barsRaw.rows:[]);
   const audited=auditBars(normalized,timeframe);
   const bars=audited.bars;
-  if(bars.length<settings.minSamples+settings.horizonBars+60)throw new Error(`Istoric insuficient: ${bars.length} lumânări valide. Importă sau generează mai multe date.`);
+  const tradingDays=new Set(bars.map(item=>String(item.bar_time).slice(0,10))).size;
+  const minimumBarsByTimeframe={"5":3000,"15":1500,"30":1000,"60":500,"240":180};
+  const requiredBars=Math.max(settings.minSamples+settings.horizonBars+60,minimumBarsByTimeframe[String(timeframe)]||500);
+  if(bars.length<requiredBars||tradingDays<BACKTEST_MIN_TRADING_DAYS)throw new Error(`Istoric insuficient pentru un backtest relevant: ${bars.length}/${requiredBars} lumânări și ${tradingDays}/${BACKTEST_MIN_TRADING_DAYS} zile de tranzacționare. Completează istoricul înainte de test.`);
   const report=buildBacktest(bars,settings);
   report.summary.dataAudit=audited.audit;
+  report.summary.dataCoverage={tradingDays,requiredTradingDays:BACKTEST_MIN_TRADING_DAYS,requiredBars};
   const run=await saveBacktestRun({symbol,timeframe,bars:bars.length,start_time:bars[0].bar_time,end_time:bars[bars.length-1].bar_time,settings,summary:report.summary,results:report.results});
   res.json({ok:true,run});
 }catch(e){console.error("[BACKTEST] EROARE:",e);res.status(400).json({ok:false,error:e.message});}});
@@ -2041,13 +2299,18 @@ app.get("/api/history-status",async(req,res)=>{try{
   let rows;
   if(!pool){
     const m=new Map();
-    for(const b of memoryBars){const k=`${b.symbol}|${b.timeframe}`;if(!m.has(k))m.set(k,{symbol:b.symbol,timeframe:b.timeframe,bars:0,start_time:b.bar_time,end_time:b.bar_time});const x=m.get(k);x.bars++;if(b.bar_time<x.start_time)x.start_time=b.bar_time;if(b.bar_time>x.end_time)x.end_time=b.bar_time;}
-    rows=[...m.values()];
+    for(const b of memoryBars){const k=`${b.symbol}|${b.timeframe}`;if(!m.has(k))m.set(k,{symbol:b.symbol,timeframe:b.timeframe,bars:0,start_time:b.bar_time,end_time:b.bar_time,daySet:new Set()});const x=m.get(k);x.bars++;x.daySet.add(String(b.bar_time).slice(0,10));if(b.bar_time<x.start_time)x.start_time=b.bar_time;if(b.bar_time>x.end_time)x.end_time=b.bar_time;}
+    rows=[...m.values()].map(({daySet,...item})=>({...item,trading_days:daySet.size}));
   }else{
-    const queryResult=await pool.query(`SELECT symbol,timeframe,COUNT(*)::int bars,MIN(bar_time) start_time,MAX(bar_time) end_time FROM market_bars GROUP BY symbol,timeframe ORDER BY symbol,timeframe`);
+    const queryResult=await pool.query(`SELECT symbol,timeframe,COUNT(*)::int bars,COUNT(DISTINCT (bar_time AT TIME ZONE 'UTC')::date)::int trading_days,MIN(bar_time) start_time,MAX(bar_time) end_time FROM market_bars GROUP BY symbol,timeframe ORDER BY symbol,timeframe`);
     rows=Array.isArray(queryResult?.rows)?queryResult.rows:[];
   }
-  const datasets=Array.isArray(rows)?rows:[];
+  const datasets=(Array.isArray(rows)?rows:[]).map(item=>{
+    const start=new Date(item.start_time),end=new Date(item.end_time);
+    const durationDays=Number.isFinite(start.getTime())&&Number.isFinite(end.getTime())?Math.max(1,Math.ceil((end-start)/86400000)+1):0;
+    const tradingDays=num(item.trading_days);
+    return {...item,duration_days:durationDays,usable_for_research:tradingDays>=30&&num(item.bars)>=500,quality_note:tradingDays>=30&&num(item.bars)>=500?"Acoperire minimă pentru cercetare":"Istoric insuficient pentru concluzii statistice"};
+  });
   res.json({ok:true,datasets});
 }catch(e){res.status(500).json({ok:false,error:e.message,datasets:[]});}});
 
@@ -2080,10 +2343,11 @@ app.post("/webhook", async(req,res)=>{try{
 }catch(e){lastWebhookResult=`RESPINS: ${e.message}`;console.error("POST /webhook:",e);return res.status(400).json({ok:false,error:e.message});}});
 
 initDb().then(async()=>{
+  await deduplicateExistingPendingSmcSetups();
   await archiveOldSignals();
   setInterval(()=>archiveOldSignals().catch(e=>console.error("Auto-archive:",e)),15*60*1000).unref();
   if(OFFICIAL_NEWS_ENABLED||(FMP_ENABLED&&FMP_API_KEY)||ALPHAVANTAGE_API_KEY||FINNHUB_API_KEY){syncRealNews().catch(e=>{lastNewsSyncError=e.message;console.error("News sync:",e.message)});setInterval(()=>syncRealNews().catch(e=>{lastNewsSyncError=e.message;console.error("News sync:",e.message)}),NEWS_AUTO_SYNC_MINUTES*60000).unref();}
   setTimeout(()=>monitorSystem().catch(e=>console.error("System monitor:",e.message)),15000).unref();
   setInterval(()=>monitorSystem().catch(e=>console.error("System monitor:",e.message)),SYSTEM_MONITOR_INTERVAL_MINUTES*60000).unref();
-  app.listen(PORT,()=>console.log(`PropTrader AI v18.4 rulează pe portul ${PORT}`));
+  app.listen(PORT,()=>console.log(`PropTrader AI v18.5 rulează pe portul ${PORT}`));
 }).catch(e=>{console.error("DB init failed:",e);process.exit(1)});

@@ -32,6 +32,10 @@ services:
         value: 15
       - key: SMC_MIN_BLOCK_SAMPLES
         value: 8
+      - key: SMC_OVERLAP_THRESHOLD
+        value: 0.5
+      - key: BACKTEST_MIN_TRADING_DAYS
+        value: 60
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_CHAT_ID

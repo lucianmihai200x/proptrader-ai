@@ -1,4 +1,4 @@
-# PropTrader AI v18.4 — SMC predictiv M5–H4 și niveluri pe TradingView
+# PropTrader AI v18.5 — SMC predictiv M5–H4, statistici curate și niveluri pe TradingView
 
 Aplicația primește lumânări M5 închise din TradingView, construiește automat M15, M30, H1, H4 și contextul D1 și caută intrări SMC pe toate intervalele M5–H4. O intrare nu este mutată artificial la prețul curent.
 
@@ -9,7 +9,7 @@ Motorul separă două momente:
 
 ## Reguli SMC implementate
 
-SMC nu are o specificație tehnică universală. În v18.4 regulile sunt explicite și testabile:
+SMC nu are o specificație tehnică universală. În v18.5 regulile sunt explicite și testabile:
 
 - swing high/low este confirmat numai după două lumânări în dreapta;
 - structura bullish cere HH + HL, iar structura bearish LH + LL; EMA20/EMA50 este doar fallback;
@@ -17,7 +17,7 @@ SMC nu are o specificație tehnică universală. În v18.4 regulile sunt explici
 - lumânarea de rupere trebuie să aibă displacement măsurat în ATR;
 - order block este ultima lumânare opusă înainte de displacement;
 - setup-ul cere FVG sau sweep de lichiditate;
-- SELL este favorizat în premium, BUY în discount;
+- SELL este acceptat numai în premium, iar BUY numai în discount; planurile nealiniate rămân observații fără Telegram;
 - zonele invalidate sau testate de prea multe ori sunt eliminate;
 - într-un plan de retragere, prețul poate fi deja dincolo de TP1 înainte să revină la Entry; țintele devin active numai după confirmarea intrării;
 - dacă aceeași lumânare traversează Entry și SL, planul este anulat conservator deoarece ordinea intrabar nu poate fi demonstrată;
@@ -74,8 +74,8 @@ Astfel, lumânările TradingView, istoricul Dukascopy, știrile și rezultatele 
 
 1. Înlocuiește în GitHub fișierele proiectului cu cele din această arhivă.
 2. Fă un commit și alege în Render **Manual Deploy → Deploy latest commit**.
-3. Verifică `/health`: `version` trebuie să fie `18.4.0`.
-4. În pagina **Istoric & Backtest**, după ce există date M5, apasă **Construiește M15 · M30 · H1 · H4 · D1 din M5**.
+3. Verifică `/health`: `version` trebuie să fie `18.5.0`.
+4. În pagina **Istoric & Backtest**, după ce există minimum 3.000 de lumânări M5 din cel puțin 30 de zile, apasă **Reconstruiește M15 · M30 · H1 · H4 · D1 din M5**.
 
 Variabile recomandate:
 
@@ -88,6 +88,8 @@ SMC_NOTIFY_PENDING_SCORE=78
 SMC_REQUIRE_M5_CONFIRMATION=true
 SMC_MAX_PENDING_PER_SYMBOL=15
 SMC_MIN_BLOCK_SAMPLES=8
+SMC_OVERLAP_THRESHOLD=0.5
+BACKTEST_MIN_TRADING_DAYS=60
 AUTO_TRACK_TRADES=true
 LIVE_MIN_ADAPTIVE_SCORE=72
 TELEGRAM_ENABLED=true
@@ -99,14 +101,22 @@ NEWS_CALENDAR_UNAVAILABLE_RISK=35
 
 Păstrează valorile existente pentru `WEBHOOK_KEY`, `ADMIN_KEY`, `DATABASE_URL`, `TELEGRAM_BOT_TOKEN` și `TELEGRAM_CHAT_ID`. Nu publica secretele în GitHub.
 
-Migrarea bazei de date este automată la pornire: sunt create câmpurile pentru reevaluarea la Entry, monitorizarea până la TP/SL și analiza post-tranzacție.
+Migrarea bazei de date este automată la pornire. v18.5:
+
+- separă implicit statisticile și validarea SMC de Legacy și Modele istorice;
+- păstrează distinct stările WATCH, eligibil LIVE și Telegram trimis;
+- aplică circuit breaker separat pe familie de motor și instrument;
+- marchează BUY în PREMIUM și SELL în DISCOUNT drept observații neacționabile;
+- retrage planurile PENDING suprapuse, păstrând zona cu scorul cel mai bun;
+- rulează reconstruirea intervalelor în fundal și refuză înlocuirea dacă istoricul M5 este insuficient;
+- cere minimum 60 de zile pentru un backtest raportat drept relevant.
 
 ## TradingView — colector și indicator vizual
 
 Arhiva conține două scripturi Pine cu roluri separate:
 
 1. `PropTrader_AI_v17_M5_H4_Collector.pine` trimite lumânările M5 către server. Dacă alerta existentă funcționează numai prin Webhook URL, nu trebuie recreată.
-2. `PropTrader_AI_v18_4_SMC_Visual.pine` analizează local datele TradingView și desenează pe grafic:
+2. `PropTrader_AI_v18_5_SMC_Visual.pine` analizează local datele TradingView și desenează pe grafic:
    - zona order block pentru intrare;
    - linia Entry;
    - SL;
@@ -122,7 +132,7 @@ Indicatorul vizual verifică M5, M15, M30, H1 și H4 și, implicit, afișează p
 
 1. Deschide același instrument pe graficul de **5 minute**.
 2. În Pine Editor creează un indicator nou.
-3. Copiază integral conținutul fișierului `PropTrader_AI_v18_4_SMC_Visual.pine`.
+3. Copiază integral conținutul fișierului `PropTrader_AI_v18_5_SMC_Visual.pine`.
 4. Apasă **Save**, apoi **Add to chart**.
 5. Lasă `Interval afișat = AUTO — cel mai bun`.
 6. Nu crea alertă pentru acest indicator. El nu conține `alertcondition()` și este numai pentru desenarea nivelurilor.
@@ -154,7 +164,7 @@ TradingView va înregistra tehnic un webhook la fiecare lumânare M5 deoarece ac
 
 ## Știri
 
-FMP este oprit implicit. Dacă variabila a rămas activă, dar abonamentul răspunde HTTP 402, v18.4 oprește automat FMP pentru sesiunea serverului și continuă sincronizarea fluxurilor oficiale gratuite. Titlurile Federal Reserve și BLS funcționează fără chei; dacă nu există calendar anticipat, motorul aplică risc de siguranță în loc de risc zero.
+FMP este oprit implicit. Dacă variabila a rămas activă, dar abonamentul răspunde HTTP 402, v18.5 oprește automat FMP pentru sesiunea serverului și continuă sincronizarea fluxurilor oficiale gratuite. Titlurile Federal Reserve și BLS funcționează fără chei; dacă nu există calendar anticipat, motorul aplică risc de siguranță în loc de risc zero.
 
 Activează FMP numai dacă planul tău include endpoint-ul calendarului economic:
 
