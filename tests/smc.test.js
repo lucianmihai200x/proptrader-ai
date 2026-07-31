@@ -105,26 +105,34 @@ test("ambiguous entry and stop crossing cancels the plan conservatively", () => 
   assert.match(result.reason, /ordine intrabar necunoscută/);
 });
 
-test("pending setup is cancelled when price reaches TP1 without activating entry", () => {
-  const result = evaluatePendingSetup({
+test("pending retracement remains valid when price is beyond TP1 before entry", () => {
+  const sell = evaluatePendingSetup({
     status: "PENDING", side: "SELL", entry: 1035, sl: 1045, tp1: 1010,
     expires_at: "2026-01-02T00:00:00Z"
   }, {
     bar_time: "2026-01-01T10:00:00Z", open: 1020, high: 1025, low: 1008, close: 1012
   });
-  assert.equal(result.action, "CANCEL");
-  assert.match(result.reason, /oportunitate ratată/);
+  const buy = evaluatePendingSetup({
+    status: "PENDING", side: "BUY", entry: 52433.65, sl: 52414.05, tp1: 52482.2,
+    expires_at: "2026-01-02T00:00:00Z"
+  }, {
+    bar_time: "2026-01-01T10:25:00Z", open: 52500, high: 52524, low: 52490, close: 52517.9
+  });
+  assert.equal(sell.action, "KEEP");
+  assert.equal(buy.action, "KEEP");
+  assert.match(sell.reason, /nu a atins încă intrarea/);
+  assert.match(buy.reason, /nu a atins încă intrarea/);
 });
 
-test("entry and TP1 crossing in the same candle is rejected as ambiguous", () => {
+test("targets become relevant only after entry confirmation", () => {
   const result = evaluatePendingSetup({
     status: "PENDING", side: "SELL", entry: 1035, sl: 1045, tp1: 1010,
     expires_at: "2026-01-02T00:00:00Z"
   }, {
     bar_time: "2026-01-01T10:00:00Z", open: 1038, high: 1040, low: 1008, close: 1012
   });
-  assert.equal(result.action, "CANCEL");
-  assert.match(result.reason, /fără ambiguitate/);
+  assert.equal(result.action, "TRIGGER");
+  assert.match(result.reason, /confirmare M5 SELL/);
 });
 
 test("SMC targets remain ordered and separated when TP1 uses a liquidity pool above standard TP2", () => {

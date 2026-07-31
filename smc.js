@@ -421,21 +421,10 @@ function evaluatePendingSetup(setup, inputBar, { requireConfirmation = true, max
   const side = String(setup.side).toUpperCase();
   const entry = number(setup.entry);
   const sl = number(setup.sl);
-  const tp1 = number(setup.tp1, NaN);
   const touched = bar.low <= entry && bar.high >= entry;
   const invalidated = side === "BUY" ? bar.low <= sl : bar.high >= sl;
-  const targetReached = Number.isFinite(tp1) && tp1 > 0 &&
-    (side === "BUY" ? bar.high >= tp1 : bar.low <= tp1);
   if (invalidated) {
     return { action: "CANCEL", reason: touched ? "intrarea și SL au fost traversate în aceeași lumânare; ordine intrabar necunoscută" : "order block invalidat înainte de confirmare" };
-  }
-  if (targetReached) {
-    return {
-      action: "CANCEL",
-      reason: touched
-        ? "intrarea și TP1 au fost traversate în aceeași lumânare; activarea nu poate fi confirmată fără ambiguitate"
-        : "prețul a ajuns la TP1 fără activarea intrării; oportunitate ratată"
-    };
   }
   if (!touched) return { action: "KEEP", reason: "prețul nu a atins încă intrarea" };
   const touchCount = number(setup.touch_count) + 1;

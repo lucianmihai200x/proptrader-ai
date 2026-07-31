@@ -1,4 +1,4 @@
-# PropTrader AI v18.3 — SMC predictiv M5–H4 și niveluri pe TradingView
+# PropTrader AI v18.4 — SMC predictiv M5–H4 și niveluri pe TradingView
 
 Aplicația primește lumânări M5 închise din TradingView, construiește automat M15, M30, H1, H4 și contextul D1 și caută intrări SMC pe toate intervalele M5–H4. O intrare nu este mutată artificial la prețul curent.
 
@@ -9,7 +9,7 @@ Motorul separă două momente:
 
 ## Reguli SMC implementate
 
-SMC nu are o specificație tehnică universală. În v18.3 regulile sunt explicite și testabile:
+SMC nu are o specificație tehnică universală. În v18.4 regulile sunt explicite și testabile:
 
 - swing high/low este confirmat numai după două lumânări în dreapta;
 - structura bullish cere HH + HL, iar structura bearish LH + LL; EMA20/EMA50 este doar fallback;
@@ -19,8 +19,8 @@ SMC nu are o specificație tehnică universală. În v18.3 regulile sunt explici
 - setup-ul cere FVG sau sweep de lichiditate;
 - SELL este favorizat în premium, BUY în discount;
 - zonele invalidate sau testate de prea multe ori sunt eliminate;
-- dacă prețul atinge TP1 fără activarea Entry, oportunitatea este considerată ratată și planul este eliminat;
-- dacă aceeași lumânare traversează Entry și TP1/SL, planul este anulat conservator deoarece ordinea intrabar nu poate fi demonstrată;
+- într-un plan de retragere, prețul poate fi deja dincolo de TP1 înainte să revină la Entry; țintele devin active numai după confirmarea intrării;
+- dacă aceeași lumânare traversează Entry și SL, planul este anulat conservator deoarece ordinea intrabar nu poate fi demonstrată;
 - D1 și H4 dau biasul de context, iar M5/M15/M30/H1/H4 pot produce planul;
 - intrarea este mijlocul corpului order block-ului, SL trece de wick cu buffer ATR;
 - TP1, TP2 și TP3 pornesc de la minimum 1,5R, 2,5R și 4R, pot folosi pool-uri de lichiditate valide și sunt forțate să rămână strict ordonate, cu minimum 0,35R între două ținte.
@@ -74,7 +74,7 @@ Astfel, lumânările TradingView, istoricul Dukascopy, știrile și rezultatele 
 
 1. Înlocuiește în GitHub fișierele proiectului cu cele din această arhivă.
 2. Fă un commit și alege în Render **Manual Deploy → Deploy latest commit**.
-3. Verifică `/health`: `version` trebuie să fie `18.3.0`.
+3. Verifică `/health`: `version` trebuie să fie `18.4.0`.
 4. În pagina **Istoric & Backtest**, după ce există date M5, apasă **Construiește M15 · M30 · H1 · H4 · D1 din M5**.
 
 Variabile recomandate:
@@ -106,7 +106,7 @@ Migrarea bazei de date este automată la pornire: sunt create câmpurile pentru 
 Arhiva conține două scripturi Pine cu roluri separate:
 
 1. `PropTrader_AI_v17_M5_H4_Collector.pine` trimite lumânările M5 către server. Dacă alerta existentă funcționează numai prin Webhook URL, nu trebuie recreată.
-2. `PropTrader_AI_v18_3_SMC_Visual.pine` analizează local datele TradingView și desenează pe grafic:
+2. `PropTrader_AI_v18_4_SMC_Visual.pine` analizează local datele TradingView și desenează pe grafic:
    - zona order block pentru intrare;
    - linia Entry;
    - SL;
@@ -122,12 +122,12 @@ Indicatorul vizual verifică M5, M15, M30, H1 și H4 și, implicit, afișează p
 
 1. Deschide același instrument pe graficul de **5 minute**.
 2. În Pine Editor creează un indicator nou.
-3. Copiază integral conținutul fișierului `PropTrader_AI_v18_3_SMC_Visual.pine`.
+3. Copiază integral conținutul fișierului `PropTrader_AI_v18_4_SMC_Visual.pine`.
 4. Apasă **Save**, apoi **Add to chart**.
 5. Lasă `Interval afișat = AUTO — cel mai bun`.
 6. Nu crea alertă pentru acest indicator. El nu conține `alertcondition()` și este numai pentru desenarea nivelurilor.
 
-Zona verde indică un plan BUY, iar zona roșie un plan SELL. Nivelurile sunt extinse spre dreapta. Pe grafic rămân exclusiv planurile `PENDING` și intrările `LIVE` care nu au ajuns încă la TP3 sau SL. Planurile expirate, invalidate, neactivate ori ratate sunt șterse imediat; nu mai există starea gri „ULTIMUL PLAN”. Eticheta BUY/SELL apare numai după atingerea Entry și respingere confirmată M5; sub pragul informativ Telegram apare `WATCH`.
+Zona verde indică un plan BUY, iar zona roșie un plan SELL. Nivelurile sunt extinse spre dreapta. Pe grafic rămân exclusiv planurile `PENDING` și intrările `LIVE` care nu au ajuns încă la TP3 sau SL. Un plan PENDING rămâne desenat chiar dacă prețul se află deja dincolo de TP1, deoarece acesta așteaptă retragerea în order block; TP-urile sunt urmărite numai după activare. Planurile expirate sau invalidate sunt șterse imediat; nu mai există starea gri „ULTIMUL PLAN”. Eticheta BUY/SELL apare numai după atingerea Entry și respingere confirmată M5; sub pragul informativ Telegram apare `WATCH`.
 
 ### Limită tehnică importantă
 
@@ -154,7 +154,7 @@ TradingView va înregistra tehnic un webhook la fiecare lumânare M5 deoarece ac
 
 ## Știri
 
-FMP este oprit implicit. Dacă variabila a rămas activă, dar abonamentul răspunde HTTP 402, v18.3 oprește automat FMP pentru sesiunea serverului și continuă sincronizarea fluxurilor oficiale gratuite. Titlurile Federal Reserve și BLS funcționează fără chei; dacă nu există calendar anticipat, motorul aplică risc de siguranță în loc de risc zero.
+FMP este oprit implicit. Dacă variabila a rămas activă, dar abonamentul răspunde HTTP 402, v18.4 oprește automat FMP pentru sesiunea serverului și continuă sincronizarea fluxurilor oficiale gratuite. Titlurile Federal Reserve și BLS funcționează fără chei; dacă nu există calendar anticipat, motorul aplică risc de siguranță în loc de risc zero.
 
 Activează FMP numai dacă planul tău include endpoint-ul calendarului economic:
 
