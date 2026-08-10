@@ -5,7 +5,7 @@ const path = require('node:path');
 
 test('server includes v19 predictive SMC, Capital.com execution, monitoring and Telegram', () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
-  assert.match(source, /APP_VERSION = "19\.0\.0"/);
+  assert.match(source, /APP_VERSION = "19\.0\.1"/);
   assert.match(source, /ANALYSIS_TIMEFRAMES/);
   assert.match(source, /deriveCompletedHigherBars/);
   assert.match(source, /api\/history-aggregate-all/);

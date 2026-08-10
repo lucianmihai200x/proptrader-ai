@@ -114,6 +114,10 @@ function createCapitalClient(options = {}) {
     : "https://demo-api-capital.backend-capital.com/api/v1";
 
   let session = null;
+  // Capital.com limitează POST /session la o cerere pe secundă. Mai multe
+  // operații pot avea nevoie simultan de prima sesiune (de exemplu conturi și
+  // poziții), de aceea toate așteaptă aceeași autentificare în curs.
+  let sessionPromise = null;
   let lastConnectionAt = null;
   let lastExecutionAt = null;
   let lastResult = "Nicio conexiune Capital.com după pornire.";
@@ -206,7 +210,13 @@ function createCapitalClient(options = {}) {
 
   async function ensureSession() {
     if (session && now() - session.lastUsedAt < 8 * 60 * 1000) return session;
-    return createSession();
+    if (sessionPromise) return sessionPromise;
+    sessionPromise = createSession();
+    try {
+      return await sessionPromise;
+    } finally {
+      sessionPromise = null;
+    }
   }
 
   async function authenticatedRequest(path, { method = "GET", body, retryAuth = true, timeoutMs } = {}) {

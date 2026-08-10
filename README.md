@@ -1,4 +1,4 @@
-# PropTrader AI v19.0 — SMC predictiv M5–H4, Telegram și execuție automată Capital.com
+# PropTrader AI v19.0.1 — SMC predictiv M5–H4, Telegram și execuție automată Capital.com
 
 Aplicația primește lumânări M5 închise din TradingView, construiește automat M15, M30, H1, H4 și contextul D1 și caută intrări SMC pe toate intervalele M5–H4. O intrare nu este mutată artificial la prețul curent.
 
@@ -152,7 +152,7 @@ Astfel, lumânările TradingView, istoricul Dukascopy, știrile și rezultatele 
 
 1. Înlocuiește în GitHub fișierele proiectului cu cele din această arhivă.
 2. Fă un commit și alege în Render **Manual Deploy → Deploy latest commit**.
-3. Verifică `/health`: `version` trebuie să fie `19.0.0`.
+3. Verifică `/health`: `version` trebuie să fie `19.0.1`.
 4. În pagina **Istoric & Backtest**, după ce există minimum 3.000 de lumânări M5 din cel puțin 30 de zile, apasă **Reconstruiește M15 · M30 · H1 · H4 · D1 din M5**.
 
 Variabile recomandate:

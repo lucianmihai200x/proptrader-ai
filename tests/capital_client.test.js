@@ -111,6 +111,14 @@ test("un semnal SMC LIVE deschide exact trei poziții TP1–TP3", async () => {
   assert.ok(result.preview.estimatedRiskAmount <= result.preview.riskAmountLimit);
 });
 
+test("cererile paralele folosesc o singură sesiune Capital.com", async () => {
+  const broker = successfulBroker();
+  const client = createCapitalClient({ env: demoEnv(), fetchImpl: broker.fetchImpl });
+  const result = await client.testConnection();
+  assert.equal(result.ok, true);
+  assert.equal(broker.calls.filter(item => item.method === "POST" && item.path.endsWith("/session")).length, 1);
+});
+
 test("dacă o felie e respinsă, pozițiile deja deschise sunt închise", async () => {
   const broker = successfulBroker({ failPositionNumber: 2 });
   const client = createCapitalClient({ env: demoEnv(), fetchImpl: broker.fetchImpl });
