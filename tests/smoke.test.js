@@ -3,9 +3,9 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 
-test('server includes v18 predictive SMC, multi-timeframe analysis, monitoring and Telegram', () => {
+test('server includes v19 predictive SMC, Capital.com execution, monitoring and Telegram', () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
-  assert.match(source, /APP_VERSION = "18\.6\.0"/);
+  assert.match(source, /APP_VERSION = "19\.0\.0"/);
   assert.match(source, /ANALYSIS_TIMEFRAMES/);
   assert.match(source, /deriveCompletedHigherBars/);
   assert.match(source, /api\/history-aggregate-all/);
@@ -30,15 +30,19 @@ test('server includes v18 predictive SMC, multi-timeframe analysis, monitoring a
   assert.match(source, /reassessOpenSignalContext/);
   assert.match(source, /api\/smc-setups/);
   assert.match(source, /SMC_REQUIRE_M5_CONFIRMATION/);
+  assert.match(source, /createCapitalClient/);
+  assert.match(source, /executeCapitalSignal/);
+  assert.match(source, /capital_executions/);
+  assert.match(source, /api\/capital\/test-connection/);
 });
 
 test('frontend contains SMC plans, defensive array handling and M5-D1 aggregation controls', () => {
   const html = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8');
-  assert.match(html, /PropTrader AI v18\.6/);
+  assert.match(html, /PropTrader AI v19\.0/);
   assert.match(html, /asArray/);
   assert.match(html, /aggregateAllTimeframes/);
-  assert.match(html, /M5 · M15 · M30 · H1 · H4/);
-  assert.match(html, /Backtest Integrity v18\.6/);
+  assert.match(html, /M5–H4/);
+  assert.match(html, /Backtest Integrity v19\.0/);
   assert.match(html, /Planuri SMC/);
   assert.match(html, /Reconstruiește M15 · M30 · H1 · H4 · D1/);
   assert.match(html, /PropTrader_AI_v18_6_SMC_Visual\.pine/);
@@ -49,6 +53,8 @@ test('frontend contains SMC plans, defensive array handling and M5-D1 aggregatio
   assert.match(html, /Serverul a răspuns/);
   assert.match(html, /Test semnal complet/);
   assert.match(html, /Stare sistem/);
+  assert.match(html, /Testează conexiunea/);
+  assert.match(html, /capitalStatus/);
 });
 
 test('Pine collector runs on M5 and sends closed BAR events', () => {

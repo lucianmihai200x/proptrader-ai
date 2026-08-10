@@ -70,6 +70,36 @@ services:
         value: US,DE,GERMANY,EU,EA,EURO AREA
       - key: FMP_ENABLED
         value: false
+      - key: CAPITAL_AUTO_TRADING_ENABLED
+        value: false
+      - key: CAPITAL_ENVIRONMENT
+        value: DEMO
+      - key: CAPITAL_API_KEY
+        sync: false
+      - key: CAPITAL_API_IDENTIFIER
+        sync: false
+      - key: CAPITAL_API_PASSWORD
+        sync: false
+      - key: CAPITAL_ACCOUNT_ID
+        sync: false
+      - key: CAPITAL_MIN_ADAPTIVE_SCORE
+        value: 85
+      - key: CAPITAL_MAX_NEWS_RISK
+        value: 75
+      - key: CAPITAL_RISK_PERCENT
+        value: 0.2
+      - key: CAPITAL_MAX_DAILY_SIGNALS
+        value: 3
+      - key: CAPITAL_MAX_OPEN_POSITIONS
+        value: 12
+      - key: CAPITAL_MAX_ENTRY_SLIPPAGE_R
+        value: 0.15
+      - key: CAPITAL_MAX_SPREAD_R
+        value: 0.1
+      - key: CAPITAL_ALLOWED_SYMBOLS
+        value: US30,NAS100,XAUUSD,GER40,USOIL
+      - key: CAPITAL_LIVE_TRADING_CONFIRMED
+        sync: false
 
 databases:
   - name: proptrader-db

@@ -3,6 +3,7 @@ const path = require("path");
 const { Pool } = require("pg");
 const { getHistoricalRates } = require("dukascopy-node");
 const telegram = require("./telegram");
+const { createCapitalClient } = require("./capital_client");
 const { buildBacktest, auditBars, aggregateBars } = require("./backtest");
 const { fetchOfficialNews } = require("./news_feeds");
 const { findSmcSetups, evaluatePendingSetup, structureBias } = require("./smc");
@@ -26,7 +27,8 @@ const {
 } = require("./timeframes");
 
 const app = express();
-const APP_VERSION = "18.6.0";
+const APP_VERSION = "19.0.0";
+const capital = createCapitalClient();
 let lastWebhookAt = null;
 let lastWebhookResult = "Niciun webhook primit după pornire";
 let lastTelegramAt = null;
@@ -105,6 +107,8 @@ let memoryNews = [];
 let memoryBars = [];
 let memoryPatterns = [];
 let memorySmcSetups = [];
+let memoryCapitalExecutions = [];
+const liveChartClients = new Set();
 
 let historyDownloadJob = null;
 let historyAggregationJob = null;
@@ -114,6 +118,7 @@ const HISTORY_RETRY_BASE_MS = Math.max(500, Number(process.env.HISTORY_RETRY_BAS
 
 app.use(express.json({ limit: "25mb" }));
 app.use(express.text({ type: ["text/plain", "application/text"], limit: "25mb" }));
+app.use("/vendor/lightweight-charts", express.static(path.join(__dirname, "node_modules", "lightweight-charts", "dist")));
 app.use(express.static(path.join(__dirname, "public")));
 
 const num = (v, fallback = 0) => {
@@ -217,6 +222,10 @@ function systemWarnings() {
   }
   if (lastDbCheckOk === false) warnings.push({ code: "DATABASE_DOWN", severity: "critical", message: `Baza de date nu răspunde: ${lastDbCheckError}` });
   if (!telegram.status().configured) warnings.push({ code: "TELEGRAM_OFF", severity: "warning", message: "Telegram nu este configurat complet." });
+  const capitalStatus = capital.status();
+  if (capitalStatus.enabled && !capitalStatus.configured) warnings.push({ code: "CAPITAL_NOT_CONFIGURED", severity: "critical", message: "Auto-trading Capital.com este activat, dar credențialele API nu sunt configurate complet." });
+  if (capitalStatus.environment === "LIVE" && capitalStatus.enabled && !capitalStatus.liveConfirmed) warnings.push({ code: "CAPITAL_LIVE_LOCKED", severity: "critical", message: "Capital.com LIVE este blocat până la confirmarea explicită a riscului." });
+  if (capitalStatus.lastError) warnings.push({ code: "CAPITAL_LAST_ERROR", severity: "warning", message: `Ultima execuție Capital.com: ${capitalStatus.lastError}` });
   const news = newsCoverageStatus();
   if (!news.healthy) warnings.push({ code: "NEWS_COVERAGE", severity: "warning", message: lastNewsSyncError ? `Filtrul de știri este degradat: ${lastNewsSyncError}` : "Nu există o sincronizare recentă și reușită a știrilor." });
   else if (!news.calendarHealthy) warnings.push({ code: "NEWS_CALENDAR", severity: "warning", message: `Fluxurile oficiale sunt active, dar calendarul economic anticipat nu este disponibil; se aplică risc de siguranță ${NEWS_CALENDAR_UNAVAILABLE_RISK}/100.` });
@@ -239,6 +248,7 @@ async function buildSystemStatus() {
       marketExpectedOpen: marketExpectedOpen()
     },
     telegram: { ...telegram.status(), lastAt: lastTelegramAt, lastResult: lastTelegramResult },
+    capital: capital.status(),
     news: newsCoverageStatus(),
     autoPatternSignals: {
       enabled: AUTO_PATTERN_SIGNALS,
@@ -322,7 +332,8 @@ async function initDb() {
     ["tp1_hit_at", "TIMESTAMPTZ"], ["tp2_hit_at", "TIMESTAMPTZ"], ["tp3_hit_at", "TIMESTAMPTZ"],
     ["best_target", "TEXT"], ["managed_stop", "NUMERIC"],
     ["last_reanalysis_at", "TIMESTAMPTZ"], ["monitoring_state", "JSONB"], ["monitoring_summary", "TEXT"],
-    ["reviewed_at", "TIMESTAMPTZ"], ["review_factors", "JSONB"], ["review_summary", "TEXT"]
+    ["reviewed_at", "TIMESTAMPTZ"], ["review_factors", "JSONB"], ["review_summary", "TEXT"],
+    ["broker_execution_status", "TEXT"], ["broker_execution_summary", "TEXT"], ["broker_executed_at", "TIMESTAMPTZ"]
   ];
   for (const [name, type] of columns) {
     await pool.query(`ALTER TABLE signals ADD COLUMN IF NOT EXISTS ${name} ${type}`);
@@ -499,6 +510,28 @@ async function initDb() {
     )
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS telegram_logs_created_idx ON telegram_logs(created_at DESC)`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS capital_executions (
+      id BIGSERIAL PRIMARY KEY,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      external_id TEXT UNIQUE NOT NULL,
+      symbol TEXT NOT NULL,
+      side TEXT NOT NULL,
+      environment TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'PENDING',
+      adaptive_score NUMERIC,
+      news_risk INTEGER DEFAULT 0,
+      epic TEXT,
+      total_size NUMERIC,
+      estimated_risk NUMERIC,
+      account_currency TEXT,
+      deal_ids JSONB,
+      details JSONB,
+      error TEXT
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS capital_executions_created_idx ON capital_executions(created_at DESC)`);
   const newsState = await pool.query(`SELECT MAX(received_at) AS last_received FROM news_events`);
   if (newsState.rows[0]?.last_received) lastSuccessfulNewsSync = new Date(newsState.rows[0].last_received).toISOString();
   const calendarState = await pool.query(`SELECT MAX(received_at) AS last_received FROM news_events WHERE scheduled=TRUE`);
@@ -738,7 +771,7 @@ async function trackSignalsWithBar(bar) {
     const hadTp1=Boolean(s.tp1_hit_at), hadTp2=Boolean(s.tp2_hit_at);
     const hitAt=new Date().toISOString();
     const targetUpdates={};
-    if(tp1Hit&&!hadTp1){targetUpdates.tp1_hit_at=hitAt;targetUpdates.best_target="TP1";targetUpdates.managed_stop=entry;}
+    if(tp1Hit&&!hadTp1){targetUpdates.tp1_hit_at=hitAt;targetUpdates.best_target="TP1";targetUpdates.managed_stop=entry;protectCapitalAtBreakEven(s.external_id,entry).catch(error=>console.error("[CAPITAL BREAK-EVEN]",error.message));}
     if(tp2Hit&&!hadTp2){targetUpdates.tp1_hit_at=targetUpdates.tp1_hit_at||s.tp1_hit_at||hitAt;targetUpdates.tp2_hit_at=hitAt;targetUpdates.best_target="TP2";targetUpdates.managed_stop=entry;}
     if(tp3Hit){targetUpdates.tp1_hit_at=targetUpdates.tp1_hit_at||s.tp1_hit_at||hitAt;targetUpdates.tp2_hit_at=targetUpdates.tp2_hit_at||s.tp2_hit_at||hitAt;targetUpdates.tp3_hit_at=hitAt;targetUpdates.best_target="TP3";targetUpdates.managed_stop=entry;}
     const monitoring = await reassessOpenSignalContext({ ...s, ...targetUpdates }, bar, reanalysisCache);
@@ -945,6 +978,55 @@ async function recentBars(symbol,timeframe,limit=20000) {
      ) recent ORDER BY bar_time ASC`,
     [symbol,timeframe,cutoff,limit]
   )).rows;
+}
+
+function chartBar(bar) {
+  const timestamp = Math.floor(new Date(bar.bar_time).getTime() / 1000);
+  const open = num(bar.open, NaN);
+  const high = num(bar.high, NaN);
+  const low = num(bar.low, NaN);
+  const close = num(bar.close, NaN);
+  if (![timestamp, open, high, low, close].every(Number.isFinite)) return null;
+  return {
+    time: timestamp,
+    barTime: new Date(timestamp * 1000).toISOString(),
+    open,
+    high,
+    low,
+    close,
+    volume: num(bar.volume)
+  };
+}
+
+function writeLiveChartEvent(client, event, payload) {
+  if (client.response.writableEnded) return false;
+  client.response.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);
+  return true;
+}
+
+function broadcastLiveChartBar(bar) {
+  const candle = chartBar(bar);
+  if (!candle) return;
+  const symbol = canonicalSymbol(bar.symbol);
+  const timeframe = String(bar.timeframe);
+  for (const client of liveChartClients) {
+    if (client.symbol !== symbol || client.timeframe !== timeframe) continue;
+    try {
+      writeLiveChartEvent(client, "bar", { symbol, timeframe, bar: candle, receivedAt: new Date().toISOString() });
+    } catch {
+      liveChartClients.delete(client);
+    }
+  }
+}
+
+function heartbeatLiveChartClients() {
+  for (const client of liveChartClients) {
+    try {
+      if (!writeLiveChartEvent(client, "heartbeat", { time: new Date().toISOString() })) liveChartClients.delete(client);
+    } catch {
+      liveChartClients.delete(client);
+    }
+  }
 }
 
 function median(values){if(!values.length)return 0;const a=[...values].sort((x,y)=>x-y),m=Math.floor(a.length/2);return a.length%2?a[m]:(a[m-1]+a[m])/2;}
@@ -1562,6 +1644,7 @@ async function processPendingSmcSetups(bar) {
       if (inserted) {
         activatedSignals.push(candidate);
         notifyTelegramSignal(candidate).catch(error => console.error("[TELEGRAM SMC LIVE]", error.message));
+        executeCapitalSignal(candidate).catch(error => console.error("[CAPITAL SMC LIVE]", error.message));
       }
     }
   }
@@ -1990,6 +2073,144 @@ async function saveBacktestRun(run){
 }
 async function latestBacktest(){if(!pool)return global.lastMemoryBacktest||null;return (await pool.query(`SELECT * FROM backtest_runs ORDER BY created_at DESC LIMIT 1`)).rows[0]||null;}
 
+async function reserveCapitalExecution(signal) {
+  const status = capital.status();
+  const row = {
+    id: Date.now(),
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    external_id: signal.external_id,
+    symbol: signal.symbol,
+    side: signal.signal,
+    environment: status.environment,
+    status: "PENDING",
+    adaptive_score: num(signal.adaptive_score ?? signal.score),
+    news_risk: Math.round(num(signal.news_risk)),
+    details: {}
+  };
+  if (!pool) {
+    if (memoryCapitalExecutions.some(item => item.external_id === row.external_id)) return null;
+    memoryCapitalExecutions.unshift(row);
+    memoryCapitalExecutions = memoryCapitalExecutions.slice(0, 500);
+    return row;
+  }
+  const result = await pool.query(
+    `INSERT INTO capital_executions(external_id,symbol,side,environment,status,adaptive_score,news_risk)
+     VALUES($1,$2,$3,$4,'PENDING',$5,$6)
+     ON CONFLICT DO NOTHING RETURNING *`,
+    [row.external_id,row.symbol,row.side,row.environment,row.adaptive_score,row.news_risk]
+  );
+  return result.rows[0] || null;
+}
+
+async function capitalExecutedToday() {
+  if (!pool) {
+    const start = new Date();
+    start.setUTCHours(0,0,0,0);
+    return memoryCapitalExecutions.filter(item => item.status === "EXECUTED" && new Date(item.created_at) >= start).length;
+  }
+  return Number((await pool.query(`SELECT COUNT(*)::int AS count FROM capital_executions WHERE status='EXECUTED' AND created_at>=date_trunc('day',NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'`)).rows[0]?.count || 0);
+}
+
+async function updateSignalBrokerExecution(externalId, status, summary, executedAt = null) {
+  if (!pool) {
+    const signal = memorySignals.find(item => item.external_id === externalId);
+    if (signal) Object.assign(signal, { broker_execution_status: status, broker_execution_summary: summary, broker_executed_at: executedAt });
+    return signal || null;
+  }
+  return (await pool.query(
+    `UPDATE signals SET broker_execution_status=$1,broker_execution_summary=$2,broker_executed_at=$3 WHERE external_id=$4 RETURNING *`,
+    [status,clean(summary,1000),executedAt,externalId]
+  )).rows[0] || null;
+}
+
+async function finishCapitalExecution(externalId, result) {
+  const preview = result.preview || {};
+  const deals = Array.isArray(result.deals) ? result.deals : [];
+  const summary = result.status === "EXECUTED"
+    ? `${result.environment} ${preview.side} ${preview.symbol}: 3 poziții x ${preview.sliceSize}, risc estimat ${num(preview.estimatedRiskAmount).toFixed(2)} ${preview.accountCurrency || ""}.`
+    : `${result.status}: ${result.reason || "ordin neexecutat"}`;
+  if (!pool) {
+    const row = memoryCapitalExecutions.find(item => item.external_id === externalId);
+    if (row) Object.assign(row, {
+      updated_at: new Date().toISOString(), status: result.status, epic: preview.epic || null,
+      total_size: preview.totalSize || null, estimated_risk: preview.estimatedRiskAmount || null,
+      account_currency: preview.accountCurrency || null, deal_ids: deals.map(item => item.dealId),
+      details: result, error: result.status === "EXECUTED" ? null : result.reason || null
+    });
+  } else {
+    await pool.query(
+      `UPDATE capital_executions SET updated_at=NOW(),status=$1,epic=$2,total_size=$3,estimated_risk=$4,
+       account_currency=$5,deal_ids=$6::jsonb,details=$7::jsonb,error=$8 WHERE external_id=$9`,
+      [result.status,preview.epic||null,preview.totalSize||null,preview.estimatedRiskAmount||null,
+       preview.accountCurrency||null,JSON.stringify(deals.map(item=>item.dealId)),JSON.stringify(result),
+       result.status==="EXECUTED"?null:clean(result.reason||"ordin neexecutat",1000),externalId]
+    );
+  }
+  await updateSignalBrokerExecution(externalId,result.status,summary,result.executedAt||null);
+  return { ...result, summary };
+}
+
+async function capitalExecutionForSignal(externalId) {
+  if (!pool) return memoryCapitalExecutions.find(item => item.external_id === externalId) || null;
+  return (await pool.query(`SELECT * FROM capital_executions WHERE external_id=$1`,[externalId])).rows[0] || null;
+}
+
+async function listCapitalExecutions(limit = 50) {
+  const safeLimit = Math.min(200,Math.max(1,Math.floor(num(limit,50))));
+  if (!pool) return memoryCapitalExecutions.slice(0,safeLimit);
+  return (await pool.query(`SELECT * FROM capital_executions ORDER BY created_at DESC LIMIT $1`,[safeLimit])).rows;
+}
+
+async function notifyCapitalExecution(result) {
+  if (!telegram.status().configured) return;
+  if (result.status === "EXECUTED") {
+    const p = result.preview;
+    await telegram.sendSystemAlert(
+      `💼 <b>Capital.com ${result.environment} — ORDIN EXECUTAT</b>\n\n`+
+      `${p.side === "BUY" ? "🟢" : "🔴"} <b>${p.side} ${p.symbol}</b>\n`+
+      `3 poziții × ${p.sliceSize} · SL ${p.stopLevel}\n`+
+      `TP1 ${p.targets[0]} · TP2 ${p.targets[1]} · TP3 ${p.targets[2]}\n`+
+      `Risc estimat: ${num(p.estimatedRiskAmount).toFixed(2)} ${p.accountCurrency || ""} (${p.riskPercent}%)`
+    );
+  } else if (result.status === "ROLLED_BACK") {
+    await telegram.sendSystemAlert(`⚠️ <b>Capital.com — execuție anulată și rollback</b>\n\n${clean(result.reason,500)}`);
+  }
+}
+
+async function executeCapitalSignal(signal) {
+  if (!capital.status().enabled) return { status: "DISABLED", reason: "Auto-trading Capital.com este oprit." };
+  const reserved = await reserveCapitalExecution(signal);
+  if (!reserved) return { status: "DUPLICATE", reason: "Acest semnal are deja o înregistrare Capital.com." };
+  const result = await capital.executeSignal(signal,{dailyExecutedCount:await capitalExecutedToday()});
+  const saved = await finishCapitalExecution(signal.external_id,result);
+  notifyCapitalExecution(result).catch(error=>console.error("[CAPITAL TELEGRAM]",error.message));
+  return saved;
+}
+
+async function protectCapitalAtBreakEven(externalId, entry) {
+  const execution = await capitalExecutionForSignal(externalId);
+  if (!execution || execution.status !== "EXECUTED") return { skipped: true, reason: "Nu există execuție Capital.com activă." };
+  const details = safeJson(execution.details);
+  if (details.breakEvenProtection?.attemptedAt) return details.breakEvenProtection;
+  const deals = (Array.isArray(details.deals) ? details.deals : []).filter(item => ["TP2","TP3"].includes(item.target) && item.dealId);
+  const results = [];
+  for (const deal of deals) {
+    try { results.push({target:deal.target,status:"UPDATED",...(await capital.updateStop(deal.dealId,entry))}); }
+    catch (error) { results.push({target:deal.target,status:"ERROR",error:error.message}); }
+  }
+  const protection = { attemptedAt:new Date().toISOString(),entry,results };
+  if (!pool) {
+    execution.details = { ...details, breakEvenProtection: protection };
+  } else {
+    await pool.query(
+      `UPDATE capital_executions SET updated_at=NOW(),details=COALESCE(details,'{}'::jsonb)||jsonb_build_object('breakEvenProtection',$1::jsonb) WHERE external_id=$2`,
+      [JSON.stringify(protection),externalId]
+    );
+  }
+  return protection;
+}
+
 async function logTelegram({ signal = null, status, messageId = null, details = "" }) {
   const row = { id: Date.now(), created_at: new Date().toISOString(), external_id: signal?.external_id || null, symbol: signal?.symbol || null, side: signal?.signal || null, status, message_id: messageId ? String(messageId) : null, details: clean(details, 1000) };
   if (!pool) { global.memoryTelegramLogs = global.memoryTelegramLogs || []; global.memoryTelegramLogs.unshift(row); global.memoryTelegramLogs = global.memoryTelegramLogs.slice(0, 200); return row; }
@@ -2048,11 +2269,45 @@ async function notifyTelegramSignal(signal) {
   }
 }
 
-app.get("/health", (req,res)=>res.json({ok:true,version:APP_VERSION,database:pool?"postgres":"memory",archiveAfterHours:ARCHIVE_AFTER_HOURS,adminKeyConfigured:Boolean(ADMIN_KEY),newsWebhookConfigured:Boolean(NEWS_WEBHOOK_KEY),officialNewsEnabled:OFFICIAL_NEWS_ENABLED,fmpEnabled:FMP_ENABLED,fmpKeyConfigured:Boolean(FMP_API_KEY),fmpConfigured:FMP_ENABLED&&Boolean(FMP_API_KEY)&&!fmpRuntimeDisabledReason,fmpRuntimeDisabledReason,alphaVantageConfigured:Boolean(ALPHAVANTAGE_API_KEY),finnhubConfigured:Boolean(FINNHUB_API_KEY),autoTrackTrades:AUTO_TRACK_TRADES,lastNewsSync,lastSuccessfulNewsSync,lastNewsSyncError,newsProviders:lastNewsProviderResults,newsCoverage:newsCoverageStatus(),patternMinSamples:PATTERN_MIN_SAMPLES,patternMinProbability:PATTERN_MIN_PROBABILITY,analysisTimeframe:ANALYSIS_TIMEFRAME,analysisTimeframes:ANALYSIS_TIMEFRAMES,analysisProfiles:analysisProfilesPublic(),contextTimeframes:CONTEXT_TIMEFRAMES,symbolAliases:aliasSummary(),lastBarAtByTimeframe:{...lastBarAtByTimeframe},autoPatternSignals:AUTO_PATTERN_SIGNALS,patternSignalMinSamples:PATTERN_SIGNAL_MIN_SAMPLES,patternSignalMinProbability:PATTERN_SIGNAL_MIN_PROBABILITY,patternSignalMinScore:PATTERN_SIGNAL_MIN_SCORE,smcEnabled:SMC_ENABLED,smcMinScore:SMC_MIN_SCORE,smcNotifyPendingScore:SMC_NOTIFY_PENDING_SCORE,smcRequireM5Confirmation:SMC_REQUIRE_M5_CONFIRMATION,liveMinAdaptiveScore:LIVE_MIN_ADAPTIVE_SCORE,learningMinSamples:LEARNING_MIN_SAMPLES,maxNewsRiskLive:MAX_NEWS_RISK_LIVE,maxConsecutiveLosses:MAX_CONSECUTIVE_LOSSES,webhookStaleMinutes:WEBHOOK_STALE_MINUTES,telegramSystemAlerts:TELEGRAM_SYSTEM_ALERTS,telegram:telegram.status(),lastTelegramAt,lastTelegramResult,lastSystemAlertAt,lastWebhookAt,lastWebhookResult,warnings:systemWarnings(),time:new Date().toISOString()}));
+app.get("/health", (req,res)=>res.json({ok:true,version:APP_VERSION,database:pool?"postgres":"memory",archiveAfterHours:ARCHIVE_AFTER_HOURS,adminKeyConfigured:Boolean(ADMIN_KEY),newsWebhookConfigured:Boolean(NEWS_WEBHOOK_KEY),officialNewsEnabled:OFFICIAL_NEWS_ENABLED,fmpEnabled:FMP_ENABLED,fmpKeyConfigured:Boolean(FMP_API_KEY),fmpConfigured:FMP_ENABLED&&Boolean(FMP_API_KEY)&&!fmpRuntimeDisabledReason,fmpRuntimeDisabledReason,alphaVantageConfigured:Boolean(ALPHAVANTAGE_API_KEY),finnhubConfigured:Boolean(FINNHUB_API_KEY),autoTrackTrades:AUTO_TRACK_TRADES,lastNewsSync,lastSuccessfulNewsSync,lastNewsSyncError,newsProviders:lastNewsProviderResults,newsCoverage:newsCoverageStatus(),patternMinSamples:PATTERN_MIN_SAMPLES,patternMinProbability:PATTERN_MIN_PROBABILITY,analysisTimeframe:ANALYSIS_TIMEFRAME,analysisTimeframes:ANALYSIS_TIMEFRAMES,analysisProfiles:analysisProfilesPublic(),contextTimeframes:CONTEXT_TIMEFRAMES,symbolAliases:aliasSummary(),lastBarAtByTimeframe:{...lastBarAtByTimeframe},autoPatternSignals:AUTO_PATTERN_SIGNALS,patternSignalMinSamples:PATTERN_SIGNAL_MIN_SAMPLES,patternSignalMinProbability:PATTERN_SIGNAL_MIN_PROBABILITY,patternSignalMinScore:PATTERN_SIGNAL_MIN_SCORE,smcEnabled:SMC_ENABLED,smcMinScore:SMC_MIN_SCORE,smcNotifyPendingScore:SMC_NOTIFY_PENDING_SCORE,smcRequireM5Confirmation:SMC_REQUIRE_M5_CONFIRMATION,liveMinAdaptiveScore:LIVE_MIN_ADAPTIVE_SCORE,learningMinSamples:LEARNING_MIN_SAMPLES,maxNewsRiskLive:MAX_NEWS_RISK_LIVE,maxConsecutiveLosses:MAX_CONSECUTIVE_LOSSES,webhookStaleMinutes:WEBHOOK_STALE_MINUTES,telegramSystemAlerts:TELEGRAM_SYSTEM_ALERTS,telegram:telegram.status(),capital:capital.status(),lastTelegramAt,lastTelegramResult,lastSystemAlertAt,lastWebhookAt,lastWebhookResult,warnings:systemWarnings(),time:new Date().toISOString()}));
 app.get("/api/system-status", async(req,res)=>{try{res.json(await buildSystemStatus());}catch(e){res.status(500).json({ok:false,error:e.message});}});
 
 app.get("/api/signals", async(req,res)=>{ try { const mode=req.query.mode==="archive"?"archive":"active"; res.json({ok:true,mode,signals:await listSignals(mode,req.query),analytics:await analytics(req.query.analyticsScope||"SMC")}); } catch(e){ console.error(e); res.status(500).json({ok:false,error:e.message}); } });
 app.get("/api/analytics", async(req,res)=>{ try { res.json({ok:true,analytics:await analytics(req.query.scope||"SMC")}); } catch(e){res.status(500).json({ok:false,error:e.message});} });
+app.get("/api/chart-data", async(req,res)=>{try{
+  const symbol=canonicalSymbol(req.query.symbol);
+  if(!symbol)throw new Error("Instrumentul pentru grafic lipsește.");
+  const timeframe=normalizeTimeframe(req.query.timeframe||"5","5");
+  const limit=Math.min(1500,Math.max(50,Math.floor(num(req.query.limit,320))));
+  const bars=(await recentBars(symbol,timeframe,limit)).map(chartBar).filter(Boolean);
+  const latest=bars[bars.length-1]||null;
+  const ageMinutes=latest?Math.max(0,(Date.now()-latest.time*1000)/60000):null;
+  res.json({
+    ok:true,
+    symbol,
+    timeframe,
+    bars,
+    latest,
+    feed:"TRADINGVIEW_WEBHOOK",
+    updateMode:"ON_BAR_CLOSE",
+    ageMinutes:ageMinutes===null?null:Number(ageMinutes.toFixed(1)),
+    serverTime:new Date().toISOString()
+  });
+}catch(e){res.status(400).json({ok:false,error:e.message});}});
+app.get("/api/live-bars",(req,res)=>{
+  const symbol=canonicalSymbol(req.query.symbol);
+  if(!symbol)return res.status(400).json({ok:false,error:"Instrumentul pentru fluxul live lipsește."});
+  const timeframe=normalizeTimeframe(req.query.timeframe||"5","5");
+  res.setHeader("Content-Type","text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control","no-cache, no-transform");
+  res.setHeader("Connection","keep-alive");
+  res.setHeader("X-Accel-Buffering","no");
+  res.flushHeaders?.();
+  const client={response:res,symbol,timeframe};
+  liveChartClients.add(client);
+  writeLiveChartEvent(client,"ready",{symbol,timeframe,connectedAt:new Date().toISOString()});
+  req.on("close",()=>liveChartClients.delete(client));
+});
 app.post("/api/archive-now", async(req,res)=>{ if(!requireAdmin(req,res))return; try{res.json({ok:true,archived:await archiveOldSignals()});}catch(e){res.status(500).json({ok:false,error:e.message});} });
 
 app.get("/api/news", async(req,res)=>{ try {
@@ -2074,6 +2329,8 @@ app.post("/news-webhook", async(req,res)=>{ try{
 }catch(e){res.status(400).json({ok:false,error:e.message});} });
 
 app.get("/api/telegram/status", async(req,res)=>{try{let logs;if(!pool)logs=(global.memoryTelegramLogs||[]).slice(0,20);else logs=(await pool.query(`SELECT * FROM telegram_logs ORDER BY created_at DESC LIMIT 20`)).rows;res.json({ok:true,telegram:telegram.status(),lastTelegramAt,lastTelegramResult,logs});}catch(e){res.status(500).json({ok:false,error:e.message});}});
+app.get("/api/capital/status",async(req,res)=>{if(!requireAdmin(req,res))return;try{res.json({ok:true,capital:capital.status(),executions:await listCapitalExecutions(req.query.limit)});}catch(e){res.status(500).json({ok:false,error:e.message});}});
+app.post("/api/capital/test-connection",async(req,res)=>{if(!requireAdmin(req,res))return;try{res.json({ok:true,connection:await capital.testConnection(),capital:capital.status()});}catch(e){res.status(400).json({ok:false,error:e.message,capital:capital.status()});}});
 app.post("/api/telegram/test", async(req,res)=>{if(!requireAdmin(req,res))return;try{const result=await telegram.sendTest();lastTelegramAt=new Date().toISOString();lastTelegramResult=`TEST TRIMIS, mesaj ${result.message_id}`;await logTelegram({status:"TEST",messageId:result.message_id,details:lastTelegramResult});res.json({ok:true,messageId:result.message_id});}catch(e){lastTelegramAt=new Date().toISOString();lastTelegramResult=`EROARE TEST: ${e.message}`;await logTelegram({status:"ERROR",details:e.message}).catch(()=>{});res.status(400).json({ok:false,error:e.message});}});
 app.post("/api/telegram/test-signal", async(req,res)=>{if(!requireAdmin(req,res))return;try{
   const price=num(req.body.price,NaN);if(!Number.isFinite(price)||price<=0)throw new Error("Introdu un preț valid");
@@ -2098,7 +2355,7 @@ app.post("/api/test-signal",async(req,res)=>{ if(!requireAdmin(req,res))return; 
 app.post("/api/test-news",async(req,res)=>{ if(!requireAdmin(req,res))return; try{const n=normalizeNews({external_id:`NEWS-${Date.now()}`,title:"FOMC, ECB and crude oil volatility test",summary:"High-impact central-bank and energy event may increase volatility in US indices, GER40, gold and USOIL.",source:"PropTrader test",symbols:["US30","NAS100","XAUUSD","GER40","USOIL"],impact:90});await saveNews(n);res.json({ok:true,news:n});}catch(e){res.status(500).json({ok:false,error:e.message});} });
 
 app.post("/api/manual-close",async(req,res)=>{if(!requireAdmin(req,res))return;try{res.json({ok:true,closed:await closeSignal(req.body)});}catch(e){res.status(400).json({ok:false,error:e.message});}});
-app.post("/api/clear",async(req,res)=>{if(!requireAdmin(req,res))return;try{if(pool){await pool.query("DELETE FROM signals");await pool.query("DELETE FROM news_events");await pool.query("DELETE FROM pattern_signals");await pool.query("DELETE FROM smc_setups");await pool.query("DELETE FROM market_bars");}else{memorySignals=[];memoryNews=[];memoryBars=[];memoryPatterns=[];memorySmcSetups=[];}res.json({ok:true});}catch(e){res.status(500).json({ok:false,error:e.message});}});
+app.post("/api/clear",async(req,res)=>{if(!requireAdmin(req,res))return;try{if(pool){await pool.query("DELETE FROM signals");await pool.query("DELETE FROM news_events");await pool.query("DELETE FROM pattern_signals");await pool.query("DELETE FROM smc_setups");await pool.query("DELETE FROM market_bars");await pool.query("DELETE FROM capital_executions");}else{memorySignals=[];memoryNews=[];memoryBars=[];memoryPatterns=[];memorySmcSetups=[];memoryCapitalExecutions=[];}res.json({ok:true});}catch(e){res.status(500).json({ok:false,error:e.message});}});
 
 app.get("/api/patterns",async(req,res)=>{try{res.json({ok:true,patterns:await listPatterns(Math.min(300,Math.max(1,num(req.query.limit,100)))),settings:{minSamples:PATTERN_MIN_SAMPLES,minProbability:PATTERN_MIN_PROBABILITY,lookbackDays:PATTERN_LOOKBACK_DAYS,analysisTimeframes:ANALYSIS_TIMEFRAMES,profiles:analysisProfilesPublic()}});}catch(e){res.status(500).json({ok:false,error:e.message});}});
 app.get("/api/smc-setups",async(req,res)=>{try{
@@ -2345,6 +2602,8 @@ app.post("/webhook", async(req,res)=>{try{
     const derived=await deriveCompletedHigherBars(bar);
     const analyses=[await processNewBar(bar,{trackTrades:true})];
     for(const higherBar of derived)analyses.push(await processNewBar(higherBar,{trackTrades:false}));
+    broadcastLiveChartBar(bar);
+    for(const higherBar of derived)broadcastLiveChartBar(higherBar);
     const generatedSignals=analyses.flatMap(item=>[item.generatedSignal,...(Array.isArray(item.smcActivatedSignals)?item.smcActivatedSignals:[])]).filter(Boolean);
     const plannedSetups=analyses.flatMap(item=>Array.isArray(item.smcSetups)?item.smcSetups:[]);
     const labels=analyses.filter(item=>item.analyzed).map(item=>timeframeLabel(item.bar.timeframe)).join(", ");
@@ -2358,8 +2617,9 @@ initDb().then(async()=>{
   await deduplicateExistingPendingSmcSetups();
   await archiveOldSignals();
   setInterval(()=>archiveOldSignals().catch(e=>console.error("Auto-archive:",e)),15*60*1000).unref();
+  setInterval(heartbeatLiveChartClients,25000).unref();
   if(OFFICIAL_NEWS_ENABLED||(FMP_ENABLED&&FMP_API_KEY)||ALPHAVANTAGE_API_KEY||FINNHUB_API_KEY){syncRealNews().catch(e=>{lastNewsSyncError=e.message;console.error("News sync:",e.message)});setInterval(()=>syncRealNews().catch(e=>{lastNewsSyncError=e.message;console.error("News sync:",e.message)}),NEWS_AUTO_SYNC_MINUTES*60000).unref();}
   setTimeout(()=>monitorSystem().catch(e=>console.error("System monitor:",e.message)),15000).unref();
   setInterval(()=>monitorSystem().catch(e=>console.error("System monitor:",e.message)),SYSTEM_MONITOR_INTERVAL_MINUTES*60000).unref();
-  app.listen(PORT,()=>console.log(`PropTrader AI v18.6 rulează pe portul ${PORT}`));
+  app.listen(PORT,()=>console.log(`PropTrader AI v19.0 rulează pe portul ${PORT}`));
 }).catch(e=>{console.error("DB init failed:",e);process.exit(1)});

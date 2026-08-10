@@ -1,6 +1,66 @@
-# PropTrader AI v18.6 — SMC predictiv M5–H4 pentru US30, NAS100, XAUUSD, GER40 și USOIL
+# PropTrader AI v19.0 — SMC predictiv M5–H4, Telegram și execuție automată Capital.com
 
 Aplicația primește lumânări M5 închise din TradingView, construiește automat M15, M30, H1, H4 și contextul D1 și caută intrări SMC pe toate intervalele M5–H4. O intrare nu este mutată artificial la prețul curent.
+
+v19.0 poate transmite automat către Capital.com numai semnalele `SMC LIVE` care au atins Entry, au confirmare M5 și au trecut din nou filtrele de scor, știri, structură și expunere. Funcția este oprită implicit și pornește în mediul `DEMO`.
+
+## Execuție automată Capital.com
+
+Fluxul este `TradingView → PropTrader AI → reverificare SMC → calcul risc → Capital.com → confirmare broker → Telegram`.
+
+Protecțiile implementate sunt:
+
+- numai identificatorii `SMC-LIVE-*` cu `execution_mode=LIVE` pot ajunge la broker;
+- planurile `PENDING`, semnalele WATCH, testele și webhook-urile manuale nu pot deschide poziții;
+- scor adaptiv minim separat, implicit 85;
+- limită de risc de știri, implicit 75/100;
+- risc calculat din sold, implicit 0,2% pentru întregul semnal;
+- maximum trei semnale executate pe zi și maximum 12 poziții totale deschise;
+- maximum o expunere pe același instrument;
+- verificare spread și abatere față de Entry înainte de ordin;
+- Entry, SL și TP1–TP3 trebuie să fie strict ordonate;
+- mărimea este rotunjită în jos la incrementul permis de broker;
+- sunt create trei poziții egale, cu același SL și TP1, TP2, respectiv TP3;
+- fiecare răspuns `POST /positions` este verificat prin `GET /confirms/{dealReference}`;
+- dacă una dintre cele trei poziții este respinsă, pozițiile deja deschise în acea execuție sunt închise automat;
+- după detectarea TP1, serverul încearcă mutarea SL la Entry pentru pozițiile TP2 și TP3;
+- același `external_id` nu poate fi executat de două ori, nici după restart;
+- toate încercările sunt salvate în `capital_executions` și apar în pagina Administrare.
+
+Capital.com permite un singur TP pentru fiecare poziție. Din acest motiv TP1–TP3 sunt implementate ca trei poziții independente. Mutarea la break-even depinde de următoarea lumânare M5 primită de server; SL-ul inițial și cele trei TP-uri sunt însă trimise direct brokerului odată cu ordinele.
+
+### Variabile Render pentru DEMO
+
+Generează cheia în Capital.com Demo la **Settings → API integrations**. `CAPITAL_API_PASSWORD` este parola personalizată a cheii API, nu parola principală a contului.
+
+```text
+CAPITAL_AUTO_TRADING_ENABLED=true
+CAPITAL_ENVIRONMENT=DEMO
+CAPITAL_API_KEY=cheia API afișată la creare
+CAPITAL_API_IDENTIFIER=emailul/loginul Capital.com
+CAPITAL_API_PASSWORD=parola personalizată a cheii API
+CAPITAL_ACCOUNT_ID=opțional; necesar doar dacă ai mai multe conturi
+CAPITAL_MIN_ADAPTIVE_SCORE=85
+CAPITAL_MAX_NEWS_RISK=75
+CAPITAL_RISK_PERCENT=0.2
+CAPITAL_MAX_DAILY_SIGNALS=3
+CAPITAL_MAX_OPEN_POSITIONS=12
+CAPITAL_MAX_ENTRY_SLIPPAGE_R=0.15
+CAPITAL_MAX_SPREAD_R=0.1
+CAPITAL_ALLOWED_SYMBOLS=US30,NAS100,XAUUSD,GER40,USOIL
+```
+
+După deploy, introdu `ADMIN_KEY` în pagina **Administrare** și apasă **Testează conexiunea**. Testul nu deschide ordine.
+
+### Blocarea mediului LIVE
+
+Setarea `CAPITAL_ENVIRONMENT=LIVE` nu este suficientă. Pentru a permite ordine reale trebuie adăugată și valoarea exactă:
+
+```text
+CAPITAL_LIVE_TRADING_CONFIRMED=I_UNDERSTAND_LIVE_RISK
+```
+
+Nu activa mediul LIVE înainte ca execuția DEMO, dimensiunile și simbolurile Capital.com să fie verificate separat. Credențialele rămân numai în Environment Variables din Render și nu se introduc în Pine, TradingView sau URL-ul webhook-ului.
 
 Instrumentele configurate integral sunt `US30`, `NAS100`, `XAUUSD`, `GER40` și `USOIL`: colectare TradingView, planuri SMC, reanalizare până la TP/SL, Telegram, știri, istoric Dukascopy și backtest. Pentru fiecare instrument trebuie creată propria alertă a colectorului pe graficul M5.
 
@@ -11,7 +71,7 @@ Motorul separă două momente:
 
 ## Reguli SMC implementate
 
-SMC nu are o specificație tehnică universală. În v18.6 regulile sunt explicite și testabile:
+SMC nu are o specificație tehnică universală. În v19.0 regulile sunt explicite și testabile:
 
 - swing high/low este confirmat numai după două lumânări în dreapta;
 - structura bullish cere HH + HL, iar structura bearish LH + LL; EMA20/EMA50 este doar fallback;
@@ -51,6 +111,20 @@ Fiecare plan salvează configurația care l-a produs: instrument, direcție, int
 
 Primele rezultate sunt tratate ca perioadă de învățare, nu ca dovadă de validare. Învățarea adaptează scorurile; nu modifică singură regulile structurale și nu garantează profit.
 
+## Grafic live în aplicație
+
+Fiecare semnal deschis are butonul **Grafic live**. Fereastra folosește biblioteca TradingView Lightweight Charts, servită direct de aplicație, și afișează:
+
+- lumânările M5 primite de la alerta TradingView/Capital.com;
+- selectare M5, M15, M30, H1 sau H4;
+- marcajul BUY/SELL la momentul semnalului;
+- liniile Entry, SL și TP1–TP3;
+- prețul ultimei lumânări, progresul în R și etapa curentă a tranzacției;
+- vechimea ultimei lumânări, astfel încât un flux TradingView oprit să fie vizibil imediat;
+- actualizare instantanee în interfață prin flux SSE, fără reîncărcarea paginii.
+
+Graficul folosește exact lumânările salvate de colector, nu un feed separat. De aceea nivelurile rămân aliniate cu motorul și mesajul Telegram. „Live” înseamnă actualizare la închiderea lumânării M5; aplicația nu inventează tick-uri între două webhook-uri TradingView.
+
 ## Notificări Telegram
 
 Există două tipuri de mesaje:
@@ -78,7 +152,7 @@ Astfel, lumânările TradingView, istoricul Dukascopy, știrile și rezultatele 
 
 1. Înlocuiește în GitHub fișierele proiectului cu cele din această arhivă.
 2. Fă un commit și alege în Render **Manual Deploy → Deploy latest commit**.
-3. Verifică `/health`: `version` trebuie să fie `18.6.0`.
+3. Verifică `/health`: `version` trebuie să fie `19.0.0`.
 4. În pagina **Istoric & Backtest**, după ce există minimum 3.000 de lumânări M5 din cel puțin 30 de zile, apasă **Reconstruiește M15 · M30 · H1 · H4 · D1 din M5**.
 
 Variabile recomandate:
@@ -106,7 +180,7 @@ NEWS_CALENDAR_UNAVAILABLE_RISK=35
 
 Păstrează valorile existente pentru `WEBHOOK_KEY`, `ADMIN_KEY`, `DATABASE_URL`, `TELEGRAM_BOT_TOKEN` și `TELEGRAM_CHAT_ID`. Nu publica secretele în GitHub.
 
-Migrarea bazei de date este automată la pornire. v18.6:
+Migrarea bazei de date este automată la pornire. v19.0 păstrează funcțiile v18.7 și adaugă jurnalul securizat de execuție Capital.com:
 
 - separă implicit statisticile și validarea SMC de Legacy și Modele istorice;
 - păstrează distinct stările WATCH, eligibil LIVE și Telegram trimis;
@@ -116,6 +190,7 @@ Migrarea bazei de date este automată la pornire. v18.6:
 - rulează reconstruirea intervalelor în fundal și refuză înlocuirea dacă istoricul M5 este insuficient;
 - cere minimum 60 de zile pentru un backtest raportat drept relevant.
 - adaugă GER40 și USOIL în normalizarea brokerilor și în descărcarea istorică Dukascopy (`deuidxeur`, respectiv `lightcmdusd`).
+- adaugă API-ul de lumânări și fluxul live SSE pentru graficul semnalelor active, fără modificarea schemei bazei de date.
 
 ## TradingView — colector și indicator vizual
 
@@ -172,7 +247,7 @@ TradingView va înregistra tehnic un webhook la fiecare lumânare M5 deoarece ac
 
 ## Știri
 
-FMP este oprit implicit. Dacă variabila a rămas activă, dar abonamentul răspunde HTTP 402, v18.6 oprește automat FMP pentru sesiunea serverului și continuă sincronizarea fluxurilor oficiale gratuite. Fluxurile Federal Reserve și BLS acoperă contextul SUA, ECB alimentează contextul GER40, iar EIA furnizează titluri energetice relevante pentru USOIL, toate fără chei API. Dacă nu există calendar anticipat, motorul aplică risc de siguranță în loc de risc zero.
+FMP este oprit implicit. Dacă variabila a rămas activă, dar abonamentul răspunde HTTP 402, v19.0 oprește automat FMP pentru sesiunea serverului și continuă sincronizarea fluxurilor oficiale gratuite. Fluxurile Federal Reserve și BLS acoperă contextul SUA, ECB alimentează contextul GER40, iar EIA furnizează titluri energetice relevante pentru USOIL, toate fără chei API. Dacă nu există calendar anticipat, motorul aplică risc de siguranță în loc de risc zero.
 
 Activează FMP numai dacă planul tău include endpoint-ul calendarului economic:
 
