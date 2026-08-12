@@ -129,6 +129,7 @@ function createCoreDemoBridge(options = {}) {
   const marketCache = new Map();
   const inFlight = new Set();
   const dealBySetup = new Map();
+  const memoryExecutedAt = [];
 
   function parseBody(req) {
     let body = req.body;
@@ -291,7 +292,11 @@ function createCoreDemoBridge(options = {}) {
   }
 
   async function dailyExecutedCount() {
-    if (!pool) return 0;
+    if (!pool) {
+      const cutoff = now() - 24 * 60 * 60 * 1000;
+      while (memoryExecutedAt.length && memoryExecutedAt[0] < cutoff) memoryExecutedAt.shift();
+      return memoryExecutedAt.length;
+    }
     const result = await pool.query(`SELECT COUNT(*)::int AS n FROM core_demo_executions WHERE status='EXECUTED' AND created_at >= date_trunc('day', NOW())`);
     return Number(result.rows[0]?.n || 0);
   }
@@ -384,6 +389,7 @@ function createCoreDemoBridge(options = {}) {
       if (!dealReference) throw new Error("Capital.com DEMO nu a returnat dealReference.");
       const confirmation = await confirmDeal(dealReference);
       dealBySetup.set(preview.setupId, { dealId: confirmation.dealId, symbol: preview.symbol, epic: preview.epic });
+      memoryExecutedAt.push(now());
       lastExecutionAt = new Date(now()).toISOString();
       lastError = "";
       lastResult = `${preview.side} ${preview.symbol} DEMO: size ${preview.size}, SL ${preview.sl}, TP2 ${preview.tp2}, risc estimat ${preview.estimatedRisk.toFixed(2)} ${preview.accountCurrency}.`;
@@ -400,8 +406,12 @@ function createCoreDemoBridge(options = {}) {
 
   async function closeTimedExit(signal) {
     if (!enabled) return { status: "DISABLED", reason: "CORE_DEMO_ENABLED este false." };
-    const tracked = dealBySetup.get(signal.setupId);
-    if (!tracked?.dealId) return { status: "IGNORED", reason: "Poziția nu este mapată în memoria acestui proces; SL/TP2 broker rămân active. Nu închid alte poziții prin presupunere." };
+    let tracked = dealBySetup.get(signal.setupId);
+    if (!tracked?.dealId && pool) {
+      const q = await pool.query(`SELECT deal_id,symbol,epic,status FROM core_demo_executions WHERE setup_id=$1 LIMIT 1`, [signal.setupId]);
+      if (q.rows[0]?.deal_id && q.rows[0]?.status === "EXECUTED") tracked = { dealId: q.rows[0].deal_id, symbol: q.rows[0].symbol, epic: q.rows[0].epic };
+    }
+    if (!tracked?.dealId) return { status: "IGNORED", reason: "Nu există o poziție CORE DEMO executată pentru acest setup_id; nu închid alte poziții prin presupunere." };
     const response = await authenticatedRequest(`/positions/${encodeURIComponent(tracked.dealId)}`, { method: "DELETE", retryAuth: false });
     const dealReference = response.data.dealReference;
     if (dealReference) await confirmDeal(dealReference).catch(() => null);
